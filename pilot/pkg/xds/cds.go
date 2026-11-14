@@ -17,13 +17,15 @@ package xds
 import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/jwt"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
 type CdsGenerator struct {
-	Server *DiscoveryServer
+	ConfigGenerator core.ConfigGenerator
 }
 
 var _ model.XdsDeltaResourceGenerator = &CdsGenerator{}
@@ -36,15 +38,22 @@ var skippedCdsConfigs = sets.New(
 	kind.AuthorizationPolicy,
 	kind.RequestAuthentication,
 	kind.Secret,
+	kind.ConfigMap,
 	kind.Telemetry,
 	kind.WasmPlugin,
+	kind.TrafficExtension,
 	kind.ProxyConfig,
+	kind.DNSName,
+	kind.Endpoints,
+	// we can skip Address here to avoid pushing Sidecars and Gateways on Address changes,
+	// it's already checked in waypointNeedsPush
+	kind.Address,
 )
 
-// Map all configs that impact CDS for gateways when `PILOT_FILTER_GATEWAY_CLUSTER_CONFIG = true`.
+// Map all aditional configs that impact CDS for gateways.
+// Gateway resources can impact VirtualService selection and so should need a push.
 var pushCdsGatewayConfig = func() sets.Set[kind.Kind] {
 	s := sets.New(
-		kind.VirtualService,
 		kind.Gateway,
 	)
 	if features.JwksFetchMode != jwt.Istiod {
@@ -53,47 +62,95 @@ var pushCdsGatewayConfig = func() sets.Set[kind.Kind] {
 	return s
 }()
 
-func cdsNeedsPush(req *model.PushRequest, proxy *model.Proxy) bool {
-	if req == nil {
-		return true
+// cdsNeedsPush may return a new PushRequest with ConfigsUpdated filtered to only include configs that impact CDS,
+// this is done because cluster generator checks if only some specific types of configs are present to enable delta generation.
+func cdsNeedsPush(req *model.PushRequest, proxy *model.Proxy) (*model.PushRequest, bool) {
+	if res, ok := xdsNeedsPush(req, proxy); ok {
+		return req, res
 	}
-	if !req.Full {
-		// CDS only handles full push
-		return false
+	if proxy.Type == model.Waypoint && waypointNeedsPush(req, proxy) {
+		return req, true
 	}
-	// If none set, we will always push
-	if len(req.ConfigsUpdated) == 0 {
-		return true
-	}
+
+	// Optimization: Skip CDS for headless endpoint updates.
+	// For routers: Clusters are EDS type - endpoint IPs delivered via EDS.
+	// For sidecars: Clusters are ORIGINAL_DST (no endpoints) or EDS type.
+	// In both cases, cluster definitions are static when only endpoints change.
+	// However, if ServiceUpdate is also present, the service definition changed
+	// (ports, labels, etc.) and we need to push CDS.
+	headlessOnly := req.Reason.Has(model.HeadlessEndpointUpdate) && !req.Reason.Has(model.ServiceUpdate)
+
+	relevantUpdates := make(sets.Set[model.ConfigKey])
+	filtered := false
+	checkGateway := false
 	for config := range req.ConfigsUpdated {
-		if features.FilterGatewayClusterConfig && proxy.Type == model.Router {
+		// Check if all updates are ServiceEntry (headless endpoint marker)
+		if config.Kind != kind.ServiceEntry {
+			headlessOnly = false
+		}
+
+		// Ambient east-west gateways merge Gateway resources like routers do, and their AUTO_PASSTHROUGH
+		// servers drive the SNI-DNAT clusters, so Gateway changes must be considered for them as well.
+		if proxy.Type == model.Router || proxy.IsAmbientEastWestGateway() {
+			if config.Kind == kind.Gateway {
+				// Do the check outside of the loop since its slow; just trigger we need it
+				checkGateway = true
+			}
+
 			if _, f := pushCdsGatewayConfig[config.Kind]; f {
-				return true
+				relevantUpdates.Insert(config)
+				continue
 			}
 		}
 
-		if _, f := skippedCdsConfigs[config.Kind]; !f {
-			return true
+		if !skippedCdsConfigs.Contains(config.Kind) {
+			relevantUpdates.Insert(config)
+		} else {
+			// we filtered a config
+			filtered = true
 		}
 	}
-	return false
+
+	if headlessOnly {
+		return req, false
+	}
+
+	needsPush := false
+
+	if checkGateway {
+		autoPassthroughModeChanged := proxy.MergedGateway.HasAutoPassthroughGateways() != proxy.PrevMergedGateway.HasAutoPassthroughGateway()
+		autoPassthroughHostsChanged := !proxy.MergedGateway.GetAutoPassthroughGatewaySNIHosts().Equals(proxy.PrevMergedGateway.GetAutoPassthroughSNIHosts())
+		gatewayNamesChanged := !slices.Equal(proxy.MergedGateway.GetGatewayNames(), proxy.PrevMergedGateway.GetGatewayNames())
+		if autoPassthroughModeChanged || autoPassthroughHostsChanged || gatewayNamesChanged {
+			needsPush = true
+		}
+	}
+
+	if filtered {
+		newPushRequest := *req
+		newPushRequest.ConfigsUpdated = relevantUpdates
+		req = &newPushRequest
+	}
+
+	return req, needsPush || len(req.ConfigsUpdated) > 0
 }
 
 func (c CdsGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
-	if !cdsNeedsPush(req, proxy) {
+	req, needsPush := cdsNeedsPush(req, proxy)
+	if !needsPush {
 		return nil, model.DefaultXdsLogDetails, nil
 	}
-	clusters, logs := c.Server.ConfigGenerator.BuildClusters(proxy, req)
+	clusters, logs := c.ConfigGenerator.BuildClusters(proxy, req)
 	return clusters, logs, nil
 }
 
-// GenerateDeltas for CDS currently only builds deltas when services change. todo implement changes for DestinationRule, etc
 func (c CdsGenerator) GenerateDeltas(proxy *model.Proxy, req *model.PushRequest,
 	w *model.WatchedResource,
 ) (model.Resources, model.DeletedResources, model.XdsLogDetails, bool, error) {
-	if !cdsNeedsPush(req, proxy) {
+	req, needsPush := cdsNeedsPush(req, proxy)
+	if !needsPush {
 		return nil, nil, model.DefaultXdsLogDetails, false, nil
 	}
-	updatedClusters, removedClusters, logs, usedDelta := c.Server.ConfigGenerator.BuildDeltaClusters(proxy, req, w)
+	updatedClusters, removedClusters, logs, usedDelta := c.ConfigGenerator.BuildDeltaClusters(proxy, req, w)
 	return updatedClusters, removedClusters, logs, usedDelta, nil
 }

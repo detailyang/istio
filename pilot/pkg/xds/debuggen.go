@@ -16,6 +16,7 @@ package xds
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -92,7 +93,7 @@ func (dg *DebugGen) Generate(proxy *model.Proxy, w *model.WatchedResource, req *
 		return nil, model.DefaultXdsLogDetails, err
 	}
 
-	buffer := processDebugRequest(dg, resourceName)
+	buffer := processDebugRequest(dg, resourceName, proxy.VerifiedIdentity.Namespace)
 
 	res := model.Resources{&discovery.Resource{
 		Name: resourceName,
@@ -119,7 +120,7 @@ func (dg *DebugGen) GenerateDeltas(
 		return nil, nil, model.DefaultXdsLogDetails, true, err
 	}
 
-	buffer := processDebugRequest(dg, resourceName)
+	buffer := processDebugRequest(dg, resourceName, proxy.VerifiedIdentity.Namespace)
 
 	res := model.Resources{&discovery.Resource{
 		Name: resourceName,
@@ -143,8 +144,11 @@ func validateProxyAuthentication(proxy *model.Proxy, w *model.WatchedResource) e
 }
 
 func parseAndValidateDebugRequest(proxy *model.Proxy, w *model.WatchedResource, dg *DebugGen) (string, error) {
-	resourceName := w.ResourceNames[0]
-	u, _ := url.Parse(resourceName)
+	resourceName := w.ResourceNames.UnsortedList()[0]
+	u, err := url.Parse(resourceName)
+	if err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "invalid debug request %q: %v", resourceName, err)
+	}
 	debugType := u.Path
 	identity := proxy.VerifiedIdentity
 	if identity.Namespace != dg.SystemNamespace {
@@ -155,10 +159,14 @@ func parseAndValidateDebugRequest(proxy *model.Proxy, w *model.WatchedResource, 
 	return resourceName, nil
 }
 
-func processDebugRequest(dg *DebugGen, resourceName string) bytes.Buffer {
+func processDebugRequest(dg *DebugGen, resourceName string, callerNamespace string) bytes.Buffer {
 	var buffer bytes.Buffer
 	debugURL := "/debug/" + resourceName
-	hreq, _ := http.NewRequest(http.MethodGet, debugURL, nil)
+	ctx := context.WithValue(context.Background(), CallerNamespaceKey{}, callerNamespace)
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, debugURL, nil)
+	if err != nil {
+		return buffer
+	}
 	handler, _ := dg.DebugMux.Handler(hreq)
 	response := NewResponseCapture()
 	handler.ServeHTTP(response, hreq)

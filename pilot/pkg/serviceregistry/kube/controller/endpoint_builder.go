@@ -17,14 +17,16 @@ package controller
 import (
 	v1 "k8s.io/api/core/v1"
 
+	"istio.io/api/annotation"
 	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	labelutil "istio.io/istio/pilot/pkg/serviceregistry/util/label"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/labels"
 	kubeUtil "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/ptr"
 )
 
 // EndpointBuilder is a stateful IstioEndpoint builder with metadata used to build IstioEndpoint
@@ -46,14 +48,18 @@ type EndpointBuilder struct {
 	subDomain string
 	// If in k8s, the node where the pod resides
 	nodeName string
+	// When true, ztunnel traffic interception is set up for the workload, so it supports
+	// receiving HBONE traffic.
+	CapturedByZtunnel bool
 }
 
-func NewEndpointBuilder(c controllerInterface, pod *v1.Pod) *EndpointBuilder {
+func (c *Controller) NewEndpointBuilder(pod *v1.Pod) *EndpointBuilder {
 	var locality, sa, namespace, hostname, subdomain, ip, node string
 	var podLabels labels.Instance
+	var capturedByZtunnel bool
 	if pod != nil {
 		locality = c.getPodLocality(pod)
-		sa = kube.SecureNamingSAN(pod)
+		sa = kube.SecureNamingSAN(pod, ptr.OrEmpty(c.meshConfig.Get()).TrustDomain)
 		podLabels = pod.Labels
 		namespace = pod.Namespace
 		subdomain = pod.Spec.Subdomain
@@ -65,8 +71,9 @@ func NewEndpointBuilder(c controllerInterface, pod *v1.Pod) *EndpointBuilder {
 		}
 		ip = pod.Status.PodIP
 		node = pod.Spec.NodeName
+		capturedByZtunnel = pod.Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled
 	}
-	dm, _ := kubeUtil.GetDeployMetaFromPod(pod)
+	dm, _ := kubeUtil.GetWorkloadMetaFromPod(pod)
 	out := &EndpointBuilder{
 		controller:     c,
 		serviceAccount: sa,
@@ -74,37 +81,17 @@ func NewEndpointBuilder(c controllerInterface, pod *v1.Pod) *EndpointBuilder {
 			Label:     locality,
 			ClusterID: c.Cluster(),
 		},
-		tlsMode:      kube.PodTLSMode(pod),
-		workloadName: dm.Name,
-		namespace:    namespace,
-		hostname:     hostname,
-		subDomain:    subdomain,
-		labels:       podLabels,
-		nodeName:     node,
+		tlsMode:           kube.PodTLSMode(pod),
+		workloadName:      dm.Name,
+		namespace:         namespace,
+		hostname:          hostname,
+		subDomain:         subdomain,
+		labels:            podLabels,
+		nodeName:          node,
+		CapturedByZtunnel: capturedByZtunnel,
 	}
 	networkID := out.endpointNetwork(ip)
 	out.labels = labelutil.AugmentLabels(podLabels, c.Cluster(), locality, node, networkID)
-	return out
-}
-
-func NewEndpointBuilderFromMetadata(c controllerInterface, proxy *model.Proxy) *EndpointBuilder {
-	locality := util.LocalityToString(proxy.Locality)
-	out := &EndpointBuilder{
-		controller:     c,
-		metaNetwork:    proxy.Metadata.Network,
-		serviceAccount: proxy.Metadata.ServiceAccount,
-		locality: model.Locality{
-			Label:     locality,
-			ClusterID: c.Cluster(),
-		},
-		tlsMode:  model.GetTLSModeFromEndpointLabels(proxy.Labels),
-		nodeName: proxy.GetNodeName(),
-	}
-	var networkID network.ID
-	if len(proxy.IPAddresses) > 0 {
-		networkID = out.endpointNetwork(proxy.IPAddresses[0])
-	}
-	out.labels = labelutil.AugmentLabels(proxy.Labels, c.Cluster(), locality, out.nodeName, networkID)
 	return out
 }
 
@@ -114,6 +101,7 @@ func (b *EndpointBuilder) buildIstioEndpoint(
 	svcPortName string,
 	discoverabilityPolicy model.EndpointDiscoverabilityPolicy,
 	healthStatus model.HealthStatus,
+	sendUnhealthy bool,
 ) *model.IstioEndpoint {
 	if b == nil {
 		return nil
@@ -127,21 +115,23 @@ func (b *EndpointBuilder) buildIstioEndpoint(
 	}
 
 	return &model.IstioEndpoint{
-		Labels:                b.labels,
-		ServiceAccount:        b.serviceAccount,
-		Locality:              b.locality,
-		TLSMode:               b.tlsMode,
-		Address:               endpointAddress,
-		EndpointPort:          uint32(endpointPort),
-		ServicePortName:       svcPortName,
-		Network:               networkID,
-		WorkloadName:          b.workloadName,
-		Namespace:             b.namespace,
-		HostName:              b.hostname,
-		SubDomain:             b.subDomain,
-		DiscoverabilityPolicy: discoverabilityPolicy,
-		HealthStatus:          healthStatus,
-		NodeName:              b.nodeName,
+		Labels:                 b.labels,
+		ServiceAccount:         b.serviceAccount,
+		Locality:               b.locality,
+		TLSMode:                b.tlsMode,
+		Addresses:              []string{endpointAddress},
+		EndpointPort:           uint32(endpointPort),
+		ServicePortName:        svcPortName,
+		Network:                networkID,
+		WorkloadName:           b.workloadName,
+		Namespace:              b.namespace,
+		HostName:               b.hostname,
+		SubDomain:              b.subDomain,
+		DiscoverabilityPolicy:  discoverabilityPolicy,
+		HealthStatus:           healthStatus,
+		SendUnhealthyEndpoints: sendUnhealthy,
+		NodeName:               b.nodeName,
+		CapturedByZtunnel:      b.CapturedByZtunnel,
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
@@ -44,18 +45,18 @@ func (mh mockMeshConfigHolder) Mesh() *meshconfig.MeshConfig {
 }
 
 func buildMockController() *Controller {
-	discovery1 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV1.DeepCopy(),
-		mock.HelloService.DeepCopy(),
-		mock.ExtHTTPService.DeepCopy(),
+	discovery1 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV1.ShallowCopy(),
+		mock.HelloService.ShallowCopy(),
+		mock.ExtHTTPService.ShallowCopy(),
 	)
 	for _, port := range mock.HelloService.Ports {
 		discovery1.AddInstance(mock.MakeServiceInstance(mock.HelloService, port, 0, model.Locality{}))
 		discovery1.AddInstance(mock.MakeServiceInstance(mock.HelloService, port, 1, model.Locality{}))
 	}
 
-	discovery2 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV2.DeepCopy(),
-		mock.WorldService.DeepCopy(),
-		mock.ExtHTTPSService.DeepCopy(),
+	discovery2 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV2.ShallowCopy(),
+		mock.WorldService.ShallowCopy(),
+		mock.ExtHTTPSService.ShallowCopy(),
 	)
 	for _, port := range mock.WorldService.Ports {
 		discovery2.AddInstance(mock.MakeServiceInstance(mock.WorldService, port, 0, model.Locality{}))
@@ -71,7 +72,8 @@ func buildMockController() *Controller {
 		DiscoveryController: discovery2,
 	}
 
-	ctls := NewController(Options{&mockMeshConfigHolder{}})
+	// No config cluster (should be fine since this is a test)
+	ctls := NewController(Options{&mockMeshConfigHolder{}, ""})
 	ctls.AddRegistry(registry1)
 	ctls.AddRegistry(registry2)
 
@@ -109,7 +111,7 @@ func buildMockControllerForMultiCluster() (*Controller, *memory.ServiceDiscovery
 }
 
 func TestServicesForMultiCluster(t *testing.T) {
-	originalHelloService := mock.HelloService.DeepCopy()
+	originalHelloService := mock.HelloService.ShallowCopy()
 	aggregateCtl, _, registry2 := buildMockControllerForMultiCluster()
 	// List Services from aggregate controller
 	services := aggregateCtl.Services()
@@ -144,7 +146,7 @@ func TestServicesForMultiCluster(t *testing.T) {
 		},
 	}
 	for _, svc := range services {
-		if !reflect.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
+		if !apiequality.Semantic.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
 			t.Fatalf("Service %s ClusterVIPs actual %v, expected %v", svc.Hostname,
 				svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname])
 		}
@@ -163,7 +165,7 @@ func TestServicesForMultiCluster(t *testing.T) {
 		},
 	}
 	for _, svc := range services {
-		if !reflect.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
+		if !apiequality.Semantic.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
 			t.Fatalf("Service %s ClusterVIPs actual %v, expected %v", svc.Hostname,
 				svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname])
 		}
@@ -273,6 +275,11 @@ func TestAddRegistry(t *testing.T) {
 			ClusterID:           "cluster2",
 			DiscoveryController: memory.NewServiceDiscovery(),
 		},
+		{
+			ProviderID:          provider.Kubernetes,
+			ClusterID:           "cluster3",
+			DiscoveryController: memory.NewServiceDiscovery(),
+		},
 	}
 	ctrl := NewController(Options{})
 
@@ -280,8 +287,11 @@ func TestAddRegistry(t *testing.T) {
 	registry2Counter := atomic.NewInt32(0)
 
 	for _, r := range registries {
+		counter := atomic.NewInt32(0)
 		clusterID := r.Cluster()
-		counter := registry1Counter
+		if clusterID == "cluster1" {
+			counter = registry1Counter
+		}
 		if clusterID == "cluster2" {
 			counter = registry2Counter
 		}
@@ -290,8 +300,13 @@ func TestAddRegistry(t *testing.T) {
 		})
 		ctrl.AddRegistry(r)
 	}
-	if l := len(ctrl.registries); l != 2 {
-		t.Fatalf("Expected length of the registries slice should be 2, got %d", l)
+	if l := len(ctrl.registries); l != 3 {
+		t.Fatalf("Expected length of the registries slice should be 3, got %d", l)
+	}
+
+	if ctrl.registries[0].Instance.Provider() != provider.Kubernetes {
+		t.Errorf("expected first registry should be %s, but got %s", provider.Kubernetes,
+			ctrl.registries[0].Instance.Provider())
 	}
 
 	registries[0].DiscoveryController.(*memory.ServiceDiscovery).AddService(mock.HelloService)
@@ -350,7 +365,7 @@ func TestGetDeleteRegistry(t *testing.T) {
 	}
 	// check left registries are orders as before
 	if !reflect.DeepEqual(result[0], wrapRegistry(registries[0])) || !reflect.DeepEqual(result[1], wrapRegistry(registries[2])) {
-		t.Fatalf("Expected registries order has been changed")
+		t.Fatal("Expected registries order has been changed")
 	}
 }
 
@@ -443,7 +458,7 @@ func TestDeferredRun(t *testing.T) {
 
 	t.Run("AddRegistry before aggregate Run does not run", func(t *testing.T) {
 		ctrl.AddRegistry(runnableRegistry("earlyAdd"))
-		ctrl.AddRegistryAndRun(runnableRegistry("earlyAddAndRun"), nil)
+		ctrl.AddRegistryAndRun(runnableRegistry("earlyAddAndRun"), stop)
 		expectRunningOrFail(t, ctrl, false)
 	})
 	t.Run("aggregate Run starts all registries", func(t *testing.T) {
@@ -459,7 +474,364 @@ func TestDeferredRun(t *testing.T) {
 		expectRunningOrFail(t, ctrl, true)
 	})
 	t.Run("AddRegistryAndRun after aggregate Run starts registry", func(t *testing.T) {
-		ctrl.AddRegistryAndRun(runnableRegistry("late"), nil)
+		ctrl.AddRegistryAndRun(runnableRegistry("late"), stop)
 		expectRunningOrFail(t, ctrl, true)
 	})
+}
+
+func TestReplaceRegistry(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	ctrl := NewController(Options{})
+
+	// Add initial registry
+	oldRegistry := runnableRegistry("cluster1")
+	ctrl.AddRegistryAndRun(oldRegistry, stop)
+
+	// Start the controller
+	go ctrl.Run(stop)
+	expectRunningOrFail(t, ctrl, true)
+
+	// Verify initial state
+	registries := ctrl.GetRegistries()
+	if len(registries) != 1 {
+		t.Fatalf("Expected 1 registry, got %d", len(registries))
+	}
+	if registries[0].Cluster() != "cluster1" {
+		t.Fatalf("Expected cluster1, got %s", registries[0].Cluster())
+	}
+
+	// Caller starts the new registry before swapping it in; UpdateRegistry only swaps.
+	// Wait for it to actually be running so the swap models the real ordering.
+	newRegistry := runnableRegistry("cluster1")
+	go newRegistry.Run(stop)
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running before swap")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+	ctrl.UpdateRegistry(newRegistry, stop)
+
+	// Verify replacement - should still have 1 registry with same cluster ID
+	registries = ctrl.GetRegistries()
+	if len(registries) != 1 {
+		t.Fatalf("Expected 1 registry after replacement, got %d", len(registries))
+	}
+	if registries[0].Cluster() != "cluster1" {
+		t.Fatalf("Expected cluster1 after replacement, got %s", registries[0].Cluster())
+	}
+
+	// Verify the new registry is running
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running")
+		}
+		return nil
+	}, retry.Timeout(50*time.Millisecond))
+
+	// Verify the old registry is NOT the one running anymore (new one replaced it)
+	// The old registry should not be running because ReplaceRegistry replaces in-place
+	// Note: oldRegistry.running is still true because it was started before replacement,
+	// but the controller now holds newRegistry, not oldRegistry
+	if !newRegistry.running.Load() {
+		t.Fatal("Expected the new registry to be running")
+	}
+}
+
+func TestReplaceRegistryAddsIfNotExists(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	ctrl := NewController(Options{})
+
+	// Wait until the controller is running before swapping, so its startup loop
+	// doesn't also start the registry we start ourselves (double-run).
+	go ctrl.Run(stop)
+	retry.UntilSuccessOrFail(t, func() error {
+		ctrl.storeLock.RLock()
+		defer ctrl.storeLock.RUnlock()
+		if !ctrl.running {
+			return fmt.Errorf("controller not running yet")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+
+	// Wait for it to actually be running so the swap models the real ordering.
+	newRegistry := runnableRegistry("newCluster")
+	go newRegistry.Run(stop)
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running before swap")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+	ctrl.UpdateRegistry(newRegistry, stop)
+
+	// Verify it was added
+	registries := ctrl.GetRegistries()
+	if len(registries) != 1 {
+		t.Fatalf("Expected 1 registry, got %d", len(registries))
+	}
+	if registries[0].Cluster() != "newCluster" {
+		t.Fatalf("Expected newCluster, got %s", registries[0].Cluster())
+	}
+
+	// Verify the new registry is running
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running")
+		}
+		return nil
+	}, retry.Timeout(50*time.Millisecond))
+}
+
+// Regression test for https://github.com/istio/istio/issues/60920: after UpdateRegistry
+// swaps a registry in, its gateway and service events must still reach the aggregate's handlers.
+func TestReplaceRegistryReloadsGateways(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	ctrl := NewController(Options{})
+
+	reloads := atomic.NewInt32(0)
+	ctrl.AppendNetworkGatewayHandler(func() { reloads.Inc() })
+	svcEvents := atomic.NewInt32(0)
+	ctrl.AppendServiceHandler(func(_, _ *model.Service, _ model.Event) { svcEvents.Inc() })
+
+	oldSD := memory.NewServiceDiscovery()
+	oldRegistry := &RunnableRegistry{
+		Instance: serviceregistry.Simple{ClusterID: "cluster1", ProviderID: "test", DiscoveryController: oldSD},
+		running:  atomic.NewBool(false),
+	}
+	oldSD.AddGateways(model.NetworkGateway{Network: "network1", Cluster: "cluster1", Addr: "1.1.1.1", Port: 15443})
+	ctrl.AddRegistryAndRun(oldRegistry, stop)
+	go ctrl.Run(stop)
+	expectRunningOrFail(t, ctrl, true)
+
+	if got := ctrl.NetworkGateways(); len(got) != 1 {
+		t.Fatalf("expected 1 gateway before swap, got %d", len(got))
+	}
+
+	// Caller starts and syncs the new registry before UpdateRegistry swaps it in.
+	newSD := memory.NewServiceDiscovery()
+	newSD.AddGateways(model.NetworkGateway{Network: "network1", Cluster: "cluster1", Addr: "1.1.1.1", Port: 15443})
+	newRegistry := &RunnableRegistry{
+		Instance: serviceregistry.Simple{ClusterID: "cluster1", ProviderID: "test", DiscoveryController: newSD},
+		running:  atomic.NewBool(false),
+	}
+	go newRegistry.Run(stop)
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running before swap")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+	ctrl.UpdateRegistry(newRegistry, stop)
+
+	if reloads.Load() == 0 {
+		t.Fatal("expected UpdateRegistry to notify gateway handlers")
+	}
+	before := reloads.Load()
+	newSD.AddGateways(model.NetworkGateway{Network: "network1", Cluster: "cluster1", Addr: "2.2.2.2", Port: 15443})
+	retry.UntilSuccessOrFail(t, func() error {
+		if reloads.Load() <= before {
+			return fmt.Errorf("gateway change on swapped-in registry did not reach handler")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+
+	if got := ctrl.NetworkGateways(); len(got) != 2 {
+		t.Fatalf("expected 2 gateways after change on swapped-in registry, got %d", len(got))
+	}
+
+	newSD.AddService(&model.Service{Hostname: "svc.example.com"})
+	retry.UntilSuccessOrFail(t, func() error {
+		if svcEvents.Load() == 0 {
+			return fmt.Errorf("service change on swapped-in registry did not reach handler")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+}
+
+// TestReplaceRegistrySyncsNewServices verifies that services added to the new registry
+// after UpdateRegistry swaps it in are visible via the aggregate controller's Services()/
+// GetService() - i.e. the swapped-in registry is actually queried, not just notified.
+func TestReplaceRegistrySyncsNewServices(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	ctrl := NewController(Options{})
+
+	oldSD := memory.NewServiceDiscovery()
+	oldSD.AddService(&model.Service{Hostname: "old.example.com", Attributes: model.ServiceAttributes{}})
+	oldRegistry := &RunnableRegistry{
+		Instance: serviceregistry.Simple{ClusterID: "cluster1", ProviderID: "test", DiscoveryController: oldSD},
+		running:  atomic.NewBool(false),
+	}
+	ctrl.AddRegistryAndRun(oldRegistry, stop)
+	go ctrl.Run(stop)
+	expectRunningOrFail(t, ctrl, true)
+
+	if svc := ctrl.GetService("old.example.com"); svc == nil {
+		t.Fatal("expected old service to be visible before swap")
+	}
+
+	// Caller starts and syncs the new registry - with its own, different set of services -
+	// before UpdateRegistry swaps it in.
+	newSD := memory.NewServiceDiscovery()
+	newSD.AddService(&model.Service{Hostname: "new.example.com", Attributes: model.ServiceAttributes{}})
+	newRegistry := &RunnableRegistry{
+		Instance: serviceregistry.Simple{ClusterID: "cluster1", ProviderID: "test", DiscoveryController: newSD},
+		running:  atomic.NewBool(false),
+	}
+	go newRegistry.Run(stop)
+	retry.UntilSuccessOrFail(t, func() error {
+		if !newRegistry.running.Load() {
+			return fmt.Errorf("new registry should be running before swap")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+	ctrl.UpdateRegistry(newRegistry, stop)
+
+	// The swapped-in registry's pre-existing service must be visible immediately.
+	if svc := ctrl.GetService("new.example.com"); svc == nil {
+		t.Fatal("expected new service to be visible immediately after swap")
+	}
+	if svc := ctrl.GetService("old.example.com"); svc != nil {
+		t.Fatal("expected old registry's service to no longer be visible after swap")
+	}
+
+	// A service added to the new registry after the swap must also be synced - this only
+	// works if appendHandlers actually wired the swapped-in registry's handlers.
+	newSD.AddService(&model.Service{Hostname: "post-swap.example.com", Attributes: model.ServiceAttributes{}})
+	retry.UntilSuccessOrFail(t, func() error {
+		if svc := ctrl.GetService("post-swap.example.com"); svc == nil {
+			return fmt.Errorf("expected service added after swap to be synced")
+		}
+		return nil
+	}, retry.Timeout(time.Second))
+
+	names := map[host.Name]bool{}
+	for _, svc := range ctrl.Services() {
+		names[svc.Hostname] = true
+	}
+	if !names["new.example.com"] || !names["post-swap.example.com"] {
+		t.Fatalf("expected Services() to include new and post-swap services, got %v", names)
+	}
+	if names["old.example.com"] {
+		t.Fatalf("expected Services() to no longer include old registry's service, got %v", names)
+	}
+}
+
+func TestMergeServiceWithSameTrustDomain(t *testing.T) {
+	svc1 := mock.MakeService(mock.ServiceArgs{
+		Hostname:        "test.default.svc.cluster.local",
+		Address:         "10.1.0.1",
+		ServiceAccounts: []string{"spiffe://cluster.local/ns/default/sa/test-sa"},
+		ClusterID:       "cluster-1",
+	})
+	svc2 := mock.MakeService(mock.ServiceArgs{
+		Hostname:        "test.default.svc.cluster.local",
+		Address:         "10.2.0.1",
+		ServiceAccounts: []string{"spiffe://cluster.local/ns/default/sa/test-sa"},
+		ClusterID:       "cluster-2",
+	})
+
+	discovery1 := memory.NewServiceDiscovery(svc1)
+	discovery2 := memory.NewServiceDiscovery(svc2)
+
+	registry1 := serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-1",
+		DiscoveryController: discovery1,
+	}
+
+	registry2 := serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-2",
+		DiscoveryController: discovery2,
+	}
+
+	ctrl := NewController(Options{
+		MeshHolder: &mockMeshConfigHolder{},
+	})
+	ctrl.AddRegistry(registry1)
+	ctrl.AddRegistry(registry2)
+
+	mergedSvc := ctrl.GetService(svc1.Hostname)
+	if mergedSvc == nil {
+		t.Fatal("Failed to get merged service")
+	}
+
+	expectedClusterVIPs := map[cluster.ID][]string{
+		"cluster-1": {"10.1.0.1"},
+		"cluster-2": {"10.2.0.1"},
+	}
+	if !apiequality.Semantic.DeepEqual(mergedSvc.ClusterVIPs.Addresses, expectedClusterVIPs) {
+		t.Errorf("ClusterVIPs mismatch.\nGot: %v\nWant: %v",
+			mergedSvc.ClusterVIPs.Addresses, expectedClusterVIPs)
+	}
+
+	expectedServiceAccounts := []string{"spiffe://cluster.local/ns/default/sa/test-sa"}
+	if !apiequality.Semantic.DeepEqual(mergedSvc.ServiceAccounts, expectedServiceAccounts) {
+		t.Errorf("ServiceAccounts mismatch.\nGot: %v\nWant: %v",
+			mergedSvc.ServiceAccounts, expectedServiceAccounts)
+	}
+}
+
+func TestMergeServiceWithDistinctTrustDomains(t *testing.T) {
+	svc1 := mock.MakeService(mock.ServiceArgs{
+		Hostname:        "test.default.svc.cluster.local",
+		Address:         "10.1.0.1",
+		ServiceAccounts: []string{"spiffe://mesh.east/ns/default/sa/test-sa"},
+		ClusterID:       "cluster-east",
+	})
+	svc2 := mock.MakeService(mock.ServiceArgs{
+		Hostname:        "test.default.svc.cluster.local",
+		Address:         "10.2.0.1",
+		ServiceAccounts: []string{"spiffe://mesh.west/ns/default/sa/test-sa"},
+		ClusterID:       "cluster-west",
+	})
+
+	discovery1 := memory.NewServiceDiscovery(svc1)
+	discovery2 := memory.NewServiceDiscovery(svc2)
+
+	registry1 := serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-east",
+		DiscoveryController: discovery1,
+	}
+
+	registry2 := serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-west",
+		DiscoveryController: discovery2,
+	}
+
+	ctrl := NewController(Options{
+		MeshHolder: &mockMeshConfigHolder{},
+	})
+	ctrl.AddRegistry(registry1)
+	ctrl.AddRegistry(registry2)
+
+	mergedSvc := ctrl.GetService(svc1.Hostname)
+	if mergedSvc == nil {
+		t.Fatal("Failed to get merged service")
+	}
+
+	expectedClusterVIPs := map[cluster.ID][]string{
+		"cluster-east": {"10.1.0.1"},
+		"cluster-west": {"10.2.0.1"},
+	}
+	if !apiequality.Semantic.DeepEqual(mergedSvc.ClusterVIPs.Addresses, expectedClusterVIPs) {
+		t.Errorf("ClusterVIPs mismatch.\nGot: %v\nWant: %v",
+			mergedSvc.ClusterVIPs.Addresses, expectedClusterVIPs)
+	}
+
+	expectedServiceAccounts := []string{
+		"spiffe://mesh.east/ns/default/sa/test-sa",
+		"spiffe://mesh.west/ns/default/sa/test-sa",
+	}
+	if !apiequality.Semantic.DeepEqual(mergedSvc.ServiceAccounts, expectedServiceAccounts) {
+		t.Errorf("ServiceAccounts mismatch.\nGot: %v\nWant: %v",
+			mergedSvc.ServiceAccounts, expectedServiceAccounts)
+	}
 }

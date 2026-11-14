@@ -145,6 +145,7 @@ func newForwardRequest(opts echo.CallOptions) *proto.ForwardEchoRequest {
 		FollowRedirects:         opts.HTTP.FollowRedirects,
 		ServerName:              opts.TLS.ServerName,
 		NewConnectionPerRequest: opts.NewConnectionPerRequest,
+		ForceIpFamily:           opts.ForceIPFamily,
 		ForceDNSLookup:          opts.ForceDNSLookup,
 		Hbone: &proto.HBONE{
 			Address:            opts.HBONE.Address,
@@ -157,7 +158,20 @@ func newForwardRequest(opts echo.CallOptions) *proto.ForwardEchoRequest {
 			CaCertFile:         opts.HBONE.CaCertFile,
 			InsecureSkipVerify: opts.HBONE.InsecureSkipVerify,
 		},
+		DoubleHbone: &proto.HBONE{
+			Address:            opts.DoubleHBONE.Address,
+			Headers:            common.HTTPToProtoHeaders(opts.DoubleHBONE.Headers),
+			Cert:               opts.DoubleHBONE.Cert,
+			Key:                opts.DoubleHBONE.Key,
+			CaCert:             opts.DoubleHBONE.CaCert,
+			CertFile:           opts.DoubleHBONE.CertFile,
+			KeyFile:            opts.DoubleHBONE.KeyFile,
+			CaCertFile:         opts.DoubleHBONE.CaCertFile,
+			InsecureSkipVerify: opts.DoubleHBONE.InsecureSkipVerify,
+		},
 		ProxyProtocolVersion: getProxyProtoVersion(opts.ProxyProtocolVersion),
+		TlsMinVersion:        opts.TLS.MinVersion,
+		TlsCurvePreferences:  opts.TLS.CurvePreferences,
 	}
 }
 

@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -18,26 +17,36 @@
 package pilot
 
 import (
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	controllruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
+	"sigs.k8s.io/gateway-api/conformance"
+	confv1 "sigs.k8s.io/gateway-api/conformance/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
+	"sigs.k8s.io/yaml"
 
+	"istio.io/istio/pilot/pkg/config/kube/gateway"
 	"istio.io/istio/pkg/kube"
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/namespace"
+	"istio.io/istio/pkg/test/prow"
 	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/tests/integration/pilot/gatewayconformance"
 )
 
 // GatewayConformanceInputs defines inputs to the gateway conformance test.
 // The upstream build requires using `testing.T` types, which we cannot pass using our framework.
-// To workaround this, we set up the inputs it TestMain.
+// To workaround this, we set up the inputs in TestMain.
 type GatewayConformanceInputs struct {
 	Client  kube.CLIClient
 	Cleanup bool
@@ -55,18 +64,19 @@ var conformanceNamespaces = []string{
 }
 
 var skippedTests = map[string]string{
-	"MeshFrontendHostname": "https://github.com/istio/istio/issues/44702",
-}
-
-func init() {
-	scope := log.RegisterScope("controlleruntime", "scope for controller runtime")
-	controllruntimelog.SetLogger(log.NewLogrAdapter(scope))
+	// The following tests were added in v1.5.0
+	"HTTPRouteHTTPSListenerDetectMisdirectedRequests": "TODO",
+	// The following tests were added in v1.7.0
+	// Istio derives the upstream protocol from the Service port; the test Service has no appProtocol,
+	// so we send HTTP/1.1 (no h2 ALPN) to the TLS gRPC backend.
+	"BackendTLSPolicyGRPCRoute": "TODO",
+	// Backends have sidecars, which turn the connection error into a 503 response, so the gateway does not retry.
+	"HTTPRouteRetryConnectionError": "TODO",
 }
 
 func TestGatewayConformance(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.gateway").
 		Run(func(ctx framework.TestContext) {
 			crd.DeployGatewayAPIOrSkip(ctx)
 
@@ -80,28 +90,60 @@ func TestGatewayConformance(t *testing.T) {
 				}
 			}
 
-			mapper, _ := gatewayConformanceInputs.Client.UtilFactory().ToRESTMapper()
-			c, err := client.New(gatewayConformanceInputs.Client.RESTConfig(), client.Options{
+			clientOptions := client.Options{
 				Scheme: kube.IstioScheme,
-				Mapper: mapper,
-			})
+			}
+			c, err := client.New(gatewayConformanceInputs.Client.RESTConfig(), clientOptions)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			features := suite.AllFeatures
+			supportedFeatures := gateway.SupportedFeatures.Clone().
+				Delete(features.MeshClusterIPMatchingFeature) // https://github.com/istio/istio/issues/44702
+
+			// Standard-only selection goes through SkipTests, leaving supportedFeatures to
+			// advertise what Istio actually implements. Conformance tests read it at runtime
+			// to decide whether their assertions apply.
+			testsToSkip := skippedTests
+			if ctx.Settings().GatewayConformanceStandardOnly {
+				testsToSkip = gatewayconformance.SkipNonStandardTests(tests.ConformanceTests, skippedTests)
+			}
+
 			hostnameType := v1.AddressType("Hostname")
-			opts := suite.Options{
-				Client:                   c,
-				Clientset:                gatewayConformanceInputs.Client.Kube(),
-				RestConfig:               gatewayConformanceInputs.Client.RESTConfig(),
-				GatewayClassName:         "istio",
-				Debug:                    scopes.Framework.DebugEnabled(),
-				CleanupBaseResources:     gatewayConformanceInputs.Cleanup,
-				SupportedFeatures:        features,
-				SkipTests:                maps.Keys(skippedTests),
-				UsableNetworkAddresses:   []v1.GatewayAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
-				UnusableNetworkAddresses: []v1.GatewayAddress{{Value: "foo", Type: &hostnameType}},
+			istioVersion, _ := env.ReadVersion()
+			// Honor the --istio.test.kube.gatewayClassName flag if set; otherwise this is DefaultGatewayClassName ("istio").
+			gatewayClassName := i.Settings().GatewayClassName
+			opts := suite.ConformanceOptions{
+				ConfigurableOptions: suite.ConfigurableOptions{
+					GatewayClassName:         gatewayClassName,
+					Debug:                    scopes.Framework.DebugEnabled(),
+					CleanupBaseResources:     gatewayConformanceInputs.Cleanup,
+					CleanupTestResources:     gatewayConformanceInputs.Cleanup,
+					SupportedFeatures:        features.SetsToNamesSet(supportedFeatures).UnsortedList(),
+					SkipTests:                maps.Keys(testsToSkip),
+					UsableNetworkAddresses:   []v1.GatewaySpecAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
+					UnusableNetworkAddresses: []v1.GatewaySpecAddress{{Value: "foo", Type: &hostnameType}},
+					ConformanceProfiles: []suite.ConformanceProfileName{
+						suite.GatewayHTTPConformanceProfileName,
+						suite.GatewayTLSConformanceProfileName,
+						suite.GatewayGRPCConformanceProfileName,
+						suite.GatewayTCPConformanceProfileName,
+						suite.MeshHTTPConformanceProfileName,
+					},
+					Implementation: confv1.Implementation{
+						Organization: "istio",
+						Project:      "istio",
+						URL:          "https://istio.io/",
+						Version:      istioVersion,
+						Contact:      []string{"@istio/maintainers"},
+					},
+					TimeoutConfig: ctx.Settings().GatewayConformanceTimeoutConfig,
+				},
+				Client:        c,
+				Clientset:     gatewayConformanceInputs.Client.Kube(),
+				ClientOptions: clientOptions,
+				RestConfig:    gatewayConformanceInputs.Client.RESTConfig(),
+				ManifestFS:    []fs.FS{&conformance.Manifests},
 			}
 			if rev := ctx.Settings().Revisions.Default(); rev != "" {
 				opts.NamespaceLabels = map[string]string{
@@ -111,6 +153,9 @@ func TestGatewayConformance(t *testing.T) {
 				opts.NamespaceLabels = map[string]string{
 					"istio-injection": "enabled",
 				}
+			}
+			if ctx.Settings().GatewayConformanceAllowCRDsMismatch {
+				opts.AllowCRDsMismatch = true
 			}
 			ctx.Cleanup(func() {
 				if !ctx.Failed() {
@@ -123,8 +168,20 @@ func TestGatewayConformance(t *testing.T) {
 				}
 			})
 
-			csuite := suite.New(opts)
-			csuite.Setup(t)
-			csuite.Run(t, tests.ConformanceTests)
+			csuite, err := suite.NewConformanceTestSuite(opts)
+			assert.NoError(t, err)
+			csuite.Setup(t, tests.ConformanceTests)
+			// Run marks the suite as finished in a t.Cleanup, so the report can only be generated after that.
+			// Cleanups run in reverse order, so register this before calling Run.
+			t.Cleanup(func() {
+				report, err := csuite.Report()
+				assert.NoError(t, err)
+				reportb, err := yaml.Marshal(report)
+				assert.NoError(t, err)
+				fp := filepath.Join(ctx.Settings().BaseDir, "istio-conformance.yaml")
+				t.Logf("writing conformance test to %v (%v)", fp, prow.ArtifactsURL(fp))
+				assert.NoError(t, os.WriteFile(fp, reportb, 0o644))
+			})
+			assert.NoError(t, csuite.Run(t, tests.ConformanceTests))
 		})
 }

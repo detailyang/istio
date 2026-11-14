@@ -56,10 +56,6 @@ var (
 	// Description: A VirtualService routes to a service with more than one port exposed, but does not specify which to use.
 	VirtualServiceDestinationPortSelectorRequired = diag.NewMessageType(diag.Error, "IST0112", "This VirtualService routes to a service %q that exposes multiple ports %v. Specifying a port in the destination is required to disambiguate.")
 
-	// MTLSPolicyConflict defines a diag.MessageType for message "MTLSPolicyConflict".
-	// Description: A DestinationRule and Policy are in conflict with regards to mTLS.
-	MTLSPolicyConflict = diag.NewMessageType(diag.Error, "IST0113", "A DestinationRule and Policy are in conflict with regards to mTLS for host %s. The DestinationRule %q specifies that mTLS must be %t but the Policy object %q specifies %s.")
-
 	// DeploymentAssociatedToMultipleServices defines a diag.MessageType for message "DeploymentAssociatedToMultipleServices".
 	// Description: The resulting pods of a service mesh deployment can't be associated with multiple services using the same port but different protocols.
 	DeploymentAssociatedToMultipleServices = diag.NewMessageType(diag.Warning, "IST0116", "This deployment %s is associated with multiple services using port %d but different protocols: %v")
@@ -67,14 +63,6 @@ var (
 	// PortNameIsNotUnderNamingConvention defines a diag.MessageType for message "PortNameIsNotUnderNamingConvention".
 	// Description: Port name is not under naming convention. Protocol detection is applied to the port.
 	PortNameIsNotUnderNamingConvention = diag.NewMessageType(diag.Info, "IST0118", "Port name %s (port: %d, targetPort: %s) doesn't follow the naming convention of Istio port.")
-
-	// JwtFailureDueToInvalidServicePortPrefix defines a diag.MessageType for message "JwtFailureDueToInvalidServicePortPrefix".
-	// Description: Authentication policy with JWT targets Service with invalid port specification.
-	JwtFailureDueToInvalidServicePortPrefix = diag.NewMessageType(diag.Warning, "IST0119", "Authentication policy with JWT targets Service with invalid port specification (port: %d, name: %s, protocol: %s, targetPort: %s).")
-
-	// InvalidRegexp defines a diag.MessageType for message "InvalidRegexp".
-	// Description: Invalid Regex
-	InvalidRegexp = diag.NewMessageType(diag.Warning, "IST0122", "Field %q regular expression invalid: %q (%s)")
 
 	// NamespaceMultipleInjectionLabels defines a diag.MessageType for message "NamespaceMultipleInjectionLabels".
 	// Description: A namespace has more than one type of injection labels
@@ -117,7 +105,7 @@ var (
 	SchemaWarning = diag.NewMessageType(diag.Warning, "IST0133", "Schema validation warning: %v")
 
 	// ServiceEntryAddressesRequired defines a diag.MessageType for message "ServiceEntryAddressesRequired".
-	// Description: Virtual IP addresses are required for ports serving TCP (or unset) protocol
+	// Description: Virtual IP addresses are required for ports serving TCP (or unset) protocol when PILOT_ENABLE_IP_AUTOALLOCATE is not set on a proxy
 	ServiceEntryAddressesRequired = diag.NewMessageType(diag.Warning, "IST0134", "ServiceEntry addresses are required for this protocol.")
 
 	// DeprecatedAnnotation defines a diag.MessageType for message "DeprecatedAnnotation".
@@ -208,6 +196,10 @@ var (
 	// Description: The Gateway API CRD version is not supported
 	UnsupportedGatewayAPIVersion = diag.NewMessageType(diag.Error, "IST0156", "The Gateway API CRD version %v is lower than the minimum version: %v")
 
+	// FutureUnsupportedGatewayAPIVersion defines a diag.MessageType for message "FutureUnsupportedGatewayAPIVersion".
+	// Description: The Gateway API CRD version will not be supported in the future
+	FutureUnsupportedGatewayAPIVersion = diag.NewMessageType(diag.Warning, "IST0172", "The Gateway API CRD version %v is lower than the minimum version: %v")
+
 	// InvalidTelemetryProvider defines a diag.MessageType for message "InvalidTelemetryProvider".
 	// Description: The Telemetry with empty providers will be ignored
 	InvalidTelemetryProvider = diag.NewMessageType(diag.Warning, "IST0157", "The Telemetry %v in namespace %q with empty providers will be ignored.")
@@ -247,6 +239,50 @@ var (
 	// IneffectiveSelector defines a diag.MessageType for message "IneffectiveSelector".
 	// Description: Selector has no effect when applied to Kubernetes Gateways.
 	IneffectiveSelector = diag.NewMessageType(diag.Warning, "IST0166", "Ineffective selector on Kubernetes Gateway %s. Use the TargetRef field instead.")
+
+	// IneffectivePolicy defines a diag.MessageType for message "IneffectivePolicy".
+	// Description: The policy applied has no impact.
+	IneffectivePolicy = diag.NewMessageType(diag.Warning, "IST0167", "The policy has no impact: %s.")
+
+	// UnknownUpgradeCompatibility defines a diag.MessageType for message "UnknownUpgradeCompatibility".
+	// Description: We cannot automatically detect whether a change is fully compatible or not
+	UnknownUpgradeCompatibility = diag.NewMessageType(diag.Warning, "IST0168", "The configuration %q changed in release %s, but compatibility cannot be automatically detected: %s. Or, install with `--set compatibilityVersion=%s` to retain the old default.")
+
+	// UpdateIncompatibility defines a diag.MessageType for message "UpdateIncompatibility".
+	// Description: The provided configuration object may be incompatible due to an upgrade
+	UpdateIncompatibility = diag.NewMessageType(diag.Warning, "IST0169", "The configuration %q changed in release %s: %s. Or, install with `--set compatibilityVersion=%s` to retain the old default.")
+
+	// MultiClusterInconsistentService defines a diag.MessageType for message "MultiClusterInconsistentService".
+	// Description: The services live in different clusters under multi-cluster deployment model are inconsistent
+	MultiClusterInconsistentService = diag.NewMessageType(diag.Warning, "IST0170", "The service %v in namespace %q is inconsistent across clusters %q, which can lead to undefined behaviors. The inconsistent behaviors are: %v.")
+
+	// NegativeConditionStatus defines a diag.MessageType for message "NegativeConditionStatus".
+	// Description: A condition with a negative status is present
+	NegativeConditionStatus = diag.NewMessageType(diag.Warning, "IST0171", "A condition with a negative status is present: type=%s, reason=%s, message=%s.")
+
+	// DestinationRuleSubsetNotSelectPods defines a diag.MessageType for message "DestinationRuleSubsetNotSelectPods".
+	// Description: Subsets defined in destination does not select any pods.
+	DestinationRuleSubsetNotSelectPods = diag.NewMessageType(diag.Error, "IST0173", "The Subset %s defined in the DestinationRule does not select any pods. Which may lead to 503 UH (NoHealthyUpstream).")
+
+	// UnknownDestinationRuleHost defines a diag.MessageType for message "UnknownDestinationRuleHost".
+	// Description: Host defined in destination rule does not match any services in the mesh.
+	UnknownDestinationRuleHost = diag.NewMessageType(diag.Warning, "IST0174", "The host %s defined in the DestinationRule does not match any services in the mesh.")
+
+	// JwksUriFetchUnrestricted defines a diag.MessageType for message "JwksUriFetchUnrestricted".
+	// Description: RequestAuthentication resources exist but BLOCKED_CIDRS_IN_JWKS_URIS is not configured on istiod.
+	JwksUriFetchUnrestricted = diag.NewMessageType(diag.Warning, "IST0175", "BLOCKED_CIDRS_IN_JWKS_URIS is not configured but %d RequestAuthentication resource(s) exist (%s). Consider configuring it to restrict JWKS URI fetches to trusted networks.")
+
+	// GatewayAPICRDVersionBelowMinimum defines a diag.MessageType for message "GatewayAPICRDVersionBelowMinimum".
+	// Description: A Gateway API CRD is installed at a version below the minimum required by this Istio version. Resources of this kind will not be processed.
+	GatewayAPICRDVersionBelowMinimum = diag.NewMessageType(diag.Warning, "IST0176", "Gateway API CRD %q is at version %q but Istio requires at least %q; resources of this kind will not be processed. Upgrade the Gateway API CRDs to satisfy the minimum version.")
+
+	// ConflictingServiceEntryProtocol defines a diag.MessageType for message "ConflictingServiceEntryProtocol".
+	// Description: Multiple ServiceEntries define the same host and port with conflicting protocols.
+	ConflictingServiceEntryProtocol = diag.NewMessageType(diag.Warning, "IST0177", "Multiple ServiceEntries (%s) define the same host %q and port %d with conflicting protocols (%s).")
+
+	// EnvoyFilterMayClearRouteCache defines a diag.MessageType for message "EnvoyFilterMayClearRouteCache".
+	// Description: Using EnvoyFilters with route-dependent filters may cause the routing cache to be cleared after the route-dependent filter has run.
+	EnvoyFilterMayClearRouteCache = diag.NewMessageType(diag.Warning, "IST0178", "Using an EnvoyFilter with route-dependent filters may cause the routing cache to be cleared after the route-dependent filter has run. This can cause a request to be routed differently than it was when the route-dependent filter was evaluated. See https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/http/http_filters.html#security-considerations.")
 )
 
 // All returns a list of all known message types.
@@ -264,11 +300,8 @@ func All() []*diag.MessageType {
 		ConflictingSidecarWorkloadSelectors,
 		MultipleSidecarsWithoutWorkloadSelectors,
 		VirtualServiceDestinationPortSelectorRequired,
-		MTLSPolicyConflict,
 		DeploymentAssociatedToMultipleServices,
 		PortNameIsNotUnderNamingConvention,
-		JwtFailureDueToInvalidServicePortPrefix,
-		InvalidRegexp,
 		NamespaceMultipleInjectionLabels,
 		InvalidAnnotation,
 		UnknownMeshNetworksServiceRegistry,
@@ -302,6 +335,7 @@ func All() []*diag.MessageType {
 		EnvoyFilterUsesRemoveOperationIncorrectly,
 		EnvoyFilterUsesRelativeOperationWithProxyVersion,
 		UnsupportedGatewayAPIVersion,
+		FutureUnsupportedGatewayAPIVersion,
 		InvalidTelemetryProvider,
 		PodsIstioProxyImageMismatchInNamespace,
 		ConflictingTelemetryWorkloadSelectors,
@@ -312,6 +346,17 @@ func All() []*diag.MessageType {
 		ExternalControlPlaneAddressIsNotAHostname,
 		ReferencedInternalGateway,
 		IneffectiveSelector,
+		IneffectivePolicy,
+		UnknownUpgradeCompatibility,
+		UpdateIncompatibility,
+		MultiClusterInconsistentService,
+		NegativeConditionStatus,
+		DestinationRuleSubsetNotSelectPods,
+		UnknownDestinationRuleHost,
+		JwksUriFetchUnrestricted,
+		GatewayAPICRDVersionBelowMinimum,
+		ConflictingServiceEntryProtocol,
+		EnvoyFilterMayClearRouteCache,
 	}
 }
 
@@ -431,19 +476,6 @@ func NewVirtualServiceDestinationPortSelectorRequired(r *resource.Instance, dest
 	)
 }
 
-// NewMTLSPolicyConflict returns a new diag.Message based on MTLSPolicyConflict.
-func NewMTLSPolicyConflict(r *resource.Instance, host string, destinationRuleName string, destinationRuleMTLSMode bool, policyName string, policyMTLSMode string) diag.Message {
-	return diag.NewMessage(
-		MTLSPolicyConflict,
-		r,
-		host,
-		destinationRuleName,
-		destinationRuleMTLSMode,
-		policyName,
-		policyMTLSMode,
-	)
-}
-
 // NewDeploymentAssociatedToMultipleServices returns a new diag.Message based on DeploymentAssociatedToMultipleServices.
 func NewDeploymentAssociatedToMultipleServices(r *resource.Instance, deployment string, port int32, services []string) diag.Message {
 	return diag.NewMessage(
@@ -463,29 +495,6 @@ func NewPortNameIsNotUnderNamingConvention(r *resource.Instance, portName string
 		portName,
 		port,
 		targetPort,
-	)
-}
-
-// NewJwtFailureDueToInvalidServicePortPrefix returns a new diag.Message based on JwtFailureDueToInvalidServicePortPrefix.
-func NewJwtFailureDueToInvalidServicePortPrefix(r *resource.Instance, port int, portName string, protocol string, targetPort string) diag.Message {
-	return diag.NewMessage(
-		JwtFailureDueToInvalidServicePortPrefix,
-		r,
-		port,
-		portName,
-		protocol,
-		targetPort,
-	)
-}
-
-// NewInvalidRegexp returns a new diag.Message based on InvalidRegexp.
-func NewInvalidRegexp(r *resource.Instance, where string, re string, problem string) diag.Message {
-	return diag.NewMessage(
-		InvalidRegexp,
-		r,
-		where,
-		re,
-		problem,
 	)
 }
 
@@ -806,6 +815,16 @@ func NewUnsupportedGatewayAPIVersion(r *resource.Instance, version string, minim
 	)
 }
 
+// NewFutureUnsupportedGatewayAPIVersion returns a new diag.Message based on FutureUnsupportedGatewayAPIVersion.
+func NewFutureUnsupportedGatewayAPIVersion(r *resource.Instance, version string, minimumVersion string) diag.Message {
+	return diag.NewMessage(
+		FutureUnsupportedGatewayAPIVersion,
+		r,
+		version,
+		minimumVersion,
+	)
+}
+
 // NewInvalidTelemetryProvider returns a new diag.Message based on InvalidTelemetryProvider.
 func NewInvalidTelemetryProvider(r *resource.Instance, name string, namespace string) diag.Message {
 	return diag.NewMessage(
@@ -903,5 +922,120 @@ func NewIneffectiveSelector(r *resource.Instance, gateway string) diag.Message {
 		IneffectiveSelector,
 		r,
 		gateway,
+	)
+}
+
+// NewIneffectivePolicy returns a new diag.Message based on IneffectivePolicy.
+func NewIneffectivePolicy(r *resource.Instance, reason string) diag.Message {
+	return diag.NewMessage(
+		IneffectivePolicy,
+		r,
+		reason,
+	)
+}
+
+// NewUnknownUpgradeCompatibility returns a new diag.Message based on UnknownUpgradeCompatibility.
+func NewUnknownUpgradeCompatibility(r *resource.Instance, field string, release string, info string, compatVersion string) diag.Message {
+	return diag.NewMessage(
+		UnknownUpgradeCompatibility,
+		r,
+		field,
+		release,
+		info,
+		compatVersion,
+	)
+}
+
+// NewUpdateIncompatibility returns a new diag.Message based on UpdateIncompatibility.
+func NewUpdateIncompatibility(r *resource.Instance, field string, release string, info string, compatVersion string) diag.Message {
+	return diag.NewMessage(
+		UpdateIncompatibility,
+		r,
+		field,
+		release,
+		info,
+		compatVersion,
+	)
+}
+
+// NewMultiClusterInconsistentService returns a new diag.Message based on MultiClusterInconsistentService.
+func NewMultiClusterInconsistentService(r *resource.Instance, serviceName string, namespace string, clusters []string, error string) diag.Message {
+	return diag.NewMessage(
+		MultiClusterInconsistentService,
+		r,
+		serviceName,
+		namespace,
+		clusters,
+		error,
+	)
+}
+
+// NewNegativeConditionStatus returns a new diag.Message based on NegativeConditionStatus.
+func NewNegativeConditionStatus(r *resource.Instance, conditionType string, reason string, message string) diag.Message {
+	return diag.NewMessage(
+		NegativeConditionStatus,
+		r,
+		conditionType,
+		reason,
+		message,
+	)
+}
+
+// NewDestinationRuleSubsetNotSelectPods returns a new diag.Message based on DestinationRuleSubsetNotSelectPods.
+func NewDestinationRuleSubsetNotSelectPods(r *resource.Instance, subset string) diag.Message {
+	return diag.NewMessage(
+		DestinationRuleSubsetNotSelectPods,
+		r,
+		subset,
+	)
+}
+
+// NewUnknownDestinationRuleHost returns a new diag.Message based on UnknownDestinationRuleHost.
+func NewUnknownDestinationRuleHost(r *resource.Instance, host string) diag.Message {
+	return diag.NewMessage(
+		UnknownDestinationRuleHost,
+		r,
+		host,
+	)
+}
+
+// NewJwksUriFetchUnrestricted returns a new diag.Message based on JwksUriFetchUnrestricted.
+func NewJwksUriFetchUnrestricted(r *resource.Instance, count int, names string) diag.Message {
+	return diag.NewMessage(
+		JwksUriFetchUnrestricted,
+		r,
+		count,
+		names,
+	)
+}
+
+// NewGatewayAPICRDVersionBelowMinimum returns a new diag.Message based on GatewayAPICRDVersionBelowMinimum.
+func NewGatewayAPICRDVersionBelowMinimum(r *resource.Instance, crd string, installedVersion string, minimumVersion string) diag.Message {
+	return diag.NewMessage(
+		GatewayAPICRDVersionBelowMinimum,
+		r,
+		crd,
+		installedVersion,
+		minimumVersion,
+	)
+}
+
+// NewConflictingServiceEntryProtocol returns a new diag.Message based on ConflictingServiceEntryProtocol.
+func NewConflictingServiceEntryProtocol(r *resource.Instance, serviceEntryNames string, host string, port int, protocols string) diag.Message {
+	return diag.NewMessage(
+		ConflictingServiceEntryProtocol,
+		r,
+		serviceEntryNames,
+		host,
+		port,
+		protocols,
+	)
+}
+
+// NewEnvoyFilterMayClearRouteCache returns a new diag.Message based on EnvoyFilterMayClearRouteCache.
+func NewEnvoyFilterMayClearRouteCache(r *resource.Instance) diag.Message {
+	return diag.NewMessage(
+		EnvoyFilterMayClearRouteCache,
+		r,
 	)
 }

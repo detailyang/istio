@@ -15,40 +15,34 @@
 package model
 
 import (
+	gotls "crypto/tls"
 	"strings"
-	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	"google.golang.org/protobuf/types/known/durationpb"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/model/credentials"
 	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pkg/log"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/spiffe"
 )
 
 const (
 	// SDSClusterName is the name of the cluster for SDS connections
-	SDSClusterName = "sds-grpc"
+	SDSClusterName = pm.SDSClusterName
 
 	// SDSDefaultResourceName is the default name in sdsconfig, used for fetching normal key/cert.
-	SDSDefaultResourceName = "default"
+	SDSDefaultResourceName = pm.SDSDefaultResourceName
 
 	// SDSRootResourceName is the sdsconfig name for root CA, used for fetching root cert.
-	SDSRootResourceName = "ROOTCA"
+	SDSRootResourceName = pm.SDSRootResourceName
 
-	// K8sSAJwtFileName is the token volume mount file name for k8s jwt token.
-	K8sSAJwtFileName = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-
-	// K8sSATrustworthyJwtFileName is the token volume mount file name for k8s trustworthy jwt token.
-	K8sSATrustworthyJwtFileName = "/var/run/secrets/tokens/istio-token"
-
-	// K8sSAJwtTokenHeaderKey is the request header key for k8s jwt token.
-	// Binary header name must has suffix "-bin", according to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
-	K8sSAJwtTokenHeaderKey = "istio_sds_credentials_header-bin"
+	// ThirdPartyJwtPath is the token volume mount file name for k8s trustworthy jwt token.
+	ThirdPartyJwtPath = "/var/run/secrets/tokens/istio-token"
 
 	// SdsCaSuffix is the suffix of the sds resource name for root CA.
 	SdsCaSuffix = credentials.SdsCaSuffix
@@ -68,11 +62,28 @@ var SDSAdsConfig = &core.ConfigSource{
 	ResourceApiVersion: core.ApiVersion_V3,
 }
 
-// ConstructSdsSecretConfigForCredential constructs SDS secret configuration used
-// from certificates referenced by credentialName in DestinationRule or Gateway.
-// Currently this is served by a local SDS server, but in the future replaced by
-// Istiod SDS server.
-func ConstructSdsSecretConfigForCredential(name string, credentialSocketExist bool) *tls.SdsSecretConfig {
+// ConstructSdsSecretConfigForCredential constructs SDS secret configuration
+// referencing a credential by name, resolved from a DestinationRule or Gateway.
+func ConstructSdsSecretConfigForCredential(name string, credentialSocketExist bool, push *model.PushContext) *tls.SdsSecretConfig {
+	return constructSdsSecretConfigForCredential(name, credentialSocketExist, push, false)
+}
+
+// ConstructSdsSecretConfigForCaCredential constructs SDS secret configuration
+// referencing a CA certificate, for a credential name stored in a
+// DestinationRule's ClientTLSSettings, either in caCertCredentialName or
+// credentialName with the CA cert suffix appended.
+//
+// It differs for "sds://" names. The "-cacert" suffix is never appended to
+// them, because the resource name is sent verbatim to the external SDS server.
+// If no external SDS server is reachable we fall back to resolving the name as
+// a Kubernetes Secret via istiod, and at that point the suffix is what tells
+// istiod to serve the CA rather than the certificate and key, so it has to be
+// restored.
+func ConstructSdsSecretConfigForCaCredential(name string, credentialSocketExist bool, push *model.PushContext) *tls.SdsSecretConfig {
+	return constructSdsSecretConfigForCredential(name, credentialSocketExist, push, true)
+}
+
+func constructSdsSecretConfigForCredential(name string, credentialSocketExist bool, push *model.PushContext, isCA bool) *tls.SdsSecretConfig {
 	if name == "" {
 		return nil
 	}
@@ -82,10 +93,43 @@ func ConstructSdsSecretConfigForCredential(name string, credentialSocketExist bo
 	if name == credentials.BuiltinGatewaySecretTypeURI+SdsCaSuffix {
 		return ConstructSdsSecretConfig(SDSRootResourceName)
 	}
-	// if credentialSocketExist exists and credentialName is using SDSExternalCredentialPrefix
-	// SDS will be served via SDSExternalClusterName
-	if credentialSocketExist && strings.HasPrefix(name, security.SDSExternalCredentialPrefix) {
-		return ConstructSdsSecretConfigForCredentialSocket(name)
+	// External SDS: credentialName format is "sds://<resource-name>".
+	// The resource name (after stripping the sds:// prefix) is sent as-is to the SDS server,
+	// allowing the server to differentiate between different certificates.
+	//
+	// Priority order:
+	//   1. UDS socket (credential metadata on the proxy) — local SDS agent on the gateway pod
+	//   2. SDS extension provider in meshConfig — remote SDS server referenced by service/port
+	//   3. ADS fallback — treat resource name as a Kubernetes Secret reference via istiod
+	//
+	// Currently only a single SDS extension provider is supported; the first one found is used.
+	// To support multiple providers in the future, the format could be extended to
+	// "sds://<resource-name>@<provider-name>" to allow explicit provider selection.
+	if strings.HasPrefix(name, security.SDSExternalCredentialPrefix) {
+		resourceName, _ := strings.CutPrefix(name, security.SDSExternalCredentialPrefix)
+		if credentialSocketExist {
+			// Preserve full name (including sds:// prefix) for backward compatibility —
+			// existing UDS-based SDS agents expect the complete credentialName as the resource name.
+			return ConstructSdsSecretConfigForCredentialSocket(name, security.SDSExternalClusterName, "")
+		}
+		if push != nil {
+			for _, provider := range push.Mesh.ExtensionProviders {
+				if provider.GetSds() != nil {
+					hostName, cluster, err := model.LookupCluster(push, provider.GetSds().Service, int(provider.GetSds().Port))
+					if err != nil {
+						model.IncLookupClusterFailures("externalSds")
+						log.Errorf("could not find cluster for external sds provider %q: %v", provider.GetSds(), err)
+						return nil
+					}
+					return ConstructSdsSecretConfigForCredentialSocket(resourceName, cluster, hostName)
+				}
+			}
+		}
+		// No UDS socket or extension provider — fall back to ADS (Kubernetes Secret via istiod)
+		name = resourceName
+		if isCA {
+			name = normalizeCaCertCredentialName(name)
+		}
 	}
 
 	return &tls.SdsSecretConfig{
@@ -95,8 +139,7 @@ func ConstructSdsSecretConfigForCredential(name string, credentialSocketExist bo
 }
 
 // ConstructSdsSecretConfigForCredentialSocket constructs SDS Secret Configuration based on CredentialNameSocketPath
-// if CredentialNameSocketPath exists, use a static cluster 'sds-external'
-func ConstructSdsSecretConfigForCredentialSocket(name string) *tls.SdsSecretConfig {
+func ConstructSdsSecretConfigForCredentialSocket(name string, clusterName string, hostName string) *tls.SdsSecretConfig {
 	return &tls.SdsSecretConfig{
 		Name: name,
 		SdsConfig: &core.ConfigSource{
@@ -108,7 +151,10 @@ func ConstructSdsSecretConfigForCredentialSocket(name string) *tls.SdsSecretConf
 					GrpcServices: []*core.GrpcService{
 						{
 							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: security.SDSExternalClusterName},
+								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+									ClusterName: clusterName,
+									Authority:   hostName,
+								},
 							},
 						},
 					},
@@ -119,87 +165,9 @@ func ConstructSdsSecretConfigForCredentialSocket(name string) *tls.SdsSecretConf
 	}
 }
 
-// Preconfigured SDS configs to avoid excessive memory allocations
-var (
-	defaultSDSConfig = &tls.SdsSecretConfig{
-		Name: SDSDefaultResourceName,
-		SdsConfig: &core.ConfigSource{
-			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-				ApiConfigSource: &core.ApiConfigSource{
-					ApiType:                   core.ApiConfigSource_GRPC,
-					SetNodeOnFirstMessageOnly: true,
-					TransportApiVersion:       core.ApiVersion_V3,
-					GrpcServices: []*core.GrpcService{
-						{
-							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
-							},
-						},
-					},
-				},
-			},
-			ResourceApiVersion:  core.ApiVersion_V3,
-			InitialFetchTimeout: durationpb.New(time.Second * 0),
-		},
-	}
-	rootSDSConfig = &tls.SdsSecretConfig{
-		Name: SDSRootResourceName,
-		SdsConfig: &core.ConfigSource{
-			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-				ApiConfigSource: &core.ApiConfigSource{
-					ApiType:                   core.ApiConfigSource_GRPC,
-					SetNodeOnFirstMessageOnly: true,
-					TransportApiVersion:       core.ApiVersion_V3,
-					GrpcServices: []*core.GrpcService{
-						{
-							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
-							},
-						},
-					},
-				},
-			},
-			ResourceApiVersion:  core.ApiVersion_V3,
-			InitialFetchTimeout: durationpb.New(time.Second * 0),
-		},
-	}
-)
-
 // ConstructSdsSecretConfig constructs SDS Secret Configuration for workload proxy.
 func ConstructSdsSecretConfig(name string) *tls.SdsSecretConfig {
-	if name == "" {
-		return nil
-	}
-
-	if name == SDSDefaultResourceName {
-		return defaultSDSConfig
-	}
-	if name == SDSRootResourceName {
-		return rootSDSConfig
-	}
-
-	cfg := &tls.SdsSecretConfig{
-		Name: name,
-		SdsConfig: &core.ConfigSource{
-			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-				ApiConfigSource: &core.ApiConfigSource{
-					SetNodeOnFirstMessageOnly: true,
-					ApiType:                   core.ApiConfigSource_GRPC,
-					TransportApiVersion:       core.ApiVersion_V3,
-					GrpcServices: []*core.GrpcService{
-						{
-							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
-							},
-						},
-					},
-				},
-			},
-			ResourceApiVersion: core.ApiVersion_V3,
-		},
-	}
-
-	return cfg
+	return pm.ConstructSdsSecretConfig(name)
 }
 
 func AppendURIPrefixToTrustDomain(trustDomainAliases []string) []string {
@@ -212,17 +180,36 @@ func AppendURIPrefixToTrustDomain(trustDomainAliases []string) []string {
 
 // ApplyToCommonTLSContext completes the commonTlsContext
 func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, proxy *model.Proxy,
-	subjectAltNames []string, trustDomainAliases []string, validateClient bool,
+	subjectAltNames []string, crl string, trustDomainAliases []string, validateClient bool,
+	tlsCertificates []*networking.ServerTLSSettings_TLSCertificate,
+	allowInsecure bool,
 ) {
+	sdsSecretConfigs := make([]*tls.SdsSecretConfig, 0)
+	customFileSDSServer := proxy.Metadata.Raw[security.CredentialFileMetaDataName] == "true"
+	// Envoy does not support client validation using multiple CA certificates when multiple certificates are provided.
+	// So we only use what's provided in the ServerTLSSettings.
+	caCert := proxy.Metadata.TLSServerRootCert
+
 	// These are certs being mounted from within the pod. Rather than reading directly in Envoy,
 	// which does not support rotation, we will serve them over SDS by reading the files.
 	// We should check if these certs have values, if yes we should use them or otherwise fall back to defaults.
-	res := security.SdsCertificateConfig{
-		CertificatePath:   proxy.Metadata.TLSServerCertChain,
-		PrivateKeyPath:    proxy.Metadata.TLSServerKey,
-		CaCertificatePath: proxy.Metadata.TLSServerRootCert,
+	if len(tlsCertificates) > 0 {
+		for _, cert := range tlsCertificates {
+			res := security.SdsCertificateConfig{
+				CertificatePath:   cert.ServerCertificate,
+				PrivateKeyPath:    cert.PrivateKey,
+				CaCertificatePath: caCert,
+			}
+			sdsSecretConfigs = append(sdsSecretConfigs, constructSdsSecretConfig(res.GetResourceName(), SDSDefaultResourceName, customFileSDSServer))
+		}
+	} else {
+		res := security.SdsCertificateConfig{
+			CertificatePath:   proxy.Metadata.TLSServerCertChain,
+			PrivateKeyPath:    proxy.Metadata.TLSServerKey,
+			CaCertificatePath: caCert,
+		}
+		sdsSecretConfigs = append(sdsSecretConfigs, constructSdsSecretConfig(res.GetResourceName(), SDSDefaultResourceName, customFileSDSServer))
 	}
-
 	// TODO: if subjectAltName ends with *, create a prefix match as well.
 	// TODO: if user explicitly specifies SANs - should we alter his explicit config by adding all spifee aliases?
 	matchSAN := util.StringToExactMatch(subjectAltNames)
@@ -231,28 +218,68 @@ func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, proxy *model.Prox
 	}
 
 	// configure server listeners with SDS.
+	tlsContext.TlsCertificateSdsSecretConfigs = sdsSecretConfigs
+
+	// configure client validation context with SDS if enabled.
 	if validateClient {
+		defaultValidationContext := &tls.CertificateValidationContext{
+			MatchSubjectAltNames: matchSAN,
+		}
+		if crl != "" {
+			defaultValidationContext.Crl = &core.DataSource{
+				Specifier: &core.DataSource_Filename{
+					Filename: crl,
+				},
+			}
+		}
+		if allowInsecure {
+			defaultValidationContext.TrustChainVerification = tls.CertificateValidationContext_ACCEPT_UNTRUSTED
+		}
+		caRes := security.SdsCertificateConfig{
+			CaCertificatePath: caCert,
+		}
 		tlsContext.ValidationContextType = &tls.CommonTlsContext_CombinedValidationContext{
 			CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
-				DefaultValidationContext:         &tls.CertificateValidationContext{MatchSubjectAltNames: matchSAN},
-				ValidationContextSdsSecretConfig: ConstructSdsSecretConfig(model.GetOrDefault(res.GetRootResourceName(), SDSRootResourceName)),
+				DefaultValidationContext:         defaultValidationContext,
+				ValidationContextSdsSecretConfig: constructSdsSecretConfig(caRes.GetRootResourceName(), SDSRootResourceName, customFileSDSServer),
 			},
 		}
 	}
-	tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
-		ConstructSdsSecretConfig(model.GetOrDefault(res.GetResourceName(), SDSDefaultResourceName)),
+}
+
+// constructSdsSecretConfig allows passing a file name and a fallback.
+// If the filename is set, it is used and the customFileSDSServer flag is respected.
+func constructSdsSecretConfig(maybeFileName string, fallbackName string, customFileSDSServer bool) *tls.SdsSecretConfig {
+	if maybeFileName != "" && customFileSDSServer {
+		return pm.ConstructSdsFilesSecretConfig(maybeFileName)
 	}
+	return pm.ConstructSdsSecretConfig(model.GetOrDefault(maybeFileName, fallbackName))
+}
+
+// normalizeCaCertCredentialName appends the "-cacert" suffix that istiod uses
+// to distinguish a CA SDS resource. The suffix is used when looking up the
+// secret, but we fallback to the unsuffixed name. We do not append the
+// "-cacert" suffix given a few cases: The resource already contains the
+// prefix, is not a Kubernetes Secret, or is an invalid secret type.
+func normalizeCaCertCredentialName(name string) string {
+	if name == "" ||
+		strings.HasSuffix(name, SdsCaSuffix) ||
+		strings.HasPrefix(name, credentials.KubernetesConfigMapTypeURI) ||
+		strings.HasPrefix(name, security.SDSExternalCredentialPrefix) ||
+		strings.HasPrefix(name, credentials.InvalidSecretTypeURI) {
+		return name
+	}
+	return name + SdsCaSuffix
 }
 
 // ApplyCustomSDSToClientCommonTLSContext applies the customized sds to CommonTlsContext
-// Used for building upstream TLS context for egress gateway's TLS/mTLS origination
 func ApplyCustomSDSToClientCommonTLSContext(tlsContext *tls.CommonTlsContext,
 	tlsOpts *networking.ClientTLSSettings, credentialSocketExist bool,
 ) {
-	if tlsOpts.Mode == networking.ClientTLSSettings_MUTUAL {
+	if tlsOpts.Mode == networking.ClientTLSSettings_MUTUAL && tlsOpts.CredentialName != "" {
 		// create SDS config for gateway to fetch key/cert from agent.
 		tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
-			ConstructSdsSecretConfigForCredential(tlsOpts.CredentialName, credentialSocketExist),
+			ConstructSdsSecretConfigForCredential(tlsOpts.CredentialName, credentialSocketExist, nil),
 		}
 	}
 
@@ -261,16 +288,33 @@ func ApplyCustomSDSToClientCommonTLSContext(tlsContext *tls.CommonTlsContext,
 		return
 	}
 
+	caCert := tlsOpts.CaCertCredentialName
+	if caCert == "" {
+		if tlsOpts.CredentialName == "" {
+			return
+		}
+		caCert = tlsOpts.CredentialName + SdsCaSuffix
+	} else {
+		caCert = normalizeCaCertCredentialName(caCert)
+	}
+
 	// create SDS config for gateway to fetch certificate validation context
 	// at gateway agent.
 	defaultValidationContext := &tls.CertificateValidationContext{
 		MatchSubjectAltNames: util.StringToExactMatch(tlsOpts.SubjectAltNames),
 	}
+	if tlsOpts.GetCaCrl() != "" {
+		defaultValidationContext.Crl = &core.DataSource{
+			Specifier: &core.DataSource_Filename{
+				Filename: tlsOpts.GetCaCrl(),
+			},
+		}
+	}
 	tlsContext.ValidationContextType = &tls.CommonTlsContext_CombinedValidationContext{
 		CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
 			DefaultValidationContext: defaultValidationContext,
-			ValidationContextSdsSecretConfig: ConstructSdsSecretConfigForCredential(
-				tlsOpts.CredentialName+SdsCaSuffix, credentialSocketExist),
+			ValidationContextSdsSecretConfig: ConstructSdsSecretConfigForCaCredential(
+				caCert, credentialSocketExist, nil),
 		},
 	}
 }
@@ -278,12 +322,28 @@ func ApplyCustomSDSToClientCommonTLSContext(tlsContext *tls.CommonTlsContext,
 // ApplyCredentialSDSToServerCommonTLSContext applies the credentialName sds (Gateway/DestinationRule) to CommonTlsContext
 // Used for building both gateway/sidecar TLS context
 func ApplyCredentialSDSToServerCommonTLSContext(tlsContext *tls.CommonTlsContext,
-	tlsOpts *networking.ServerTLSSettings, credentialSocketExist bool,
+	tlsOpts *networking.ServerTLSSettings, credentialSocketExist bool, push *model.PushContext,
 ) {
 	// create SDS config for gateway/sidecar to fetch key/cert from agent.
-	tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
-		ConstructSdsSecretConfigForCredential(tlsOpts.CredentialName, credentialSocketExist),
+	caCert := tlsOpts.CredentialName + SdsCaSuffix
+	if len(tlsOpts.CredentialNames) > 0 {
+		// Handle multiple certificates for RSA and ECDSA
+		tlsContext.TlsCertificateSdsSecretConfigs = make([]*tls.SdsSecretConfig, len(tlsOpts.CredentialNames))
+		for i, name := range tlsOpts.CredentialNames {
+			tlsContext.TlsCertificateSdsSecretConfigs[i] = ConstructSdsSecretConfigForCredential(name, credentialSocketExist, push)
+		}
+		// If MUTUAL, we only support one CA certificate for all credentialNames. Thus we use the first one as CA.
+		caCert = tlsOpts.CredentialNames[0] + SdsCaSuffix
+	} else {
+		// Handle single certificate
+		tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
+			ConstructSdsSecretConfigForCredential(tlsOpts.CredentialName, credentialSocketExist, push),
+		}
 	}
+	if tlsOpts.CaCertCredentialName != "" {
+		caCert = tlsOpts.CaCertCredentialName
+	}
+
 	// If tls mode is MUTUAL/OPTIONAL_MUTUAL, create SDS config for gateway/sidecar to fetch certificate validation context
 	// at gateway agent. Otherwise, use the static certificate validation context config.
 	if tlsOpts.Mode == networking.ServerTLSSettings_MUTUAL || tlsOpts.Mode == networking.ServerTLSSettings_OPTIONAL_MUTUAL {
@@ -292,11 +352,13 @@ func ApplyCredentialSDSToServerCommonTLSContext(tlsContext *tls.CommonTlsContext
 			VerifyCertificateSpki: tlsOpts.VerifyCertificateSpki,
 			VerifyCertificateHash: tlsOpts.VerifyCertificateHash,
 		}
+		if tlsOpts.GetInsecureSkipVerify().GetValue() {
+			defaultValidationContext.TrustChainVerification = tls.CertificateValidationContext_ACCEPT_UNTRUSTED
+		}
 		tlsContext.ValidationContextType = &tls.CommonTlsContext_CombinedValidationContext{
 			CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
-				DefaultValidationContext: defaultValidationContext,
-				ValidationContextSdsSecretConfig: ConstructSdsSecretConfigForCredential(
-					tlsOpts.CredentialName+SdsCaSuffix, credentialSocketExist),
+				DefaultValidationContext:         defaultValidationContext,
+				ValidationContextSdsSecretConfig: ConstructSdsSecretConfigForCredential(caCert, credentialSocketExist, push),
 			},
 		}
 	} else if len(tlsOpts.SubjectAltNames) > 0 {
@@ -306,4 +368,12 @@ func ApplyCredentialSDSToServerCommonTLSContext(tlsContext *tls.CommonTlsContext
 			},
 		}
 	}
+}
+
+func EnforceGoCompliance(ctx *gotls.Config) {
+	pm.EnforceGoCompliance(ctx)
+}
+
+func EnforceCompliance(ctx *tls.CommonTlsContext) {
+	pm.EnforceCompliance(ctx)
 }

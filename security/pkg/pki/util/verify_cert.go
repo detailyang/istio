@@ -77,7 +77,7 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte, 
 	opts.KeyUsages = append(opts.KeyUsages, x509.ExtKeyUsageAny)
 
 	if _, err = cert.Verify(opts); err != nil {
-		return fmt.Errorf("failed to verify certificate: " + err.Error())
+		return fmt.Errorf("failed to verify certificate: %v", err)
 	}
 	if privPem != nil {
 		priv, err := ParsePemEncodedKey(privPem)
@@ -127,7 +127,7 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte, 
 			return fmt.Errorf("unexpected value for 'NotBefore' field: want %v but got %v", nb, cert.NotBefore)
 		}
 
-		if ttl := expectedFields.TTL; ttl != 0 && ttl != (cert.NotAfter.Sub(cert.NotBefore)) {
+		if ttl := expectedFields.TTL; ttl != 0 && ttl != cert.NotAfter.Sub(cert.NotBefore) {
 			return fmt.Errorf("unexpected value for 'NotAfter' - 'NotBefore': want %v but got %v", ttl, cert.NotAfter.Sub(cert.NotBefore))
 		}
 

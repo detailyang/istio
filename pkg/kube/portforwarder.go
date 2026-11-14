@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
+	"k8s.io/streaming/pkg/httpstream"
 
 	"istio.io/istio/pkg/log"
 )
@@ -56,6 +57,7 @@ var _ PortForwarder = &forwarder{}
 type forwarder struct {
 	stopCh       chan struct{}
 	restConfig   *rest.Config
+	httpClient   *http.Client
 	podName      string
 	ns           string
 	localAddress string
@@ -88,7 +90,7 @@ func (f *forwarder) Start() error {
 				f.errCh <- fmt.Errorf("port forward: %v", err)
 				return
 			}
-			log.Infof("port forward completed without error")
+			log.Debugf("port forward completed without error")
 			f.errCh <- nil
 			// At this point, either the stopCh has been closed, or port forwarder connection is broken.
 			// the port forwarder should have already been ready before.
@@ -143,6 +145,7 @@ func newPortForwarder(c *client, podName, ns, localAddress string, localPort, po
 	f := &forwarder{
 		stopCh:       make(chan struct{}),
 		restConfig:   c.config,
+		httpClient:   c.restHTTPClient,
 		podName:      podName,
 		ns:           ns,
 		localAddress: localAddress,
@@ -154,7 +157,7 @@ func newPortForwarder(c *client, podName, ns, localAddress string, localPort, po
 }
 
 func (f *forwarder) buildK8sPortForwarder(readyCh chan struct{}) (*portforward.PortForwarder, error) {
-	restClient, err := rest.RESTClientFor(f.restConfig)
+	restClient, err := rest.RESTClientForConfigAndClient(f.restConfig, f.httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +170,19 @@ func (f *forwarder) buildK8sPortForwarder(readyCh chan struct{}) (*portforward.P
 		return nil, fmt.Errorf("failure creating roundtripper: %v", err)
 	}
 
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, serverURL)
+	dialer := spdy.NewDialerForStreaming(spdy.NewUpgraderForStreaming(upgrader), &http.Client{Transport: roundTripper}, http.MethodPost, serverURL)
+	if !portForwardWebsockets.IsDisabled() {
+		tunnelingDialer, err := portforward.NewSPDYOverWebsocketDialerForStreaming(serverURL, f.restConfig)
+		if err != nil {
+			return nil, err
+		}
+		// First attempt tunneling (websocket) dialer, then fallback to spdy dialer.
+		dialer = portforward.NewFallbackDialerForStreaming(tunnelingDialer, dialer, func(err error) bool {
+			return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+		})
+	}
 
-	fw, err := portforward.NewOnAddresses(dialer,
+	fw, err := portforward.NewOnAddressesForStreaming(dialer,
 		[]string{f.localAddress},
 		[]string{fmt.Sprintf("%d:%d", f.localPort, f.podPort)},
 		f.stopCh,

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC2034
 
 # WARNING: DO NOT EDIT, THIS FILE IS PROBABLY A COPY
@@ -49,6 +49,8 @@ elif [[ ${LOCAL_ARCH} == s390x ]]; then
     TARGET_ARCH=s390x
 elif [[ ${LOCAL_ARCH} == ppc64le ]]; then
     TARGET_ARCH=ppc64le
+elif [[ ${LOCAL_ARCH} == riscv64 ]]; then
+    TARGET_ARCH=riscv64
 else
     echo "This system's architecture, ${LOCAL_ARCH}, isn't supported"
     exit 1
@@ -72,10 +74,10 @@ else
 fi
 
 # Build image to use
-TOOLS_REGISTRY_PROVIDER=${TOOLS_REGISTRY_PROVIDER:-gcr.io}
-PROJECT_ID=${PROJECT_ID:-istio-testing}
+TOOLS_REGISTRY_PROVIDER=${TOOLS_REGISTRY_PROVIDER:-registry.istio.io}
+PROJECT_ID=${PROJECT_ID:-testing}
 if [[ "${IMAGE_VERSION:-}" == "" ]]; then
-  IMAGE_VERSION=master-a27b9b60db555184f332436a42268021826344f2
+  IMAGE_VERSION=master-29c1d211334870a1f5519d98add2a48d565f4f7b
 fi
 if [[ "${IMAGE_NAME:-}" == "" ]]; then
   IMAGE_NAME=build-tools
@@ -95,6 +97,19 @@ IMG="${IMG:-${TOOLS_REGISTRY_PROVIDER}/${PROJECT_ID}/${IMAGE_NAME}:${IMAGE_VERSI
 
 CONTAINER_CLI="${CONTAINER_CLI:-docker}"
 
+# Try to use the latest cached image we have. Use at your own risk, may have incompatibly-old versions
+if [[ "${LATEST_CACHED_IMAGE:-}" != "" ]]; then
+  prefix="$(<<<"$IMAGE_VERSION" cut -d- -f1)"
+  query="${TOOLS_REGISTRY_PROVIDER}/${PROJECT_ID}/${IMAGE_NAME}:${prefix}-*"
+  latest="$("${CONTAINER_CLI}" images --filter=reference="${query}" --format "{{.CreatedAt|json}}~{{.Repository}}:{{.Tag}}~{{.CreatedSince}}" | sort -n -r | head -n1)"
+  IMG="$(<<<"$latest" cut -d~ -f2)"
+  if [[ "${IMG}" == "" ]]; then
+    echo "Attempted to use LATEST_CACHED_IMAGE, but found no images matching ${query}" >&2
+    exit 1
+  fi
+  echo "Using cached image $IMG, created $(<<<"$latest" cut -d~ -f3)" >&2
+fi
+
 ENV_BLOCKLIST="${ENV_BLOCKLIST:-^_\|^PATH=\|^GOPATH=\|^GOROOT=\|^SHELL=\|^EDITOR=\|^TMUX=\|^USER=\|^HOME=\|^PWD=\|^TERM=\|^RUBY_\|^GEM_\|^rvm_\|^SSH=\|^TMPDIR=\|^CC=\|^CXX=\|^MAKEFILE_LIST=}"
 
 # Remove functions from the list of exported variables, they mess up with the `env` command.
@@ -107,35 +122,43 @@ done
 CONDITIONAL_HOST_MOUNTS="${CONDITIONAL_HOST_MOUNTS:-} "
 container_kubeconfig=''
 
+# When adding volumes, bind mounts must use --volume so that they
+# can be configured for SELinux labeling
+
 # docker conditional host mount (needed for make docker push)
 if [[ -d "${HOME}/.docker" ]]; then
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.docker,destination=/config/.docker,readonly "
+  CONDITIONAL_HOST_MOUNTS+="--volume ${HOME}/.docker:/config/.docker:ro "
 fi
 
 # gcloud conditional host mount (needed for docker push with the gcloud auth configure-docker)
 if [[ -d "${HOME}/.config/gcloud" ]]; then
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.config/gcloud,destination=/config/.config/gcloud,readonly "
+  CONDITIONAL_HOST_MOUNTS+="--volume ${HOME}/.config/gcloud:/config/.config/gcloud:ro "
 fi
 
 # gitconfig conditional host mount (needed for git commands inside container)
 if [[ -f "${HOME}/.gitconfig" ]]; then
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.gitconfig,destination=/home/.gitconfig,readonly "
+  CONDITIONAL_HOST_MOUNTS+="--volume ${HOME}/.gitconfig:/home/.gitconfig:ro "
 fi
 
 # .netrc conditional host mount (needed for git commands inside container)
 if [[ -f "${HOME}/.netrc" ]]; then
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.netrc,destination=/home/.netrc,readonly "
+  CONDITIONAL_HOST_MOUNTS+="--volume ${HOME}/.netrc:/home/.netrc:ro "
 fi
 
 # echo ${CONDITIONAL_HOST_MOUNTS}
 
 # This function checks if the file exists. If it does, it creates a randomly named host location
-# for the file, adds it to the host KUBECONFIG, and creates a mount for it.
+# for the file, adds it to the host KUBECONFIG, and creates a mount for it. Note that we use a copy
+# of the original file, so that the container can write to it.
 add_KUBECONFIG_if_exists () {
   if [[ -f "$1" ]]; then
+    local local_config
+    local_config="$(mktemp)"
+    cp "${1}" "${local_config}"
+
     kubeconfig_random="$(od -vAn -N4 -tx /dev/random | tr -d '[:space:]' | cut -c1-8)"
     container_kubeconfig+="/config/${kubeconfig_random}:"
-    CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${1},destination=/config/${kubeconfig_random},readonly "
+    CONDITIONAL_HOST_MOUNTS+="--volume ${local_config}:/config/${kubeconfig_random} "
   fi
 }
 

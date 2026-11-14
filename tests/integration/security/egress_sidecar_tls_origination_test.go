@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -41,7 +40,6 @@ import (
 func TestSidecarMutualTlsOrigination(t *testing.T) {
 	// nolint: staticcheck
 	framework.NewTest(t).
-		Features("security.egress.mtls.sds").
 		Run(func(t framework.TestContext) {
 			var (
 				credNameGeneric  = "mtls-credential-generic"
@@ -103,19 +101,20 @@ func TestSidecarMutualTlsOrigination(t *testing.T) {
 					},
 				},
 				// Mutual TLS origination from an unauthorized sidecar to https endpoint
-				// This will result in `TLS ERROR Secret is not supplied by SDS`
+				// This will result in a 503 with the UH flag because the cluster will
+				// stay warming until a valid secret is sent.
 				{
 					name:            "unauthorized sidecar",
 					credentialToUse: credNameGeneric,
 					from:            apps.Ns1.B,
 					drSelector:      "b",
 					expectedResponse: ingressutil.ExpectedResponse{
-						StatusCode:   http.StatusServiceUnavailable,
-						ErrorMessage: "Secret is not supplied by SDS",
+						StatusCode: http.StatusServiceUnavailable,
 					},
 				},
 				// Mutual TLS origination using an invalid client certificate
-				// This will result in `TLS ERROR: Secret is not supplied by SDS`
+				// This will result in a 503 with the UH flag because the cluster will
+				// stay warming until a valid secret is sent.
 				{
 					name:             "invalid client cert",
 					credentialToUse:  fakeCredName,
@@ -123,12 +122,12 @@ func TestSidecarMutualTlsOrigination(t *testing.T) {
 					drSelector:       "c",
 					authorizeSidecar: true,
 					expectedResponse: ingressutil.ExpectedResponse{
-						StatusCode:   http.StatusServiceUnavailable,
-						ErrorMessage: "Secret is not supplied by SDS",
+						StatusCode: http.StatusServiceUnavailable,
 					},
 				},
 				// Mutual TLS origination from an authorized sidecar to https endpoint with a CRL specifying the server certificate as revoked.
-				// This will result in `certificate verify failed`
+				// This will result in `certificate verify failed` or, after envoyproxy/envoy#44149,
+				// the upstream reset surfaces as `remote connection failure`.
 				{
 					name:             "valid crl",
 					credentialToUse:  credWithCRL,
@@ -138,6 +137,9 @@ func TestSidecarMutualTlsOrigination(t *testing.T) {
 					expectedResponse: ingressutil.ExpectedResponse{
 						StatusCode:   http.StatusServiceUnavailable,
 						ErrorMessage: "CERTIFICATE_VERIFY_FAILED",
+						AllowedErrorMessages: []string{
+							"remote connection failure",
+						},
 					},
 				},
 				// Mutual TLS origination from an authorized sidecar to https endpoint with a CRL with a dummy revoked certificate.
@@ -156,7 +158,7 @@ func TestSidecarMutualTlsOrigination(t *testing.T) {
 			for _, tc := range testCases {
 				t.NewSubTest(tc.name).Run(func(t framework.TestContext) {
 					if tc.authorizeSidecar {
-						serviceAccount := tc.from.Config().ServiceAccountName()
+						serviceAccount := tc.from.Config().SpiffeIdentity()
 						serviceAccountName := serviceAccount[strings.LastIndex(serviceAccount, "/")+1:]
 						authorizeSidecar(t, tc.from.Config().Namespace, serviceAccountName)
 					}
@@ -217,7 +219,7 @@ func newTLSSidecarDestinationRule(t framework.TestContext, to echo.Instances, de
 		"WorkloadSelector": workloadSelector,
 	}
 	se := `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: ServiceEntry
 metadata:
   name: originate-mtls-for-nginx
@@ -235,7 +237,7 @@ spec:
   resolution: DNS
 `
 	dr := `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: originate-tls-for-server-sds-{{.WorkloadSelector}}
@@ -255,7 +257,7 @@ spec:
           credentialName: {{.CredentialName}}
           sni: {{ .to.Config.ClusterLocalFQDN }}
 `
-	t.ConfigIstio().Eval(clientNamespace.Name(), args, se, dr).ApplyOrFail(t, apply.NoCleanup)
+	t.ConfigIstio().Eval(clientNamespace.Name(), args, se, dr).ApplyOrFail(t)
 }
 
 func newTLSSidecarCallOpts(to echo.Target, host string, exRsp ingressutil.ExpectedResponse) echo.CallOptions {
@@ -268,20 +270,41 @@ func newTLSSidecarCallOpts(to echo.Target, host string, exRsp ingressutil.Expect
 			Headers: headers.New().WithHost(host).Build(),
 		},
 		Check: func(result echo.CallResult, err error) error {
+			expected := append([]string{}, exRsp.AllowedErrorMessages...)
+			if exRsp.ErrorMessage != "" {
+				expected = append(expected, exRsp.ErrorMessage)
+			}
+			matches := func(s string) bool {
+				for _, e := range expected {
+					if strings.Contains(s, e) {
+						return true
+					}
+				}
+				return false
+			}
 			// Check that the error message is expected.
 			if err != nil {
-				// If expected error message is empty, but we got some error
-				// message then it should be treated as error.
-				if len(exRsp.ErrorMessage) == 0 {
+				if len(expected) == 0 {
 					return fmt.Errorf("unexpected error: %w", err)
 				}
-				if !strings.Contains(err.Error(), exRsp.ErrorMessage) {
-					return fmt.Errorf("expected response error message %s but got %w and the response code is %+v",
-						exRsp.ErrorMessage, err, result.Responses)
+				if !matches(err.Error()) {
+					return fmt.Errorf("expected one of %v but got error: %w and the response code is %+v",
+						expected, err, result.Responses)
 				}
 				return nil
 			}
-			return check.And(check.NoErrorAndStatus(exRsp.StatusCode), check.BodyContains(exRsp.ErrorMessage)).Check(result, nil)
+			if err := check.NoErrorAndStatus(exRsp.StatusCode).Check(result, nil); err != nil {
+				return err
+			}
+			if len(expected) == 0 {
+				return nil
+			}
+			for _, resp := range result.Responses {
+				if !matches(resp.RawContent) {
+					return fmt.Errorf("expected one of %v in body but got: %s", expected, resp.RawContent)
+				}
+			}
+			return nil
 		},
 	}
 }

@@ -18,18 +18,30 @@ const (
 	// Postsubmit indicates that the test should be run as part of a postsubmit run only.
 	Postsubmit Instance = "postsubmit"
 
+	// Multicluster indicates that the test requires a multicluster environment.
+	Multicluster Instance = "multicluster"
+
+	// Full indicates additional tests for the standard environment.
+	Full Instance = "full"
+
 	// CustomSetup indicates that the test requires a custom Istio installation.
 	CustomSetup Instance = "customsetup"
 
 	// IPv4 indicates a test is only compatible with IPv4 clusters.
 	// Any usage of this should have an associated GitHub issue to make it compatible with IPv6
 	IPv4 Instance = "ipv4"
+
+	// PQC indicates PQC tests
+	PQC Instance = "pqc"
 )
 
 var all = NewSet(
 	Postsubmit,
+	Multicluster,
+	Full,
 	CustomSetup,
-	IPv4)
+	IPv4,
+	PQC)
 
 // Find the label with the given name
 func Find(name string) (Instance, bool) {

@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -56,10 +55,9 @@ type revisionedNamespace struct {
 // should test all possible revisioned namespace pairings to test traffic between all versions
 func TestMultiVersionRevision(t *testing.T) {
 	// nolint: staticcheck
-	framework.NewTest(t).
+	framework.NewFullTest(t).
 		RequiresSingleCluster().
 		RequiresLocalControlPlane().
-		Features("installation.upgrade").
 		// Requires installation of CPs from manifests, won't succeed
 		// if existing CPs have different root cert
 		Label(label.CustomSetup).

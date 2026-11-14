@@ -16,13 +16,13 @@ package model
 
 import (
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/ptypes/wrappers"
 	fuzz "github.com/google/gofuzz"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/apimachinery/pkg/types"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
@@ -31,682 +31,12 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
-	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 )
 
 const wildcardIP = "0.0.0.0"
-
-func TestMergeVirtualServices(t *testing.T) {
-	independentVs := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "virtual-service",
-			Namespace:        "default",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"example.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	rootVs := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage"},
-							},
-						},
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Exact{Exact: "/login"},
-							},
-						},
-					},
-					Delegate: &networking.Delegate{
-						Name:      "productpage-vs",
-						Namespace: "default",
-					},
-				},
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	defaultVs := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "default-vs",
-			Namespace:        "default",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage"},
-							},
-						},
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Exact{Exact: "/login"},
-							},
-						},
-					},
-					Delegate: &networking.Delegate{
-						Name: "productpage-vs",
-					},
-				},
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	oneRoot := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	createDelegateVs := func(name, namespace string, exportTo []string) config.Config {
-		return config.Config{
-			Meta: config.Meta{
-				GroupVersionKind: gvk.VirtualService,
-				Name:             name,
-				Namespace:        namespace,
-			},
-			Spec: &networking.VirtualService{
-				Hosts:    []string{},
-				Gateways: []string{"gateway"},
-				ExportTo: exportTo,
-				Http: []*networking.HTTPRoute{
-					{
-						Match: []*networking.HTTPMatchRequest{
-							{
-								Uri: &networking.StringMatch{
-									MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v1"},
-								},
-							},
-						},
-						Route: []*networking.HTTPRouteDestination{
-							{
-								Destination: &networking.Destination{
-									Host: "productpage.org",
-									Port: &networking.PortSelector{
-										Number: 80,
-									},
-									Subset: "v1",
-								},
-							},
-						},
-					},
-					{
-						Match: []*networking.HTTPMatchRequest{
-							{
-								Uri: &networking.StringMatch{
-									MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v2"},
-								},
-							},
-						},
-						Route: []*networking.HTTPRouteDestination{
-							{
-								Destination: &networking.Destination{
-									Host: "productpage.org",
-									Port: &networking.PortSelector{
-										Number: 80,
-									},
-									Subset: "v2",
-								},
-							},
-						},
-					},
-					{
-						Route: []*networking.HTTPRouteDestination{
-							{
-								Destination: &networking.Destination{
-									Host: "productpage.org",
-									Port: &networking.PortSelector{
-										Number: 80,
-									},
-									Subset: "v3",
-								},
-							},
-						},
-					},
-				},
-			},
-		}
-	}
-
-	delegateVs := createDelegateVs("productpage-vs", "default", []string{"istio-system"})
-	delegateVsExportedToAll := createDelegateVs("productpage-vs", "default", []string{})
-
-	delegateVsNotExported := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "productpage-vs",
-			Namespace:        "default2",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{},
-			Gateways: []string{"gateway"},
-			ExportTo: []string{"."},
-		},
-	}
-
-	mergedVs := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v1"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v2"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v2",
-							},
-						},
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage"},
-							},
-						},
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Exact{Exact: "/login"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v3",
-							},
-						},
-					},
-				},
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	mergedVsInDefault := mergedVs.DeepCopy()
-	mergedVsInDefault.Name = "default-vs"
-	mergedVsInDefault.Namespace = "default"
-
-	// invalid delegate, match condition conflicts with root
-	delegateVs2 := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "productpage-vs",
-			Namespace:        "default",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v1"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v2"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v2",
-							},
-						},
-					},
-				},
-				{
-					// mismatch, this route will be ignored
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Name: "mismatch",
-							Uri: &networking.StringMatch{
-								// conflicts with root's HTTPMatchRequest
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/mis-match/path"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v3",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	mergedVs2 := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v1"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage/v2"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v2",
-							},
-						},
-					},
-				},
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "example.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// multiple routes delegate to one single sub VS
-	multiRoutes := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage"},
-							},
-						},
-					},
-					Delegate: &networking.Delegate{
-						Name:      "productpage-vs",
-						Namespace: "default",
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/legacy/path"},
-							},
-						},
-					},
-					Rewrite: &networking.HTTPRewrite{
-						Uri: "/productpage",
-					},
-					Delegate: &networking.Delegate{
-						Name:      "productpage-vs",
-						Namespace: "default",
-					},
-				},
-			},
-		},
-	}
-
-	singleDelegate := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "productpage-vs",
-			Namespace:        "default",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	mergedVs3 := config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.VirtualService,
-			Name:             "root-vs",
-			Namespace:        "istio-system",
-		},
-		Spec: &networking.VirtualService{
-			Hosts:    []string{"*.org"},
-			Gateways: []string{"gateway"},
-			Http: []*networking.HTTPRoute{
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/productpage"},
-							},
-						},
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-				{
-					Match: []*networking.HTTPMatchRequest{
-						{
-							Uri: &networking.StringMatch{
-								MatchType: &networking.StringMatch_Prefix{Prefix: "/legacy/path"},
-							},
-						},
-					},
-					Rewrite: &networking.HTTPRewrite{
-						Uri: "/productpage",
-					},
-					Route: []*networking.HTTPRouteDestination{
-						{
-							Destination: &networking.Destination{
-								Host: "productpage.org",
-								Port: &networking.PortSelector{
-									Number: 80,
-								},
-								Subset: "v1",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	cases := []struct {
-		name                    string
-		virtualServices         []config.Config
-		expectedVirtualServices []config.Config
-		defaultExportTo         sets.Set[visibility.Instance]
-	}{
-		{
-			name:                    "one independent vs",
-			virtualServices:         []config.Config{independentVs},
-			expectedVirtualServices: []config.Config{independentVs},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "one root vs",
-			virtualServices:         []config.Config{rootVs},
-			expectedVirtualServices: []config.Config{oneRoot},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "one delegate vs",
-			virtualServices:         []config.Config{delegateVs},
-			expectedVirtualServices: []config.Config{},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "root and delegate vs",
-			virtualServices:         []config.Config{rootVs.DeepCopy(), delegateVs},
-			expectedVirtualServices: []config.Config{mergedVs},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "root and conflicted delegate vs",
-			virtualServices:         []config.Config{rootVs.DeepCopy(), delegateVs2},
-			expectedVirtualServices: []config.Config{mergedVs2},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "multiple routes delegate to one",
-			virtualServices:         []config.Config{multiRoutes.DeepCopy(), singleDelegate},
-			expectedVirtualServices: []config.Config{mergedVs3},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "root not specify delegate namespace default public",
-			virtualServices:         []config.Config{defaultVs.DeepCopy(), delegateVsExportedToAll},
-			expectedVirtualServices: []config.Config{mergedVsInDefault},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "delegate not exported to root vs namespace default public",
-			virtualServices:         []config.Config{rootVs, delegateVsNotExported},
-			expectedVirtualServices: []config.Config{oneRoot},
-			defaultExportTo:         sets.New(visibility.Public),
-		},
-		{
-			name:                    "root not specify delegate namespace default private",
-			virtualServices:         []config.Config{defaultVs.DeepCopy(), delegateVsExportedToAll},
-			expectedVirtualServices: []config.Config{mergedVsInDefault},
-			defaultExportTo:         sets.New(visibility.Private),
-		},
-		{
-			name:                    "delegate not exported to root vs namespace default private",
-			virtualServices:         []config.Config{rootVs, delegateVsNotExported},
-			expectedVirtualServices: []config.Config{oneRoot},
-			defaultExportTo:         sets.New(visibility.Private),
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, _ := mergeVirtualServicesIfNeeded(tc.virtualServices, tc.defaultExportTo)
-			assert.Equal(t, got, tc.expectedVirtualServices)
-		})
-	}
-}
 
 func TestMergeHttpRoutes(t *testing.T) {
 	dstV1 := &networking.Destination{
@@ -1143,7 +473,7 @@ func TestMergeHttpRoutes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mergeHTTPRoutes(tc.root, tc.delegate)
+			got := MergeHTTPRoutes(tc.root, tc.delegate)
 			assert.Equal(t, got, tc.expected)
 		})
 	}
@@ -1916,8 +1246,8 @@ func TestFuzzMergeHttpRoute(t *testing.T) {
 		func(r *networking.Destination, c fuzz.Continue) {
 			*r = networking.Destination{}
 		},
-		func(r *wrappers.UInt32Value, c fuzz.Continue) {
-			*r = wrappers.UInt32Value{}
+		func(r *wrapperspb.UInt32Value, c fuzz.Continue) {
+			*r = wrapperspb.UInt32Value{}
 		},
 		func(r *networking.Percent, c fuzz.Continue) {
 			*r = networking.Percent{}
@@ -2221,7 +1551,7 @@ func TestSelectVirtualService(t *testing.T) {
 			},
 		},
 	}
-	virtualService1 := config.Config{
+	virtualService1 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme2-v1",
@@ -2229,7 +1559,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec1,
 	}
-	virtualService2 := config.Config{
+	virtualService2 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme-v2",
@@ -2237,7 +1567,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec2,
 	}
-	virtualService3 := config.Config{
+	virtualService3 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme-v3",
@@ -2245,7 +1575,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec3,
 	}
-	virtualService4 := config.Config{
+	virtualService4 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme-v4",
@@ -2253,7 +1583,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec4,
 	}
-	virtualService5 := config.Config{
+	virtualService5 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme-v3",
@@ -2261,7 +1591,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec5,
 	}
-	virtualService6 := config.Config{
+	virtualService6 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme-v3",
@@ -2269,7 +1599,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec6,
 	}
-	virtualService7 := config.Config{
+	virtualService7 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "acme2-v1",
@@ -2277,7 +1607,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec7,
 	}
-	virtualService8 := config.Config{
+	virtualService8 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "vs-wildcard-v1",
@@ -2285,7 +1615,7 @@ func TestSelectVirtualService(t *testing.T) {
 		},
 		Spec: virtualServiceSpec8,
 	}
-	virtualService9 := config.Config{
+	virtualService9 := &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.VirtualService,
 			Name:             "service-wildcard-v1",
@@ -2295,7 +1625,7 @@ func TestSelectVirtualService(t *testing.T) {
 	}
 
 	index := virtualServiceIndex{
-		publicByGateway: map[string][]config.Config{
+		publicByGateway: map[string][]*config.Config{
 			constants.IstioMeshGateway: {
 				virtualService1,
 				virtualService2,
@@ -2322,6 +1652,139 @@ func TestSelectVirtualService(t *testing.T) {
 		if config.Name != expectedVS[i] {
 			t.Fatalf("Unexpected virtualService, got %s, expected %s", config.Name, expectedVS[i])
 		}
+	}
+}
+
+func TestSelectVirtualServicesExclusion(t *testing.T) {
+	mkVS := func(name, ns string, hosts ...string) *config.Config {
+		return &config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: name, Namespace: ns},
+			Spec: &networking.VirtualService{Hosts: hosts, Gateways: []string{"mesh"}},
+		}
+	}
+	index := virtualServiceIndex{
+		publicByGateway: map[string][]*config.Config{
+			constants.IstioMeshGateway: {
+				mkVS("vs-a", "a", "a.com"),
+				mkVS("vs-b", "b", "b.com"),
+				mkVS("vs-multi", "a", "drop.com", "keep.com"),
+			},
+		},
+	}
+
+	includeAll := hostClassification{exactHosts: sets.New[host.Name](), allHosts: []host.Name{wildcardService}}
+	includeAllExcept := func(excluded ...host.Name) hostClassification {
+		return hostClassification{exactHosts: sets.New[host.Name](), allHosts: []host.Name{wildcardService}, excludedHosts: excluded}
+	}
+
+	tests := []struct {
+		name      string
+		hostsByNS map[string]hostClassification
+		expected  []string
+	}{
+		{
+			name:      "no exclusion selects all",
+			hostsByNS: map[string]hostClassification{wildcardNamespace: includeAll},
+			expected:  []string{"vs-a", "vs-b", "vs-multi"},
+		},
+		{
+			name: "~b/* excludes namespace b",
+			hostsByNS: map[string]hostClassification{
+				wildcardNamespace: includeAll,
+				"b":               {excludedHosts: []host.Name{wildcardService}},
+			},
+			expected: []string{"vs-a", "vs-multi"},
+		},
+		{
+			name:      "~/a.com excludes the VS whose only host is a.com",
+			hostsByNS: map[string]hostClassification{wildcardNamespace: includeAllExcept("a.com")},
+			expected:  []string{"vs-b", "vs-multi"},
+		},
+		{
+			name:      "multi-host VS survives when only one host excluded",
+			hostsByNS: map[string]hostClassification{wildcardNamespace: includeAllExcept("drop.com")},
+			expected:  []string{"vs-a", "vs-b", "vs-multi"},
+		},
+		{
+			name:      "multi-host VS dropped when all hosts excluded",
+			hostsByNS: map[string]hostClassification{wildcardNamespace: includeAllExcept("drop.com", "keep.com")},
+			expected:  []string{"vs-a", "vs-b"},
+		},
+		{
+			name: "exclusion via ns scope while include via wildcard scope",
+			hostsByNS: map[string]hostClassification{
+				wildcardNamespace: includeAll,
+				"a":               {excludedHosts: []host.Name{"a.com"}},
+			},
+			expected: []string{"vs-b", "vs-multi"},
+		},
+		{
+			name:      "exclusion with no include matches nothing",
+			hostsByNS: map[string]hostClassification{wildcardNamespace: {exactHosts: sets.New[host.Name](), excludedHosts: []host.Name{wildcardService}}},
+			expected:  []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SelectVirtualServices(index, "some-ns", tt.hostsByNS)
+			gotNames := make([]string, 0, len(got))
+			for _, c := range got {
+				gotNames = append(gotNames, c.Name)
+			}
+			assert.Equal(t, gotNames, tt.expected)
+		})
+	}
+}
+
+// TestSelectVirtualServicesExclusionWildcard pins the directional SubsetOf semantics:
+// a wildcard exclusion covers exact hosts, but an exact exclusion does not drop a
+// wildcard route that still serves other hosts.
+func TestSelectVirtualServicesExclusionWildcard(t *testing.T) {
+	mkVS := func(name string, hosts ...string) *config.Config {
+		return &config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: name, Namespace: "a"},
+			Spec: &networking.VirtualService{Hosts: hosts, Gateways: []string{"mesh"}},
+		}
+	}
+	index := virtualServiceIndex{
+		publicByGateway: map[string][]*config.Config{
+			constants.IstioMeshGateway: {
+				mkVS("vs-exact", "a.com"),
+				mkVS("vs-wild", "*.com"),
+			},
+		},
+	}
+	includeAllExcept := func(excluded ...host.Name) map[string]hostClassification {
+		return map[string]hostClassification{
+			wildcardNamespace: {exactHosts: sets.New[host.Name](), allHosts: []host.Name{wildcardService}, excludedHosts: excluded},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		hostsByNS map[string]hostClassification
+		expected  []string
+	}{
+		{
+			name:      "wildcard exclusion covers exact host",
+			hostsByNS: includeAllExcept("*.com"),
+			expected:  []string{},
+		},
+		{
+			name:      "exact exclusion does not drop wildcard route",
+			hostsByNS: includeAllExcept("a.com"),
+			expected:  []string{"vs-wild"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SelectVirtualServices(index, "some-ns", tt.hostsByNS)
+			gotNames := make([]string, 0, len(got))
+			for _, c := range got {
+				gotNames = append(gotNames, c.Name)
+			}
+			assert.Equal(t, gotNames, tt.expected)
+		})
 	}
 }
 
@@ -2355,58 +1818,125 @@ func buildHTTPService(hostname string, v visibility.Instance, ip, namespace stri
 	return service
 }
 
-func TestVirtualServiceDependencies(t *testing.T) {
-	tests := []struct {
-		name string
-		vs   config.Config
-		want []ConfigKey
+func BenchmarkSelectVirtualServices(b *testing.B) {
+	scenarios := []struct {
+		name          string
+		numNamespaces int
+		numVSPerNS    int
+		numServices   int
 	}{
-		{
-			name: "normal vs",
-			vs: config.Config{
-				Meta: config.Meta{
-					Namespace: "ns",
-					Name:      "foo",
-				},
-			},
-			want: []ConfigKey{
-				{
-					Kind:      kind.VirtualService,
-					Namespace: "ns",
-					Name:      "foo",
-				},
-			},
-		},
-		{
-			name: "internal vs generated from http routes",
-			vs: config.Config{
-				Meta: config.Meta{
-					Namespace: "ns",
-					Name:      "foo-0-istio-autogenerated-k8s-gateway",
-					Annotations: map[string]string{
-						constants.InternalRouteSemantics: constants.RouteSemanticsGateway,
-						constants.InternalParentNames:    "HTTPRoute/foo.ns,HTTPRoute/bar.ns",
-					},
-				},
-			},
-			want: []ConfigKey{
-				{
-					Kind:      kind.HTTPRoute,
-					Namespace: "ns",
-					Name:      "foo",
-				},
-				{
-					Kind:      kind.HTTPRoute,
-					Namespace: "ns",
-					Name:      "bar",
-				},
-			},
-		},
+		{"10ns_10vs_10svc", 1, 10, 10},
+		{"1ns_100vs_50svc", 1, 100, 50},
+		{"1ns_500vs_100svc", 1, 500, 100},
+		{"50ns_100vs_500svc", 50, 100, 500},
+		{"100ns_200vs_1000svc", 100, 200, 1000},
+		{"200ns_500vs_2000svc", 200, 500, 2000},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := VirtualServiceDependencies(tt.vs); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("VirtualServiceDependencies got %v, want %v", got, tt.want)
+
+	for _, sc := range scenarios {
+		b.Run(sc.name, func(b *testing.B) {
+			// Create namespaces
+			namespaces := make([]string, sc.numNamespaces)
+			for i := 0; i < sc.numNamespaces; i++ {
+				namespaces[i] = fmt.Sprintf("ns-%d", i)
+			}
+
+			// Build services across namespaces
+			services := make([]*Service, 0, sc.numServices)
+			for i := 0; i < sc.numServices; i++ {
+				ns := namespaces[i%sc.numNamespaces]
+				hostname := fmt.Sprintf("service-%d.%s.svc.cluster.local", i, ns)
+				services = append(services, buildHTTPService(hostname, visibility.Public, wildcardIP, ns, 8080))
+			}
+
+			// Build hostsByNamespace for each namespace
+			hostsByNamespacePerNS := make([]map[string]hostClassification, sc.numNamespaces)
+			for i, ns := range namespaces {
+				hostsByNamespace := make(map[string]hostClassification)
+				hc := hostClassification{
+					exactHosts: sets.New[host.Name](),
+					allHosts:   make([]host.Name, 0, sc.numServices),
+				}
+				for _, svc := range services {
+					hc.allHosts = append(hc.allHosts, svc.Hostname)
+					if !svc.Hostname.IsWildCarded() {
+						hc.exactHosts.Insert(svc.Hostname)
+					}
+				}
+				hostsByNamespace["*"] = hc
+
+				nsHc := hostClassification{
+					exactHosts: sets.New[host.Name](),
+					allHosts:   make([]host.Name, 0),
+				}
+				for _, svc := range services {
+					if svc.Attributes.Namespace == ns {
+						nsHc.allHosts = append(nsHc.allHosts, svc.Hostname)
+						if !svc.Hostname.IsWildCarded() {
+							nsHc.exactHosts.Insert(svc.Hostname)
+						}
+					}
+				}
+				hostsByNamespace[ns] = nsHc
+				hostsByNamespacePerNS[i] = hostsByNamespace
+			}
+
+			// Build virtual services spread across namespaces
+			virtualServices := make([]*config.Config, 0, sc.numVSPerNS*sc.numNamespaces)
+			for i := 0; i < sc.numVSPerNS*sc.numNamespaces; i++ {
+				ns := namespaces[i%sc.numNamespaces]
+				var vsHost string
+				if i%3 == 0 && sc.numServices > 0 {
+					svcIdx := i % sc.numServices
+					svcNs := namespaces[svcIdx%sc.numNamespaces]
+					vsHost = fmt.Sprintf("service-%d.%s.svc.cluster.local", svcIdx, svcNs)
+				} else if i%3 == 1 {
+					vsHost = fmt.Sprintf("*.%s.svc.cluster.local", ns)
+				} else {
+					vsHost = fmt.Sprintf("external-%d.example.com", i)
+				}
+				vs := &config.Config{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.VirtualService,
+						Name:             fmt.Sprintf("vs-%d", i),
+						Namespace:        ns,
+					},
+					Spec: &networking.VirtualService{
+						Hosts:    []string{vsHost},
+						Gateways: []string{"mesh"},
+						Http: []*networking.HTTPRoute{
+							{
+								Route: []*networking.HTTPRouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "destination.default.svc.cluster.local",
+											Port: &networking.PortSelector{Number: 80},
+										},
+										Weight: 100,
+									},
+								},
+							},
+						},
+					},
+				}
+				virtualServices = append(virtualServices, vs)
+			}
+
+			index := virtualServiceIndex{
+				publicByGateway: map[string][]*config.Config{
+					constants.IstioMeshGateway: virtualServices,
+				},
+				privateByNamespaceAndGateway: map[types.NamespacedName][]*config.Config{},
+				exportedToNamespaceByGateway: map[types.NamespacedName][]*config.Config{},
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				for j, ns := range namespaces {
+					_ = SelectVirtualServices(index, ns, hostsByNamespacePerNS[j])
+				}
 			}
 		})
 	}

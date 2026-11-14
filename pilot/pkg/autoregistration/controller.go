@@ -40,6 +40,7 @@ import (
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube/controllers"
 	istiolog "istio.io/istio/pkg/log"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/queue"
 )
@@ -119,6 +120,11 @@ func NewController(store model.ConfigStoreController, instanceID string, maxConn
 		return nil
 	}
 
+	// Consistent with gRPC's keepalive.ServerParameters.MaxConnectionAge: a zero (or negative)
+	// value means "unset", which is treated as no limit rather than an immediate cutoff.
+	if maxConnAge <= 0 {
+		maxConnAge = time.Duration(math.MaxInt64)
+	}
 	if maxConnAge != math.MaxInt64 {
 		maxConnAge += maxConnAge / 2
 		// if overflow, set it to max int64
@@ -150,6 +156,8 @@ func (c *Controller) Run(stop <-chan struct{}) {
 	if c.store != nil && c.cleanupQueue != nil {
 		go c.periodicWorkloadEntryCleanup(stop)
 		go c.cleanupQueue.Run(stop)
+	}
+	if features.WorkloadEntryAutoRegistration {
 		go c.lateRegistrationQueue.Run(stop)
 	}
 
@@ -376,6 +384,11 @@ func (c *Controller) changeWorkloadEntryStateToConnected(entryName string, proxy
 	if conTime.Before(lastConTime) {
 		return false, nil
 	}
+	// Already connected to this controller at this time; skip redundant update to avoid
+	// racing with concurrent status updates (e.g. health condition writes).
+	if wle.Annotations[annotation.IoIstioWorkloadController.Name] == c.instanceID && !conTime.After(lastConTime) {
+		return false, nil
+	}
 	// Try to update, if it fails we retry all the above logic since the WLE changed
 	updated := wle.DeepCopy()
 	setConnectMeta(&updated, c.instanceID, conTime)
@@ -528,7 +541,6 @@ func (c *Controller) periodicWorkloadEntryCleanup(stopCh <-chan struct{}) {
 		case <-ticker.C:
 			wles := c.store.List(gvk.WorkloadEntry, metav1.NamespaceAll)
 			for _, wle := range wles {
-				wle := wle
 				if c.shouldCleanupEntry(wle) {
 					c.cleanupQueue.Push(func() error {
 						c.cleanupEntry(wle, true)
@@ -559,7 +571,7 @@ func (c *Controller) shouldCleanupEntry(wle config.Config) bool {
 	if connTime != "" {
 		// handle workload leak when both workload/pilot down at the same time before pilot has a chance to set disconnTime
 		connAt, err := time.Parse(timeFormat, connTime)
-		if err == nil && uint64(time.Since(connAt)) > uint64(c.maxConnectionAge) {
+		if err == nil && time.Since(connAt) > c.maxConnectionAge {
 			return true
 		}
 		return false
@@ -689,7 +701,17 @@ func workloadEntryFromGroup(name string, proxy *model.Proxy, groupCfg *config.Co
 		// the label has been converted to "istio-locality: region/zone/subzone"
 		// in pilot/pkg/xds/ads.go, and `/` is not allowed in k8s label value.
 		// Instead of converting again, we delete it since has set WorkloadEntry.Locality
-		delete(entry.Labels, model.LocalityLabel)
+		delete(entry.Labels, pm.LocalityLabel)
+	}
+
+	// If the proxy accepts HBONE, set the tunnel label so istiod marks the workload HBONE-capable
+	if proxy.EnableHBONEListen() {
+		if entry.Labels == nil {
+			entry.Labels = map[string]string{}
+		}
+		if _, ok := entry.Labels[model.TunnelLabel]; !ok {
+			entry.Labels[model.TunnelLabel] = model.TunnelHTTP
+		}
 	}
 
 	annotations := map[string]string{annotation.IoIstioAutoRegistrationGroup.Name: groupCfg.Name}
@@ -700,8 +722,12 @@ func workloadEntryFromGroup(name string, proxy *model.Proxy, groupCfg *config.Co
 	if proxy.Metadata.Network != "" {
 		entry.Network = string(proxy.Metadata.Network)
 	}
-	if proxy.Locality != nil {
-		entry.Locality = util.LocalityToString(proxy.Locality)
+	// proxy.Locality can be unset when auto registration takes place, because
+	// its state is not fully initialized. Therefore, we check the bootstrap
+	// node.
+	if proxy.XdsNode != nil && proxy.XdsNode.Locality != nil {
+		entry.Locality = util.LocalityToString(proxy.XdsNode.Locality)
+		log.Infof("Setting Locality: %s for WLE: %s via XdsNode", entry.Locality, name)
 	}
 	if proxy.Metadata.ProxyConfig != nil && proxy.Metadata.ProxyConfig.ReadinessProbe != nil {
 		annotations[status.WorkloadEntryHealthCheckAnnotation] = "true"

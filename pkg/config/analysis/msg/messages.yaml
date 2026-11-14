@@ -128,23 +128,7 @@ messages:
       - name: destPorts
         type: "[]int"
 
-  - name: "MTLSPolicyConflict"
-    code: IST0113
-    level: Error
-    description: "A DestinationRule and Policy are in conflict with regards to mTLS."
-    template: "A DestinationRule and Policy are in conflict with regards to mTLS for host %s. The DestinationRule %q specifies that mTLS must be %t but the Policy object %q specifies %s."
-    args:
-      - name: host
-        type: string
-      - name: destinationRuleName
-        type: string
-      - name: destinationRuleMTLSMode
-        type: bool
-      - name: policyName
-        type: string
-      - name: policyMTLSMode
-        type: string
-
+  # IST0113 RETIRED
   # IST0114 RETIRED
   # IST0115 RETIRED
 
@@ -176,36 +160,10 @@ messages:
       - name: targetPort
         type: string
 
-  - name: "JwtFailureDueToInvalidServicePortPrefix"
-    code: IST0119
-    level: Warning
-    description: "Authentication policy with JWT targets Service with invalid port specification."
-    template: "Authentication policy with JWT targets Service with invalid port specification (port: %d, name: %s, protocol: %s, targetPort: %s)."
-    args:
-      - name: port
-        type: int
-      - name: portName
-        type: string
-      - name: protocol
-        type: string
-      - name: targetPort
-        type: string
-
+  # IST0119 RETIRED
   # IST0120 RETIRED
   # IST0121 RETIRED
-
-  - name: "InvalidRegexp"
-    code: IST0122
-    level: Warning
-    description: "Invalid Regex"
-    template: "Field %q regular expression invalid: %q (%s)"
-    args:
-      - name: where
-        type: string
-      - name: re
-        type: string
-      - name: problem
-        type: string
+  # IST0122 RETIRED
 
   - name: "NamespaceMultipleInjectionLabels"
     code: IST0123
@@ -328,7 +286,8 @@ messages:
   - name: "ServiceEntryAddressesRequired"
     code: IST0134
     level: Warning
-    description: "Virtual IP addresses are required for ports serving TCP (or unset) protocol"
+    description: "Virtual IP addresses are required for ports serving TCP (or unset) protocol when PILOT_ENABLE_IP_AUTOALLOCATE is not set on a proxy"
+
     template: "ServiceEntry addresses are required for this protocol."
 
   - name: "DeprecatedAnnotation"
@@ -536,6 +495,17 @@ messages:
     - name: minimumVersion
       type: string
 
+  - name: "FutureUnsupportedGatewayAPIVersion"
+    code: IST0172
+    level: Warning
+    description: "The Gateway API CRD version will not be supported in the future"
+    template: "The Gateway API CRD version %v is lower than the minimum version: %v"
+    args:
+    - name: version
+      type: string
+    - name: minimumVersion
+      type: string
+
   - name: "InvalidTelemetryProvider"
     code: IST0157
     level: Warning
@@ -645,3 +615,133 @@ messages:
     args:
       - name: gateway
         type: string
+
+  - name: "IneffectivePolicy"
+    code: IST0167
+    level: Warning
+    description: "The policy applied has no impact."
+    template: "The policy has no impact: %s."
+    args:
+      - name: reason
+        type: string
+
+  - name: "UnknownUpgradeCompatibility"
+    code: IST0168
+    level: Warning
+    description: "We cannot automatically detect whether a change is fully compatible or not"
+    template: "The configuration %q changed in release %s, but compatibility cannot be automatically detected: %s. Or, install with `--set compatibilityVersion=%s` to retain the old default."
+    args:
+      - name: field
+        type: string
+      - name: release
+        type: string
+      - name: info
+        type: string
+      - name: compatVersion
+        type: string
+
+  - name: "UpdateIncompatibility"
+    code: IST0169
+    level: Warning
+    description: "The provided configuration object may be incompatible due to an upgrade"
+    template: "The configuration %q changed in release %s: %s. Or, install with `--set compatibilityVersion=%s` to retain the old default."
+    args:
+      - name: field
+        type: string
+      - name: release
+        type: string
+      - name: info
+        type: string
+      - name: compatVersion
+        type: string
+
+  - name: "MultiClusterInconsistentService"
+    code: IST0170
+    level: Warning
+    description: "The services live in different clusters under multi-cluster deployment model are inconsistent"
+    template: "The service %v in namespace %q is inconsistent across clusters %q, which can lead to undefined behaviors. The inconsistent behaviors are: %v."
+    args:
+    - name: serviceName
+      type: string
+    - name: namespace
+      type: string
+    - name: clusters
+      type: "[]string"
+    - name: error
+      type: string
+
+  - name: "NegativeConditionStatus"
+    code: IST0171
+    level: Warning
+    description: "A condition with a negative status is present"
+    template: "A condition with a negative status is present: type=%s, reason=%s, message=%s."
+    args:
+      - name: conditionType
+        type: string
+      - name: reason
+        type: string
+      - name: message
+        type: string
+
+  - name: "DestinationRuleSubsetNotSelectPods"
+    code: IST0173
+    level: Error
+    description: "Subsets defined in destination does not select any pods."
+    template: "The Subset %s defined in the DestinationRule does not select any pods. Which may lead to 503 UH (NoHealthyUpstream)."
+    args:
+    - name: subset
+      type: string
+
+  - name: "UnknownDestinationRuleHost"
+    code: IST0174
+    level: Warning
+    description: "Host defined in destination rule does not match any services in the mesh."
+    template: "The host %s defined in the DestinationRule does not match any services in the mesh."
+    args:
+    - name: host
+      type: string
+
+  - name: "JwksUriFetchUnrestricted"
+    code: IST0175
+    level: Warning
+    description: "RequestAuthentication resources exist but BLOCKED_CIDRS_IN_JWKS_URIS is not configured on istiod."
+    template: "BLOCKED_CIDRS_IN_JWKS_URIS is not configured but %d RequestAuthentication resource(s) exist (%s). Consider configuring it to restrict JWKS URI fetches to trusted networks."
+    args:
+    - name: count
+      type: int
+    - name: names
+      type: string
+
+  - name: "GatewayAPICRDVersionBelowMinimum"
+    code: IST0176
+    level: Warning
+    description: "A Gateway API CRD is installed at a version below the minimum required by this Istio version. Resources of this kind will not be processed."
+    template: "Gateway API CRD %q is at version %q but Istio requires at least %q; resources of this kind will not be processed. Upgrade the Gateway API CRDs to satisfy the minimum version."
+    args:
+    - name: crd
+      type: string
+    - name: installedVersion
+      type: string
+    - name: minimumVersion
+      type: string
+
+  - name: "ConflictingServiceEntryProtocol"
+    code: IST0177
+    level: Warning
+    description: "Multiple ServiceEntries define the same host and port with conflicting protocols."
+    template: "Multiple ServiceEntries (%s) define the same host %q and port %d with conflicting protocols (%s)."
+    args:
+    - name: serviceEntryNames
+      type: string
+    - name: host
+      type: string
+    - name: port
+      type: int
+    - name: protocols
+      type: string
+
+  - name: "EnvoyFilterMayClearRouteCache"
+    code: IST0178
+    level: Warning
+    description: "Using EnvoyFilters with route-dependent filters may cause the routing cache to be cleared after the route-dependent filter has run."
+    template: "Using an EnvoyFilter with route-dependent filters may cause the routing cache to be cleared after the route-dependent filter has run. This can cause a request to be routed differently than it was when the route-dependent filter was evaluated. See https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/http/http_filters.html#security-considerations."

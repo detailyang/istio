@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"time"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/backoff"
 )
 
@@ -45,22 +46,29 @@ type HTTPFetcher struct {
 
 // NewHTTPFetcher create a new HTTP remote wasm module fetcher.
 // requestTimeout is a timeout for each HTTP/HTTPS request.
-// requestMaxRetry is # of maximum retries of HTTP/HTTPS requests.
+// requestMaxRetry is the number of maximum retries of HTTP/HTTPS requests.
 func NewHTTPFetcher(requestTimeout time.Duration, requestMaxRetry int) *HTTPFetcher {
 	if requestTimeout == 0 {
 		requestTimeout = 5 * time.Second
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialContext := wasmDialContext()
+
+	secureTransport := http.DefaultTransport.(*http.Transport).Clone()
+	secureTransport.DialContext = dialContext
+
+	insecureTransport := http.DefaultTransport.(*http.Transport).Clone()
+	insecureTransport.DialContext = dialContext
 	// nolint: gosec
 	// This is only when a user explicitly sets a flag to enable insecure mode
-	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	return &HTTPFetcher{
 		client: &http.Client{
-			Timeout: requestTimeout,
+			Timeout:   requestTimeout,
+			Transport: secureTransport,
 		},
 		insecureClient: &http.Client{
 			Timeout:   requestTimeout,
-			Transport: transport,
+			Transport: insecureTransport,
 		},
 		initialBackoff:  time.Millisecond * 500,
 		requestMaxRetry: requestMaxRetry,
@@ -97,8 +105,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, url string, allowInsecure bool)
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
-			// Limit wasm module to 256mb; in reality it must be much smaller
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024*256))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, features.MaxWasmBinarySizeBytes))
 			if err != nil {
 				return nil, err
 			}
@@ -110,8 +117,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, url string, allowInsecure bool)
 		}
 		lastError = fmt.Errorf("wasm module download request failed: status code %v", resp.StatusCode)
 		if retryable(resp.StatusCode) {
-			// Limit wasm module to 256mb; in reality it must be much smaller
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024*256))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, features.MaxWasmBinarySizeBytes))
 			if err != nil {
 				return nil, err
 			}
@@ -147,8 +153,7 @@ func isPosixTar(b []byte) bool {
 func getFirstFileFromTar(b []byte) []byte {
 	buf := bytes.NewBuffer(b)
 
-	// Limit wasm module to 256mb; in reality it must be much smaller
-	tr := tar.NewReader(io.LimitReader(buf, 1024*1024*256))
+	tr := tar.NewReader(io.LimitReader(buf, features.MaxWasmBinarySizeBytes))
 
 	h, err := tr.Next()
 	if err != nil {
@@ -175,7 +180,7 @@ func getFileFromGZ(b []byte) []byte {
 		return nil
 	}
 
-	ret, err := io.ReadAll(zr)
+	ret, err := io.ReadAll(io.LimitReader(zr, features.MaxWasmBinarySizeBytes))
 	if err != nil {
 		return nil
 	}

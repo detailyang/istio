@@ -27,13 +27,15 @@ import (
 // TODO this logic is probably done elsewhere in XDS, possible code-reuse + perf improvements
 type mtlsChecker struct {
 	push            *model.PushContext
+	authnPolicies   model.PeerAuthnPolicies
 	svcPort         int
 	destinationRule *networkingapi.ClientTLSSettings_TLSmode
 }
 
-func newMtlsChecker(push *model.PushContext, svcPort int, dr *config.Config, subset string) *mtlsChecker {
+func newMtlsChecker(push *model.PushContext, authnPolicies model.PeerAuthnPolicies, svcPort int, dr *config.Config, subset string) *mtlsChecker {
 	return &mtlsChecker{
 		push:            push,
+		authnPolicies:   authnPolicies,
 		svcPort:         svcPort,
 		destinationRule: tlsModeForDestinationRule(dr, subset, svcPort),
 	}
@@ -59,7 +61,7 @@ func (c *mtlsChecker) checkMtlsEnabled(ep *model.IstioEndpoint, isWaypoint bool)
 	}
 
 	return authn.
-		NewMtlsPolicy(c.push, ep.Namespace, ep.Labels, isWaypoint).
+		NewMtlsPolicy(c.push, c.authnPolicies, ep.Namespace, ep.Labels, isWaypoint).
 		GetMutualTLSModeForPort(ep.EndpointPort) != model.MTLSDisable
 }
 
@@ -80,7 +82,13 @@ func tlsModeForDestinationRule(drc *config.Config, subset string, port int) *net
 		if ss.Name != subset {
 			continue
 		}
-		return trafficPolicyTLSModeForPort(ss.GetTrafficPolicy(), port)
+
+		if mode := trafficPolicyTLSModeForPort(ss.GetTrafficPolicy(), port); mode != nil {
+			return mode
+		}
+
+		// fallback to the destination rule traffic policy if the subset does not have a TLS mode for this port
+		return trafficPolicyTLSModeForPort(dr.GetTrafficPolicy(), port)
 	}
 	return nil
 }

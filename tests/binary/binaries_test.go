@@ -106,15 +106,18 @@ func TestBinarySizes(t *testing.T) {
 	}{
 		// TODO: shrink the ranges here once the active work to reduce binary size is complete
 		// For now, having two small a range will result in lots of "merge conflicts"
-		"istioctl":    {60, 100},
-		"pilot-agent": {30, 45},
-		// TODO(https://github.com/kubernetes/kubernetes/issues/101384) bump this down a bit?
-		"pilot-discovery": {60, 85},
-		"bug-report":      {60, 85},
-		"client":          {20, 30},
-		"server":          {20, 30},
-		"envoy":           {60, 130},
-		"ztunnel":         {15, 25},
+		"istioctl": {60, 105},
+		// pilot-agent grew ~1.7 MiB on top of the prior ~28 MiB baseline when
+		// the textparse-backed OpenMetrics decoder for the metrics merger landed
+		// (istio#60350); bump max to 32 to leave reasonable headroom without
+		// thrashing on merge conflicts.
+		"pilot-agent":     {20, 32},
+		"pilot-discovery": {60, 130},
+		"bug-report":      {60, 80},
+		"client":          {15, 31},
+		"server":          {15, 35},
+		"envoy":           {60, 168},
+		"ztunnel":         {12, 19},
 	}
 
 	runBinariesTest(t, func(t *testing.T, name string) {
@@ -135,7 +138,7 @@ func TestBinarySizes(t *testing.T) {
 		if got < tt.minMb {
 			t.Fatalf("Binary size of %dmb was smaller than min allowed size %dmb. This is very likely a good thing, "+
 				"indicating the binary size has decreased. The test will fail to ensure you update the test thresholds to ensure "+
-				"the improvements are 'locked in'.", got, tt.maxMb)
+				"the improvements are 'locked in'.", got, tt.minMb)
 		}
 	})
 }

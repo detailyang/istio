@@ -77,7 +77,7 @@ func newServiceImportCache(c *Controller) serviceImportCache {
 		}
 
 		sic.serviceImports = kclient.NewDelayedInformer[controllers.Object](sic.client, mcs.ServiceImportGVR, kubetypes.DynamicInformer, kclient.Filter{
-			ObjectFilter: sic.opts.GetFilter(),
+			ObjectFilter: sic.client.ObjectFilter(),
 		})
 		// Register callbacks for events.
 		registerHandlers(sic.Controller, sic.serviceImports, "ServiceImports", sic.onServiceImportEvent, nil)
@@ -147,8 +147,8 @@ func (ic *serviceImportCacheImpl) onServiceImportEvent(_, obj controllers.Object
 		return nil
 	}
 
-	// We need a full push if the cluster VIP changes.
-	needsFullPush := false
+	// We need a push if the cluster VIP changes.
+	vipChanged := false
 
 	// Get the updated MCS service.
 	mcsHost := serviceClusterSetLocalHostnameForKR(si)
@@ -183,9 +183,9 @@ func (ic *serviceImportCacheImpl) onServiceImportEvent(_, obj controllers.Object
 
 		// The service already existed. Treat it as an update.
 		event = model.EventUpdate
-		mcsService = mcsService.DeepCopy()
+		mcsService = mcsService.ShallowCopy()
 		if ic.updateIPs(mcsService, ips) {
-			needsFullPush = true
+			vipChanged = true
 		}
 	}
 
@@ -193,9 +193,9 @@ func (ic *serviceImportCacheImpl) onServiceImportEvent(_, obj controllers.Object
 	// a change to the discoverability policy.
 	ic.addOrUpdateService(nil, mcsService, event, true)
 
-	// TODO: do we really need a full push, we should do it in `addOrUpdateService`.
-	if needsFullPush {
-		ic.doFullPush(mcsHost, si.GetNamespace())
+	// TODO: do we really need this push, we should do it in `addOrUpdateService`.
+	if vipChanged {
+		ic.pushServiceUpdate(mcsHost, si.GetNamespace())
 	}
 
 	return nil
@@ -208,15 +208,13 @@ func (ic *serviceImportCacheImpl) updateIPs(mcsService *model.Service, ips []str
 		mcsService.ClusterVIPs.SetAddressesFor(ic.Cluster(), ips)
 		updated = true
 	}
-	return
+	return updated
 }
 
-func (ic *serviceImportCacheImpl) doFullPush(mcsHost host.Name, ns string) {
+func (ic *serviceImportCacheImpl) pushServiceUpdate(mcsHost host.Name, ns string) {
 	pushReq := &model.PushRequest{
-		Full:           true,
 		ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: mcsHost.String(), Namespace: ns}),
-
-		Reason: model.NewReasonStats(model.ServiceUpdate),
+		Reason:         model.NewReasonStats(model.ServiceUpdate),
 	}
 	ic.opts.XDSUpdater.ConfigUpdate(pushReq)
 }
@@ -241,7 +239,7 @@ func GetServiceImportIPs(si *unstructured.Unstructured) []string {
 
 // genMCSService generates an MCS service based on the given real k8s service. The list of vips must be non-empty.
 func (ic *serviceImportCacheImpl) genMCSService(realService *model.Service, mcsHost host.Name, vips []string) *model.Service {
-	mcsService := realService.DeepCopy()
+	mcsService := realService.ShallowCopy()
 	mcsService.Hostname = mcsHost
 	mcsService.DefaultAddress = vips[0]
 	mcsService.ClusterVIPs.Addresses = map[cluster.ID][]string{

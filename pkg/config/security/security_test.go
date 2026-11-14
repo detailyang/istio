@@ -16,9 +16,11 @@ package security_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"istio.io/istio/pkg/config/security"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestParseJwksURI(t *testing.T) {
@@ -87,6 +89,54 @@ func TestParseJwksURI(t *testing.T) {
 	}
 }
 
+func TestCheckWildcardValues(t *testing.T) {
+	cases := []struct {
+		name      string
+		values    []string
+		wantError bool
+	}{
+		{name: "exact", values: []string{"foo"}},
+		{name: "presence", values: []string{"*"}},
+		{name: "prefix", values: []string{"foo*"}},
+		{name: "suffix", values: []string{"*foo"}},
+		{name: "empty", values: []string{""}, wantError: true},
+		{name: "middle wildcard", values: []string{"fo*-bar"}, wantError: true},
+		{name: "multiple wildcards", values: []string{"fo*bar*"}, wantError: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := security.CheckWildcardValues("key", c.values)
+			if c.wantError == (err == nil) {
+				t.Fatalf("CheckWildcardValues(%v): want error (%v) but got (%v)", c.values, c.wantError, err)
+			}
+		})
+	}
+}
+
+func TestCheckTrustDomainValues(t *testing.T) {
+	cases := []struct {
+		name      string
+		values    []string
+		wantError bool
+	}{
+		{name: "exact", values: []string{"cluster.local"}},
+		{name: "presence wildcard", values: []string{"*"}},
+		{name: "prefix wildcard", values: []string{"cluster-*"}},
+		{name: "suffix wildcard", values: []string{"*-cluster"}},
+		{name: "empty", values: []string{""}, wantError: true},
+		{name: "slash", values: []string{"cluster.local/ns/foo"}, wantError: true},
+		{name: "spiffe uri", values: []string{"spiffe://cluster.local"}, wantError: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := security.CheckTrustDomainValues("key", c.values)
+			if c.wantError == (err == nil) {
+				t.Fatalf("CheckTrustDomainValues(%v): want error (%v) but got (%v)", c.values, c.wantError, err)
+			}
+		})
+	}
+}
+
 func TestValidateCondition(t *testing.T) {
 	cases := []struct {
 		key       string
@@ -137,6 +187,60 @@ func TestValidateCondition(t *testing.T) {
 		{
 			key:    "source.principal",
 			values: []string{"value"},
+		},
+		{
+			key:       "source.serviceAccount",
+			values:    []string{"too/many/slashes"},
+			wantError: true,
+		},
+		{
+			key:       "source.serviceAccount",
+			values:    []string{"/emptyns"},
+			wantError: true,
+		},
+		{
+			key:       "source.serviceAccount",
+			values:    []string{"emptysa/"},
+			wantError: true,
+		},
+		{
+			key:    "source.serviceAccount",
+			values: []string{"ns/sa"},
+		},
+		{
+			key:    "source.serviceAccount",
+			values: []string{"sa"},
+		},
+		{
+			key:    "source.trustDomain",
+			values: []string{"cluster.local"},
+		},
+		{
+			key:    "source.trustDomain",
+			values: []string{"*"},
+		},
+		{
+			key:    "source.trustDomain",
+			values: []string{"foo*"},
+		},
+		{
+			key:    "source.trustDomain",
+			values: []string{"*bar"},
+		},
+		{
+			key:       "source.trustDomain",
+			values:    []string{"fo*-bar"},
+			wantError: true,
+		},
+		{
+			key:       "source.trustDomain",
+			values:    []string{"fo*bar*"},
+			wantError: true,
+		},
+		{
+			key:       "source.trustDomain",
+			values:    []string{""},
+			wantError: true,
 		},
 		{
 			key:    "request.auth.principal",
@@ -216,5 +320,312 @@ func TestValidateCondition(t *testing.T) {
 		if c.wantError == (err == nil) {
 			t.Fatalf("ValidateAttribute(%s): want error (%v) but got (%v)", c.key, c.wantError, err)
 		}
+	}
+}
+
+func TestCheckValidPathTemplate(t *testing.T) {
+	cases := []struct {
+		name      string
+		values    []string
+		wantError bool
+	}{
+		{
+			name:   "valid path template - matchOneTemplate",
+			values: []string{"/{*}/foo"},
+		},
+		{
+			name:   "valid path template - matchOneTemplate with trailing slash",
+			values: []string{"/{*}/foo/"},
+		},
+		{
+			name:   "valid path template - matchAnyTemplate",
+			values: []string{"/foo/{**}/bar"},
+		},
+		{
+			name:   "valid path template - matchAnyTemplate at end",
+			values: []string{"/foo/bar/{**}"},
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate with additional chars",
+			values:    []string{"/foo/{**}buzz/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - empty curly braces",
+			values:    []string{"/{*}/foo/{}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with `*`",
+			values:    []string{"/foo/{*}/bar/*"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with `**`",
+			values:    []string{"/foo/{*}/bar/**/buzz"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path/path template - named var: {buzz}",
+			values:    []string{"/foo/{buzz}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path/path template - only named var: {buzz}",
+			values:    []string{"/{buzz}"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate with named var: {buzz}",
+			values:    []string{"/foo/{buzz}/bar/{**}"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate with named var: {buzz=*}",
+			values:    []string{"/foo/{buzz=*}/bar/{**}"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate with named var: {buzz=**}",
+			values:    []string{"/{*}/foo/{buzz=**}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate with additional chars at end",
+			values:    []string{"/{*}/foo/{**}bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with file extension",
+			values:    []string{"/{*}/foo/{*}.txt"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with unmatched open curly brace",
+			values:    []string{"/{*}/foo/{temp"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with unmatched closed curly brace",
+			values:    []string{"/{*}/foo/temp}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchOneTemplate with unmatched closed curly brace and `*`",
+			values:    []string{"/{*}/foo/temp}/*"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - matchAnyTemplate is not the last operator in the template",
+			values:    []string{"/{**}/foo/temp/{*}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - simple multiple matchAnyTemplates",
+			values:    []string{"/{**}/{**}"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - multiple matchAnyTemplates",
+			values:    []string{"/{**}/foo/temp/{**}/bar"},
+			wantError: true,
+		},
+		{
+			name:      "unsupported path template - invalid literal in path template",
+			values:    []string{"/{*}/foo/?abc"},
+			wantError: true,
+		},
+	}
+	for _, c := range cases {
+		err := security.CheckValidPathTemplate(c.name, c.values)
+		if c.wantError == (err == nil) {
+			t.Fatalf("CheckValidPathTemplate(%s): want error (%v) but got (%v)", c.name, c.wantError, err)
+		}
+	}
+}
+
+func TestIsValidLiteral(t *testing.T) {
+	// Valid literals:
+	//   "a-zA-Z0-9-._~" - Unreserved
+	//   "%"             - pct-encoded
+	//   "!$&'()+,;"     - sub-delims excluding *=
+	//   ":@"
+	//   "="             - user included "=" allowed
+	cases := []struct {
+		name     string
+		glob     string
+		expected bool
+	}{
+		{
+			name:     "valid - alphabet chars and nums",
+			glob:     "123abcABC",
+			expected: true,
+		},
+		{
+			name:     "valid - unreserved chars",
+			glob:     "._~-",
+			expected: true,
+		},
+		{
+			name:     "valid - equals",
+			glob:     "a=c",
+			expected: true,
+		},
+		{
+			name:     "valid - mixed chars",
+			glob:     "-._~%20!$&'()+,;:@",
+			expected: true,
+		},
+		{
+			name:     "invalid - mixed chars",
+			glob:     "`~!@#$%^&()-_+;:,<.>'\"\\| ",
+			expected: false,
+		},
+		{
+			name:     "invalid - slash",
+			glob:     "abc/",
+			expected: false,
+		},
+		{
+			name:     "invalid - star with other chars",
+			glob:     "ab*c",
+			expected: false,
+		},
+		{
+			name:     "invalid - star",
+			glob:     "*",
+			expected: false,
+		},
+		{
+			name:     "invalid - double star with other chars",
+			glob:     "ab**c",
+			expected: false,
+		},
+		{
+			name:     "invalid - double star",
+			glob:     "**",
+			expected: false,
+		},
+		{
+			name:     "invalid - question mark",
+			glob:     "?abc",
+			expected: false,
+		},
+		{
+			name:     "invalid - question mark with equals",
+			glob:     "?a=c",
+			expected: false,
+		},
+		{
+			name:     "invalid - left curly brace",
+			glob:     "{abc",
+			expected: false,
+		},
+		{
+			name:     "invalid - right curly brace",
+			glob:     "abc}",
+			expected: false,
+		},
+		{
+			name:     "invalid - curly brace set",
+			glob:     "{abc}",
+			expected: false,
+		},
+	}
+	for _, c := range cases {
+		actual := security.IsValidLiteral(c.glob)
+		if c.expected != actual {
+			t.Fatalf("IsValidLiteral(%s): expected (%v), got (%v)", c.name, c.expected, actual)
+		}
+	}
+}
+
+func TestContainsPathTemplate(t *testing.T) {
+	testCases := []struct {
+		name           string
+		path           string
+		isPathTemplate bool
+	}{
+		{
+			name:           "matchOneOnly",
+			path:           "foo/bar/{*}",
+			isPathTemplate: true,
+		},
+		{
+			name:           "matchAnyOnly",
+			path:           "foo/{**}/bar",
+			isPathTemplate: true,
+		},
+		{
+			name:           "matchAnyAndOne",
+			path:           "{*}/bar/{**}",
+			isPathTemplate: true,
+		},
+		{
+			name:           "stringMatch",
+			path:           "foo/bar/*",
+			isPathTemplate: false,
+		},
+		{
+			name:           "namedVariable",
+			path:           "foo/bar/{buzz}",
+			isPathTemplate: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pathTemplate := security.ContainsPathTemplate(tc.path)
+			assert.Equal(t, tc.isPathTemplate, pathTemplate)
+		})
+	}
+}
+
+func TestFilterALPNProtocols(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       []string
+		expected []string
+	}{
+		{
+			name:     "empty",
+			in:       nil,
+			expected: nil,
+		},
+		{
+			name:     "valid",
+			in:       []string{"h2", "http/1.1"},
+			expected: []string{"h2", "http/1.1"},
+		},
+		{
+			name:     "duplicates are dropped, order is kept",
+			in:       []string{"http/1.1", "h2", "http/1.1"},
+			expected: []string{"http/1.1", "h2"},
+		},
+		{
+			name:     "empty protocol is dropped",
+			in:       []string{"h2", ""},
+			expected: []string{"h2"},
+		},
+		{
+			name:     "too long protocol is dropped",
+			in:       []string{strings.Repeat("a", 256), "h2"},
+			expected: []string{"h2"},
+		},
+		{
+			name:     "protocol with comma is dropped",
+			in:       []string{"h2,http/1.1", "h2"},
+			expected: []string{"h2"},
+		},
+		{
+			name:     "all invalid",
+			in:       []string{"", "h2,"},
+			expected: []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, security.FilterALPNProtocols(tc.in), tc.expected)
+		})
 	}
 }

@@ -17,29 +17,23 @@ package xds
 import (
 	"fmt"
 
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	status "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
-	"google.golang.org/protobuf/proto"
-	anypb "google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/slices"
 )
 
 const (
-	// TypeURLConnect generate connect event.
-	TypeURLConnect = "istio.io/connect"
-
-	// TypeURLDisconnect generate disconnect event.
-	TypeURLDisconnect = "istio.io/disconnect"
-
-	// TypeURLNACK will receive messages of type DiscoveryRequest, containing
-	// the 'NACK' from envoy on rejected configs. Only ID is set in metadata.
-	// This includes all the info that envoy (client) provides.
-	TypeURLNACK = "istio.io/nack"
-
 	TypeDebugPrefix = v3.DebugType + "/"
 
 	// TypeDebugSyncronization requests Envoy CSDS for proxy sync status
@@ -86,19 +80,21 @@ func (sg *StatusGen) GenerateDeltas(
 	return res, nil, detail, true, err
 }
 
-func (sg *StatusGen) handleInternalRequest(_ *model.Proxy, w *model.WatchedResource, _ *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
+func (sg *StatusGen) handleInternalRequest(proxy *model.Proxy, w *model.WatchedResource, _ *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
+	if features.EnableDebugEndpointAuth && proxy.VerifiedIdentity == nil {
+		log.Warnf("proxy %s is not authorized to receive debug info. Ensure you are connecting over TLS port and are authenticated.", proxy.ID)
+		return nil, model.DefaultXdsLogDetails, grpcstatus.Error(codes.Unauthenticated, "authentication required")
+	}
+
+	// Non-system callers are restricted to proxies in their own namespace.
+	// Empty callerNamespace means unrestricted (auth disabled, caller from system namespace, or in allow-list).
+	callerNamespace := sg.callerNamespaceFilter(proxy)
+
 	res := model.Resources{}
 
 	switch w.TypeUrl {
-	case TypeURLConnect:
-		for _, v := range sg.Server.Clients() {
-			res = append(res, &discovery.Resource{
-				Name:     v.node.Id,
-				Resource: protoconv.MessageToAny(v.node),
-			})
-		}
 	case TypeDebugSyncronization:
-		res = sg.debugSyncz()
+		res = sg.debugSyncz(callerNamespace)
 	case TypeDebugConfigDump:
 		if len(w.ResourceNames) == 0 || len(w.ResourceNames) > 1 {
 			// Malformed request from client
@@ -106,7 +102,7 @@ func (sg *StatusGen) handleInternalRequest(_ *model.Proxy, w *model.WatchedResou
 			break
 		}
 		var err error
-		dumpRes, err := sg.debugConfigDump(w.ResourceNames[0])
+		dumpRes, err := sg.debugConfigDump(w.ResourceNames.UnsortedList()[0], callerNamespace)
 		if err != nil {
 			log.Infof("%s failed: %v", TypeDebugConfigDump, err)
 			break
@@ -114,6 +110,22 @@ func (sg *StatusGen) handleInternalRequest(_ *model.Proxy, w *model.WatchedResou
 		res = dumpRes
 	}
 	return res, model.DefaultXdsLogDetails, nil
+}
+
+// callerNamespaceFilter returns the namespace the caller is restricted to, or "" if unrestricted.
+func (sg *StatusGen) callerNamespaceFilter(proxy *model.Proxy) string {
+	if !features.EnableDebugEndpointAuth || proxy.VerifiedIdentity == nil {
+		return ""
+	}
+	systemNamespace := constants.IstioSystemNamespace
+	if env := sg.Server.Env; env != nil && env.Mesh() != nil && env.Mesh().GetRootNamespace() != "" {
+		systemNamespace = env.Mesh().GetRootNamespace()
+	}
+	ns := proxy.VerifiedIdentity.Namespace
+	if ns == systemNamespace || features.DebugEndpointAuthAllowedNamespaces.Contains(ns) {
+		return ""
+	}
+	return ns
 }
 
 // isSidecar ad-hoc method to see if connection represents a sidecar
@@ -131,36 +143,32 @@ func isZtunnel(con *Connection) bool {
 		con.proxy.Type == model.Ztunnel
 }
 
-func (sg *StatusGen) debugSyncz() model.Resources {
+func (sg *StatusGen) debugSyncz(callerNamespace string) model.Resources {
 	res := model.Resources{}
-
-	stypes := []string{
-		v3.ListenerType,
-		v3.RouteType,
-		v3.EndpointType,
-		v3.ClusterType,
-		v3.ExtensionConfigurationType,
-	}
 
 	for _, con := range sg.Server.Clients() {
 		con.proxy.RLock()
 		// Skip "nodes" without metadata (they are probably istioctl queries!)
-		if isProxy(con) || isZtunnel(con) {
+		if (isProxy(con) || isZtunnel(con)) && (callerNamespace == "" || con.proxy.ConfigNamespace == callerNamespace) {
 			xdsConfigs := make([]*status.ClientConfig_GenericXdsConfig, 0)
-			for _, stype := range stypes {
+			wrs := con.proxy.DeepCloneWatchedResourcesLocked()
+			for _, wr := range wrs {
 				pxc := &status.ClientConfig_GenericXdsConfig{}
-				if watchedResource, ok := con.proxy.WatchedResources[stype]; ok {
-					pxc.ConfigStatus = debugSyncStatus(watchedResource)
-				} else if isZtunnel(con) {
-					pxc.ConfigStatus = status.ConfigStatus_UNKNOWN
-				} else {
-					pxc.ConfigStatus = status.ConfigStatus_NOT_SENT
+				pxc.ConfigStatus = debugSyncStatus(wr)
+				pxc.LastUpdated = timestamppb.New(wr.LastSendTime)
+				pxc.TypeUrl = wr.TypeUrl
+				if wr.LastError != "" {
+					pxc.ErrorState = &admin.UpdateFailureState{
+						LastUpdateAttempt: timestamppb.New(wr.LastSendTime),
+						Details:           wr.LastError,
+					}
 				}
-
-				pxc.TypeUrl = stype
 
 				xdsConfigs = append(xdsConfigs, pxc)
 			}
+			slices.SortBy(xdsConfigs, func(a *status.ClientConfig_GenericXdsConfig) string {
+				return a.TypeUrl
+			})
 			clientConfig := &status.ClientConfig{
 				Node: &core.Node{
 					Id: con.proxy.ID,
@@ -183,7 +191,10 @@ func (sg *StatusGen) debugSyncz() model.Resources {
 	return res
 }
 
-func debugSyncStatus(wr *model.WatchedResource) status.ConfigStatus {
+func debugSyncStatus(wr model.WatchedResource) status.ConfigStatus {
+	if wr.LastError != "" {
+		return status.ConfigStatus_ERROR
+	}
 	if wr.NonceSent == "" {
 		return status.ConfigStatus_NOT_SENT
 	}
@@ -193,11 +204,15 @@ func debugSyncStatus(wr *model.WatchedResource) status.ConfigStatus {
 	return status.ConfigStatus_STALE
 }
 
-func (sg *StatusGen) debugConfigDump(proxyID string) (model.Resources, error) {
+func (sg *StatusGen) debugConfigDump(proxyID string, callerNamespace string) (model.Resources, error) {
 	conn := sg.Server.getProxyConnection(proxyID)
 	if conn == nil {
 		// This is "like" a 404.  The error is the client's.  However, this endpoint
 		// only tracks a single "shard" of connections.  The client may try another instance.
+		return nil, fmt.Errorf("config dump could not find connection for proxyID %q", proxyID)
+	}
+	// Non-system callers can only dump proxies in their own namespace.
+	if callerNamespace != "" && conn.proxy.ConfigNamespace != callerNamespace {
 		return nil, fmt.Errorf("config dump could not find connection for proxyID %q", proxyID)
 	}
 
@@ -207,43 +222,4 @@ func (sg *StatusGen) debugConfigDump(proxyID string) (model.Resources, error) {
 	}
 
 	return model.AnyToUnnamedResources(dump.Configs), nil
-}
-
-func (sg *StatusGen) OnConnect(con *Connection) {
-	sg.pushStatusEvent(TypeURLConnect, []proto.Message{con.node})
-}
-
-func (sg *StatusGen) OnDisconnect(con *Connection) {
-	sg.pushStatusEvent(TypeURLDisconnect, []proto.Message{con.node})
-}
-
-func (sg *StatusGen) OnNack(node *model.Proxy, dr *discovery.DiscoveryRequest) {
-	// Make sure we include the ID - the DR may not include metadata
-	if dr.Node == nil {
-		dr.Node = &core.Node{}
-	}
-	dr.Node.Id = node.ID
-	sg.pushStatusEvent(TypeURLNACK, []proto.Message{dr})
-}
-
-// pushStatusEvent is similar with DiscoveryServer.pushStatusEvent() - but called directly,
-// since status discovery is not driven by config change events.
-// We also want connection events to be dispatched as soon as possible,
-// they may be consumed by other instances of Istiod to update internal state.
-func (sg *StatusGen) pushStatusEvent(typeURL string, data []proto.Message) {
-	clients := sg.Server.ClientsOf(typeURL)
-	if len(clients) == 0 {
-		return
-	}
-
-	resources := make([]*anypb.Any, 0, len(data))
-	for _, v := range data {
-		resources = append(resources, protoconv.MessageToAny(v))
-	}
-	dr := &discovery.DiscoveryResponse{
-		TypeUrl:   typeURL,
-		Resources: resources,
-	}
-
-	sg.Server.SendResponse(clients, dr)
 }

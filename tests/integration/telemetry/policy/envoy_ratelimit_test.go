@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -19,11 +18,9 @@ package policy
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
 	"istio.io/istio/pkg/config/protocol"
-	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/check"
@@ -34,7 +31,6 @@ import (
 	"istio.io/istio/pkg/test/framework/components/prometheus"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/util/tmpl"
 )
 
@@ -51,8 +47,10 @@ var (
 func TestRateLimiting(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.ratelimit.envoy").
 		Run(func(t framework.TestContext) {
+			// TODO(stevenjin8): Re-enable after migrating Redis off Docker Hub.
+			t.Skip("temporarily disabled because Redis image pulls are rate limited in CI")
+
 			cleanup := setupEnvoyFilter(t, "testdata/enable_envoy_ratelimit.yaml")
 			defer cleanup()
 			sendTrafficAndCheckIfRatelimited(t)
@@ -62,7 +60,6 @@ func TestRateLimiting(t *testing.T) {
 func TestLocalRateLimiting(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.ratelimit.envoy").
 		Run(func(t framework.TestContext) {
 			cleanup := setupEnvoyFilter(t, "testdata/enable_envoy_local_ratelimit.yaml")
 			defer cleanup()
@@ -73,7 +70,6 @@ func TestLocalRateLimiting(t *testing.T) {
 func TestLocalRouteSpecificRateLimiting(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.ratelimit.envoy").
 		Run(func(t framework.TestContext) {
 			cleanup := setupEnvoyFilter(t, "testdata/enable_envoy_local_ratelimit_per_route.yaml")
 			defer cleanup()
@@ -84,7 +80,6 @@ func TestLocalRouteSpecificRateLimiting(t *testing.T) {
 func TestLocalRateLimitingServiceAccount(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.ratelimit.envoy").
 		Run(func(t framework.TestContext) {
 			cleanup := setupEnvoyFilter(t, "testdata/enable_envoy_local_ratelimit_sa.yaml")
 			defer cleanup()
@@ -114,7 +109,7 @@ func testSetup(ctx resource.Context) (err error) {
 		Inject: true,
 	})
 	if err != nil {
-		return
+		return err
 	}
 
 	_, err = deployment.New(ctx).
@@ -138,7 +133,7 @@ func testSetup(ctx resource.Context) (err error) {
 		}).
 		Build()
 	if err != nil {
-		return
+		return err
 	}
 
 	ing = ist.IngressFor(ctx.Clusters().Default())
@@ -147,29 +142,31 @@ func testSetup(ctx resource.Context) (err error) {
 		Prefix: "istio-ratelimit",
 	})
 	if err != nil {
-		return
+		return err
 	}
 
+	/*  FIXME(stevenjin8): Re-enable after migrating Redis off Docker Hub.
 	err = ctx.ConfigIstio().File(ratelimitNs.Name(), "testdata/rate-limit-configmap.yaml").Apply()
 	if err != nil {
-		return
+		return err
 	}
 
 	err = ctx.ConfigIstio().File(ratelimitNs.Name(), filepath.Join(env.IstioSrc, "samples/ratelimit/rate-limit-service.yaml")).
 		Apply()
 	if err != nil {
-		return
+		return err
 	}
 
 	// Wait for redis and ratelimit service to be up.
 	fetchFn := kube.NewPodFetch(ctx.Clusters().Default(), ratelimitNs.Name(), "app=redis")
 	if _, err = kube.WaitUntilPodsAreReady(fetchFn); err != nil {
-		return
+		return err
 	}
 	fetchFn = kube.NewPodFetch(ctx.Clusters().Default(), ratelimitNs.Name(), "app=ratelimit")
 	if _, err = kube.WaitUntilPodsAreReady(fetchFn); err != nil {
-		return
+		return err
 	}
+	*/
 
 	return nil
 }

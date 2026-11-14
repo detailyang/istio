@@ -26,7 +26,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -101,7 +100,6 @@ func WarmBase(ctx context.Context, architectures []string, baseImages ...string)
 
 	t0 := time.Now()
 	for i, b := range keys {
-		b, i := b, i
 		go func() {
 			defer wg.Done()
 			ref, err := name.ParseReference(b.name)
@@ -113,7 +111,12 @@ func WarmBase(ctx context.Context, architectures []string, baseImages ...string)
 				Architecture: b.arch,
 				OS:           "linux",
 			}
-			bi, err := remote.Image(ref, remote.WithPlatform(plat), remote.WithProgress(CreateProgress(fmt.Sprintf("base %v", ref))))
+			bi, err := remote.Image(
+				ref,
+				remote.WithAuthFromKeychain(authn.DefaultKeychain),
+				remote.WithPlatform(plat),
+				remote.WithProgress(CreateProgress(fmt.Sprintf("base %v", ref))),
+			)
 			if err != nil {
 				log.WithLabels("image", b).Warnf("base failed: %v", err)
 				return
@@ -177,6 +180,7 @@ func Build(ctx context.Context, b BuildSpec) error {
 			}
 			bi, err := remote.Image(
 				ref,
+				remote.WithAuthFromKeychain(authn.DefaultKeychain),
 				remote.WithPlatform(plat),
 				remote.WithProgress(CreateProgress(fmt.Sprintf("base %v", ref))),
 			)
@@ -364,8 +368,4 @@ func CreateProgress(name string) chan v1.Update {
 		}
 	}()
 	return updates
-}
-
-func Experiment() {
-	registry.New()
 }

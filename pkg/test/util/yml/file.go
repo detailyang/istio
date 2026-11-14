@@ -69,7 +69,7 @@ func (w *writerImpl) WriteYAML(filenamePrefix string, contents ...string) ([]str
 	return out, nil
 }
 
-// WriteYAMLOrFial calls WriteYAML and fails the test if an error occurs.
+// WriteYAMLOrFail calls WriteYAML and fails the test if an error occurs.
 func (w *writerImpl) WriteYAMLOrFail(t test.Failer, filenamePrefix string, contents ...string) []string {
 	t.Helper()
 	out, err := w.WriteYAML(filenamePrefix, contents...)
@@ -90,13 +90,13 @@ func writeContentsToTempFile(workDir, contents string) (filename string, err err
 	var f *os.File
 	f, err = os.CreateTemp(workDir, yamlToFilename(contents)+".*.yaml")
 	if err != nil {
-		return
+		return filename, err
 	}
 	defer f.Close()
 	filename = f.Name()
 
 	_, err = f.WriteString(contents)
-	return
+	return filename, err
 }
 
 func yamlToFilename(contents string) string {

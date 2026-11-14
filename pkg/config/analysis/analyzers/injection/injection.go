@@ -21,7 +21,6 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 
-	"istio.io/api/annotation"
 	"istio.io/api/label"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/analysis"
@@ -77,7 +76,7 @@ func (a *Analyzer) Analyze(c analysis.Context) {
 		if okInjectionLabel {
 			istioLabels = append(istioLabels, fmt.Sprintf("%s=%s", util.InjectionLabelName, injectionLabel))
 		}
-		for _, l := range []string{RevisionInjectionLabelName, constants.DataplaneMode} {
+		for _, l := range []string{RevisionInjectionLabelName, label.IoIstioDataplaneMode.Name} {
 			if _, ok := r.Metadata.Labels[l]; ok && (!okInjectionLabel || injectionLabel == "enabled") {
 				istioLabels = append(istioLabels, fmt.Sprintf("%s=%s", l, r.Metadata.Labels[l]))
 			}
@@ -87,7 +86,7 @@ func (a *Analyzer) Analyze(c analysis.Context) {
 			c.Report(gvk.Namespace, m)
 		}
 
-		if r.Metadata.Labels[constants.DataplaneMode] == constants.DataplaneModeAmbient {
+		if r.Metadata.Labels[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeAmbient {
 			return true
 		}
 
@@ -139,11 +138,7 @@ func (a *Analyzer) Analyze(c analysis.Context) {
 		}
 
 		// If a pod has injection explicitly disabled, no need to check further
-		inj := r.Metadata.Annotations[annotation.SidecarInject.Name]
-		if v, ok := r.Metadata.Labels[label.SidecarInject.Name]; ok {
-			inj = v
-		}
-		if strings.EqualFold(inj, "false") {
+		if strings.EqualFold(r.Metadata.Labels[label.SidecarInject.Name], "false") {
 			return true
 		}
 

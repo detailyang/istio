@@ -3,8 +3,15 @@ kind: Deployment
 metadata:
   labels:
     app: istio-ingressgateway
+    app.kubernetes.io/instance: istio
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: istio-ingressgateway
+    app.kubernetes.io/part-of: istio
+    app.kubernetes.io/version: 1.0.0
+    helm.sh/chart: istio-ingress-1.0.0
     install.operator.istio.io/owning-resource: unknown
     istio: ingressgateway
+    istio.io/dataplane-mode: none
     istio.io/rev: default
     operator.istio.io/component: IngressGateways
     release: istio
@@ -29,10 +36,17 @@ spec:
         sidecar.istio.io/inject: "false"
       labels:
         app: istio-ingressgateway
+        app.kubernetes.io/instance: istio
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: istio-ingressgateway
+        app.kubernetes.io/part-of: istio
+        app.kubernetes.io/version: 1.0.0
         chart: gateways
+        helm.sh/chart: istio-ingress-1.0.0
         heritage: Tiller
         install.operator.istio.io/owning-resource: unknown
         istio: ingressgateway
+        istio.io/dataplane-mode: none
         istio.io/rev: default
         operator.istio.io/component: IngressGateways
         release: istio
@@ -54,8 +68,6 @@ spec:
         - --proxyComponentLogLevel=misc:error
         - --log_output_level=default:info
         env:
-        - name: JWT_POLICY
-          value: third-party-jwt
         - name: PILOT_CERT_PROVIDER
           value: istiod
         - name: CA_ADDR
@@ -88,6 +100,7 @@ spec:
         - name: ISTIO_CPU_LIMIT
           valueFrom:
             resourceFieldRef:
+              divisor: "1"
               resource: limits.cpu
         - name: SERVICE_ACCOUNT
           valueFrom:
@@ -109,7 +122,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        image: gcr.io/istio-testing/proxyv2:latest
+        image: registry.istio.io/testing/proxyv2:latest
         name: istio-proxy
         ports:
         - containerPort: 15021
@@ -221,17 +234,21 @@ spec:
         secret:
           optional: true
           secretName: istio-ingressgateway-ca-certs
-
 ---
-
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
     app: istio-ingressgateway
+    app.kubernetes.io/instance: istio
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: istio-ingressgateway
+    app.kubernetes.io/part-of: istio
+    app.kubernetes.io/version: 1.0.0
+    helm.sh/chart: istio-ingress-1.0.0
     install.operator.istio.io/owning-resource: unknown
     istio: ingressgateway
+    istio.io/dataplane-mode: none
     istio.io/rev: default
     operator.istio.io/component: IngressGateways
     release: istio
@@ -256,10 +273,17 @@ spec:
         sidecar.istio.io/inject: "false"
       labels:
         app: istio-ingressgateway
+        app.kubernetes.io/instance: istio
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: istio-ingressgateway
+        app.kubernetes.io/part-of: istio
+        app.kubernetes.io/version: 1.0.0
         chart: gateways
+        helm.sh/chart: istio-ingress-1.0.0
         heritage: Tiller
         install.operator.istio.io/owning-resource: unknown
         istio: ingressgateway
+        istio.io/dataplane-mode: none
         istio.io/rev: default
         operator.istio.io/component: IngressGateways
         release: istio
@@ -281,8 +305,6 @@ spec:
         - --proxyComponentLogLevel=misc:error
         - --log_output_level=default:info
         env:
-        - name: JWT_POLICY
-          value: third-party-jwt
         - name: PILOT_CERT_PROVIDER
           value: istiod
         - name: CA_ADDR
@@ -315,6 +337,7 @@ spec:
         - name: ISTIO_CPU_LIMIT
           valueFrom:
             resourceFieldRef:
+              divisor: "1"
               resource: limits.cpu
         - name: SERVICE_ACCOUNT
           valueFrom:
@@ -336,7 +359,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        image: gcr.io/istio-testing/proxyv2:latest
+        image: registry.istio.io/testing/proxyv2:latest
         name: istio-proxy
         ports:
         - containerPort: 15021
@@ -445,10 +468,7 @@ spec:
         secret:
           optional: true
           secretName: istio-ingressgateway-ca-certs
-
 ---
-
-
 apiVersion: v1
 kind: Service
 metadata:
@@ -456,6 +476,12 @@ metadata:
     manifest-generate: testserviceAnnotation
   labels:
     app: istio-ingressgateway
+    app.kubernetes.io/instance: istio
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: istio-ingressgateway
+    app.kubernetes.io/part-of: istio
+    app.kubernetes.io/version: 1.0.0
+    helm.sh/chart: istio-ingress-1.0.0
     install.operator.istio.io/owning-resource: unknown
     istio: ingressgateway
     istio.io/rev: default
@@ -482,16 +508,19 @@ spec:
     app: istio-ingressgateway
     istio: ingressgateway
   type: LoadBalancer
-
 ---
-
-
 apiVersion: v1
 kind: Service
 metadata:
   annotations: null
   labels:
     app: istio-ingressgateway
+    app.kubernetes.io/instance: istio
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: istio-ingressgateway
+    app.kubernetes.io/part-of: istio
+    app.kubernetes.io/version: 1.0.0
+    helm.sh/chart: istio-ingress-1.0.0
     install.operator.istio.io/owning-resource: unknown
     istio: ingressgateway
     istio.io/rev: default
@@ -518,5 +547,3 @@ spec:
     app: istio-ingressgateway
     istio: ingressgateway
   type: LoadBalancer
-
----

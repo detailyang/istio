@@ -24,6 +24,7 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/tools/docker-builder/builder"
 )
 
@@ -78,13 +79,6 @@ type state struct {
 	shlex *shell.Lex
 }
 
-func cut(s, sep string) (before, after string) {
-	if i := strings.Index(s, sep); i >= 0 {
-		return s[:i], s[i+len(sep):]
-	}
-	return s, ""
-}
-
 // Parse parses the provided Dockerfile with the given args
 func Parse(f string, opts ...Option) (builder.Args, error) {
 	empty := builder.Args{}
@@ -117,7 +111,7 @@ func Parse(f string, opts ...Option) (builder.Args, error) {
 	for _, c := range cmds {
 		switch c.Cmd {
 		case "ARG":
-			k, v := cut(c.Value[0], "=")
+			k, v, _ := strings.Cut(c.Value[0], "=")
 			_, f := s.args[k]
 			if !f {
 				s.args[k] = v
@@ -185,8 +179,21 @@ func (s state) Expand(i string) string {
 	for k, v := range s.env {
 		avail[k] = v
 	}
-	r, _ := s.shlex.ProcessWordWithMap(i, avail)
+	r, _, _ := s.shlex.ProcessWord(i, envGetter(avail))
 	return r
+}
+
+type envGetter map[string]string
+
+var _ shell.EnvGetter = envGetter{}
+
+func (e envGetter) Get(key string) (string, bool) {
+	v, ok := e[key]
+	return v, ok
+}
+
+func (e envGetter) Keys() []string {
+	return maps.Keys(e)
 }
 
 // Below is inspired by MIT licensed https://github.com/asottile/dockerfile

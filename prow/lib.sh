@@ -52,7 +52,8 @@ function trace() {
   tracing::run "$1" "${@:2}"
 
   { set +x; } 2>/dev/null
-  elapsed=$(date_cmd +%s.%N --date="$start seconds ago" )
+  end="$(date_cmd -u +%s.%N)"
+  elapsed=$(awk "BEGIN {printf \"%.9f\", $end - $start}")
   log "Command '${1}' complete in ${elapsed}s"
   # Write to YAML file as well for easy reading by tooling
   echo "'${1}': $elapsed" >> "${ARTIFACTS}/trace.yaml"
@@ -115,26 +116,21 @@ function build_images() {
   SELECT_TEST="${1}"
 
   # Build just the images needed for tests
-  targets="docker.pilot docker.proxyv2 "
+  targets="docker.pilot docker.proxyv2 docker.agentgateway "
 
   # use ubuntu:jammy to test vms by default
-  nonDistrolessTargets="docker.app docker.app_sidecar_ubuntu_jammy docker.ext-authz "
+  nonDistrolessTargets="docker.app docker.app_sidecar_ubuntu_noble docker.ext-authz "
   if [[ "${JOB_TYPE:-presubmit}" == "postsubmit" ]]; then
     # We run tests across all VM types only in postsubmit
-    nonDistrolessTargets+="docker.app_sidecar_ubuntu_bionic docker.app_sidecar_debian_11 "
-    # TODO(https://github.com/istio/istio/issues/38224)
-#    nonDistrolessTargets+="docker.app_sidecar_rockylinux_8 "
+    nonDistrolessTargets+="docker.app_sidecar_ubuntu_bionic docker.app_sidecar_debian_12 docker.app_sidecar_rockylinux_9 "
   fi
-  if [[ "${SELECT_TEST}" == "test.integration.operator.kube" || "${SELECT_TEST}" == "test.integration.kube" || "${JOB_TYPE:-postsubmit}" == "postsubmit" ]]; then
-    targets+="docker.operator "
-  fi
-  if [[ "${SELECT_TEST}" == "test.integration.ambient.kube" || "${SELECT_TEST}" == "test.integration.kube" || "${JOB_TYPE:-postsubmit}" == "postsubmit" ]]; then
+  if [[ "${SELECT_TEST}" == test.integration.ambient.kube* || "${SELECT_TEST}" == "test.integration.kube"  || "${SELECT_TEST}" == "test.integration.helm.kube" || "${JOB_TYPE:-postsubmit}" == "postsubmit" ]]; then
     targets+="docker.ztunnel "
   fi
   targets+="docker.install-cni "
   # Integration tests are always running on local architecture (no cross compiling), so find out what that is.
   arch="linux/amd64"
-  if [[ "$(uname -m)" == "aarch64" ]]; then
+  if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
       arch="linux/arm64"
   fi
   if [[ "${VARIANT:-default}" == "distroless" ]]; then
@@ -145,26 +141,54 @@ function build_images() {
   fi
 }
 
-# Creates a local registry for kind nodes to pull images from. Expects that the "kind" network already exists.
-function setup_kind_registry() {
-  # create a registry container if it not running already
+# Starts the local registry used by kind nodes and image builds.
+function start_kind_registry() {
+  local running
   running="$(docker inspect -f '{{.State.Running}}' "${KIND_REGISTRY_NAME}" 2>/dev/null || true)"
   if [[ "${running}" != 'true' ]]; then
-      docker run \
-        -d --restart=always -p "${KIND_REGISTRY_PORT}:5000" --name "${KIND_REGISTRY_NAME}" \
-        gcr.io/istio-testing/registry:2
+    docker run \
+      -d --restart=always -p "${KIND_REGISTRY_PORT}:5000" --name "${KIND_REGISTRY_NAME}" \
+      registry.istio.io/testing/registry:2
+  fi
+}
 
-    # Allow kind nodes to reach the registry
+# Configures completed kind clusters to pull images from the local registry.
+function configure_kind_registry() {
+  local registry_network
+  registry_network="$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{if eq $name "kind"}}kind{{end}}{{end}}' "${KIND_REGISTRY_NAME}")"
+  if [[ "${registry_network}" != "kind" ]]; then
     docker network connect "kind" "${KIND_REGISTRY_NAME}"
   fi
 
   # https://docs.tilt.dev/choosing_clusters.html#discovering-the-registry
   for cluster in $(kind get clusters); do
     # TODO get context/config from existing variables
-    kind export kubeconfig --name="${cluster}"
+    if [[ "${DEVCONTAINER}" ]]; then
+      kind export kubeconfig --name="${cluster}" --internal
+    else
+      kind export kubeconfig --name="${cluster}"
+    fi
     for node in $(kind get nodes --name="${cluster}"); do
-      kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:${KIND_REGISTRY_PORT}" --overwrite;
+      docker exec "${node}" mkdir -p "${KIND_REGISTRY_DIR}"
+      cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${KIND_REGISTRY_DIR}/hosts.toml"
+[host."http://${KIND_REGISTRY_NAME}:5000"]
+EOF
+    
+      kubectl annotate node "${node}" "kind.x-k8s.io/registry=kind-registry:${KIND_REGISTRY_PORT}" --overwrite;
     done
+
+    # Document the local registry
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${KIND_REGISTRY_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
   done
 }
 

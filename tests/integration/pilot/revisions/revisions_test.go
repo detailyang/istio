@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -18,11 +17,16 @@
 package revisions
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/check"
 	"istio.io/istio/pkg/test/framework/components/echo/deployment"
@@ -43,6 +47,7 @@ func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
 		RequireMultiPrimary().
+		Label(label.Full).
 		// Requires two CPs with specific names to be configured.
 		Label(label.CustomSetup).
 		Setup(istio.Setup(nil, func(_ resource.Context, cfg *istio.Config) {
@@ -67,12 +72,12 @@ components:
 func TestMultiRevision(t *testing.T) {
 	framework.NewTest(t).
 		Run(func(t framework.TestContext) {
-			stable := namespace.NewOrFail(t, t, namespace.Config{
+			stable := namespace.NewOrFail(t, namespace.Config{
 				Prefix:   "stable",
 				Inject:   true,
 				Revision: "stable",
 			})
-			canary := namespace.NewOrFail(t, t, namespace.Config{
+			canary := namespace.NewOrFail(t, namespace.Config{
 				Prefix:   "canary",
 				Inject:   true,
 				Revision: "canary",
@@ -127,5 +132,112 @@ func TestMultiRevision(t *testing.T) {
 							check.OK()).Check(result, err)
 					}, retry.Delay(time.Millisecond*100))
 				})
+		})
+}
+
+func TestMultiRevisionRouteStatusHandling(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			crd.DeployGatewayAPIOrSkip(t)
+			cfg := istio.DefaultConfigOrFail(t, t)
+			stable := namespace.NewOrFail(t, namespace.Config{
+				Prefix:   "stable",
+				Inject:   true,
+				Revision: "stable",
+			})
+			canary := namespace.NewOrFail(t, namespace.Config{
+				Prefix:   "canary",
+				Inject:   true,
+				Revision: "canary",
+			})
+
+			_ = deployment.New(t).
+				WithClusters(t.Clusters()...).
+				WithConfig(echo.Config{
+					Service:   "client",
+					Namespace: stable,
+					Ports:     []echo.Port{},
+				}).
+				WithConfig(echo.Config{
+					Service:   "server",
+					Namespace: canary,
+					Ports: []echo.Port{
+						{
+							Name:         "http",
+							Protocol:     protocol.HTTP,
+							WorkloadPort: 8090,
+						},
+					},
+				}).
+				BuildOrFail(t)
+
+			t.ConfigIstio().Eval(canary.Name(), map[string]string{
+				"namespace":    canary.Name(),
+				"gatewayClass": cfg.GatewayClassName,
+			}, `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: test-gateway
+  namespace: {{.namespace}}
+spec:
+  gatewayClassName: {{.gatewayClass}}
+  listeners:
+  - name: http
+    hostname: "test.example.com"
+    port: 80
+    protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+  namespace: {{.namespace}}
+spec:
+  parentRefs:
+  - name: test-gateway
+  hostnames:
+  - "test.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: server
+      port: 8090
+`).ApplyOrFail(t)
+
+			getRoute := func() (int, error) {
+				route, err := t.Clusters().Default().GatewayAPI().GatewayV1beta1().HTTPRoutes(canary.Name()).Get(context.Background(), "test-route", v1.GetOptions{})
+				if err != nil {
+					return 0, err
+				}
+				return len(route.Status.Parents), nil
+			}
+
+			// Wait for the status handler to populate parent status.
+			retry.UntilSuccessOrFail(t, func() error {
+				parentCount, err := getRoute()
+				if err != nil {
+					return err
+				}
+				if parentCount == 0 {
+					return fmt.Errorf("waiting for httproute status parents")
+				}
+				return nil
+			}, retry.Timeout(30*time.Second), retry.Delay(100*time.Millisecond))
+
+			// Verify parent status is not cleared after it appears.
+			retry.UntilSuccessOrFail(t, func() error {
+				parentCount, err := getRoute()
+				if err != nil {
+					return err
+				}
+				if parentCount == 0 {
+					return fmt.Errorf("httproute status was incorrectly overwritten")
+				}
+				return nil
+			}, retry.Converge(10), retry.Delay(10*time.Millisecond))
 		})
 }

@@ -39,16 +39,18 @@ const (
 
 // Params contains parameters for running a kubectl fetch command.
 type Params struct {
-	Runner         *kubectlcmd.Runner
-	DryRun         bool
-	Verbose        bool
-	ClusterVersion string
-	Namespace      string
-	IstioNamespace string
-	Pod            string
-	Container      string
-	KubeConfig     string
-	KubeContext    string
+	Runner             *kubectlcmd.Runner
+	DryRun             bool
+	Verbose            bool
+	ClusterVersion     string
+	Namespace          string
+	IstioNamespace     string
+	Pod                string
+	Container          string
+	KubeConfig         string
+	KubeContext        string
+	ProxyAdminPort     int
+	IncludedNamespaces []string
 }
 
 func (p *Params) SetDryRun(dryRun bool) *Params {
@@ -60,6 +62,12 @@ func (p *Params) SetDryRun(dryRun bool) *Params {
 func (p *Params) SetVerbose(verbose bool) *Params {
 	out := *p
 	out.Verbose = verbose
+	return &out
+}
+
+func (p *Params) SetProxyAdminPort(proxyAdminPort int) *Params {
+	out := *p
+	out.ProxyAdminPort = proxyAdminPort
 	return &out
 }
 
@@ -89,18 +97,43 @@ func (p *Params) SetContainer(container string) *Params {
 
 // GetK8sResources returns all k8s cluster resources.
 func GetK8sResources(p *Params) (map[string]string, error) {
-	out, err := p.Runner.RunCmd("get --all-namespaces "+
-		"all,nodes,namespaces,jobs,ingresses,endpoints,endpointslices,customresourcedefinitions,configmaps,events,"+
-		"mutatingwebhookconfigurations,validatingwebhookconfigurations,networkpolicies "+
-		"-o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
+	// Cluster-scoped resources are always fetched cluster-wide.
+	clusterResources := "nodes,namespaces,customresourcedefinitions," +
+		"mutatingwebhookconfigurations,validatingwebhookconfigurations"
+
+	// Namespace-scoped resources can be filtered when specific namespaces are included.
+	nsResources := "all,jobs,ingresses,endpointslices,configmaps,networkpolicies"
+
+	nsFlag := "--all-namespaces"
+	if len(p.IncludedNamespaces) > 0 && p.IncludedNamespaces[0] != "" {
+		nsFlag = "-n " + strings.Join(p.IncludedNamespaces, ",")
+	}
+
+	// Fetch cluster-scoped resources
+	clusterOut, err := p.Runner.RunCmd("get "+clusterResources+" -o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch namespace-scoped resources (scoped when possible)
+	nsOut, err := p.Runner.RunCmd("get "+nsFlag+" "+nsResources+" -o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
+	if err != nil {
+		return nil, err
+	}
+
 	return map[string]string{
-		"k8s-resources": out,
-	}, err
+		"k8s-resources":         nsOut,
+		"k8s-cluster-resources": clusterOut,
+	}, nil
 }
 
 // GetSecrets returns all k8s secrets. If full is set, the secret contents are also returned.
 func GetSecrets(p *Params) (map[string]string, error) {
-	cmdStr := "get secrets --all-namespaces"
+	nsFlag := "--all-namespaces"
+	if len(p.IncludedNamespaces) > 0 && p.IncludedNamespaces[0] != "" {
+		nsFlag = "-n " + strings.Join(p.IncludedNamespaces, ",")
+	}
+	cmdStr := "get secrets " + nsFlag
 	if p.Verbose {
 		cmdStr += " -o yaml"
 	}
@@ -116,7 +149,14 @@ func GetCRs(p *Params) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := p.Runner.RunCmd("get --all-namespaces "+strings.Join(crds, ",")+" -o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
+	if len(crds) == 0 {
+		return map[string]string{"crs": ""}, nil
+	}
+	nsFlag := "--all-namespaces"
+	if len(p.IncludedNamespaces) > 0 && p.IncludedNamespaces[0] != "" {
+		nsFlag = "-n " + strings.Join(p.IncludedNamespaces, ",")
+	}
+	out, err := p.Runner.RunCmd("get "+nsFlag+" "+strings.Join(crds, ",")+" -o yaml", "", p.KubeConfig, p.KubeContext, p.DryRun)
 	return map[string]string{
 		"crs": out,
 	}, err
@@ -163,9 +203,13 @@ func GetPodInfo(p *Params) (map[string]string, error) {
 	}, err
 }
 
-// GetEvents returns events for all namespaces.
+// GetEvents returns events for all namespaces, or scoped namespaces if specified.
 func GetEvents(p *Params) (map[string]string, error) {
-	out, err := p.Runner.RunCmd("get events --all-namespaces -o wide --sort-by=.metadata.creationTimestamp", "", p.KubeConfig, p.KubeContext, p.DryRun)
+	nsFlag := "--all-namespaces"
+	if len(p.IncludedNamespaces) > 0 && p.IncludedNamespaces[0] != "" {
+		nsFlag = "-n " + strings.Join(p.IncludedNamespaces, ",")
+	}
+	out, err := p.Runner.RunCmd("get events "+nsFlag+" -o wide --sort-by=.metadata.creationTimestamp", "", p.KubeConfig, p.KubeContext, p.DryRun)
 	return map[string]string{
 		"events": out,
 	}, err
@@ -200,7 +244,7 @@ func GetProxyInfo(p *Params) (map[string]string, error) {
 	}
 	ret := make(map[string]string)
 	for _, url := range common.ProxyDebugURLs(p.ClusterVersion) {
-		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun)
+		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun, p.ProxyAdminPort)
 		if err != nil {
 			errs = multierror.Append(errs, err)
 			continue
@@ -220,7 +264,7 @@ func GetZtunnelInfo(p *Params) (map[string]string, error) {
 	errs := istiomultierror.New()
 	ret := make(map[string]string)
 	for _, url := range common.ZtunnelDebugURLs(p.ClusterVersion) {
-		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun)
+		out, err := p.Runner.EnvoyGet(p.Namespace, p.Pod, url, p.DryRun, p.ProxyAdminPort)
 		if err != nil {
 			errs = multierror.Append(errs, err)
 			continue

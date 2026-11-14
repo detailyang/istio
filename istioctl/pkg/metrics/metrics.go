@@ -31,6 +31,7 @@ import (
 
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/clioptions"
+	"istio.io/istio/istioctl/pkg/completion"
 	"istio.io/istio/istioctl/pkg/dashboard"
 	"istio.io/istio/pkg/log"
 )
@@ -86,6 +87,7 @@ calculated over a time interval of 1 minute.
 			return run(cmd, ctx, args)
 		},
 		DisableFlagsInUseLine: true,
+		ValidArgsFunction:     completion.ValidPodsNameArgs(ctx),
 	}
 
 	cmd.PersistentFlags().DurationVarP(&metricsDuration, "duration", "d", time.Minute, "Duration of query metrics, default value is 1m.")
@@ -127,9 +129,9 @@ func run(c *cobra.Command, ctx cli.Context, args []string) error {
 		return fmt.Errorf("failure running port forward process: %v", err)
 	}
 
-	// Close the forwarder either when we exit or when an this processes is interrupted.
+	// Close the forwarder either when we exit or when this process is interrupted.
 	defer fw.Close()
-	dashboard.ClosePortForwarderOnInterrupt(fw)
+	go dashboard.ClosePortForwarderOnInterrupt(fw)
 
 	log.Debugf("port-forward to prometheus pod ready")
 
@@ -224,7 +226,7 @@ func getLatency(promAPI promv1.API, workloadName, workloadNamespace string, dura
 }
 
 func vectorValue(promAPI promv1.API, query string) (float64, error) {
-	val, _, err := promAPI.Query(context.Background(), query, time.Now())
+	val, _, _, err := promAPI.Query(context.Background(), query, time.Now())
 	if err != nil {
 		return 0, fmt.Errorf("query() failure for '%s': %v", query, err)
 	}

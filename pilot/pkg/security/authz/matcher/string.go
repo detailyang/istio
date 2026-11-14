@@ -15,6 +15,7 @@
 package matcher
 
 import (
+	"regexp"
 	"strings"
 
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
@@ -23,6 +24,33 @@ import (
 // StringMatcher creates a string matcher for v.
 func StringMatcher(v string) *matcher.StringMatcher {
 	return StringMatcherWithPrefix(v, "")
+}
+
+// StringOrMatcher creates an OR string matcher for a list of values.
+func StringOrMatcher(vs []string) *matcher.ValueMatcher {
+	matchers := []*matcher.ValueMatcher{}
+	for _, v := range vs {
+		matchers = append(matchers, &matcher.ValueMatcher{
+			MatchPattern: &matcher.ValueMatcher_StringMatch{
+				StringMatch: StringMatcher(v),
+			},
+		})
+	}
+	return OrMatcher(matchers)
+}
+
+// OrMatcher creates an OR matcher for a list of matchers.
+func OrMatcher(matchers []*matcher.ValueMatcher) *matcher.ValueMatcher {
+	if len(matchers) == 1 {
+		return matchers[0]
+	}
+	return &matcher.ValueMatcher{
+		MatchPattern: &matcher.ValueMatcher_OrMatch{
+			OrMatch: &matcher.OrMatcher{
+				ValueMatchers: matchers,
+			},
+		},
+	}
 }
 
 // StringMatcherRegex creates a regex string matcher for regex.
@@ -79,7 +107,7 @@ func StringMatcherWithPrefix(v, prefix string) *matcher.StringMatcher {
 		if prefix == "" {
 			return StringMatcherSuffix(strings.TrimPrefix(v, "*"), false)
 		}
-		return StringMatcherRegex(prefix + ".*" + strings.TrimPrefix(v, "*"))
+		return StringMatcherRegex(prefix + ".*" + regexp.QuoteMeta(strings.TrimPrefix(v, "*")))
 	case strings.HasSuffix(v, "*"):
 		return StringMatcherPrefix(prefix+strings.TrimSuffix(v, "*"), false)
 	default:

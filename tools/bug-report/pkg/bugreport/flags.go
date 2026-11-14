@@ -24,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
 
+	"istio.io/istio/istioctl/pkg/util"
 	"istio.io/istio/pkg/kube/inject"
 	"istio.io/istio/pkg/slices"
 	config2 "istio.io/istio/tools/bug-report/pkg/config"
@@ -52,6 +53,9 @@ func addFlags(cmd *cobra.Command, args *config2.BugReportConfig) {
 	cmd.PersistentFlags().BoolVarP(&args.DryRun, "dry-run", "", false,
 		"Only log commands that would be run, don't fetch or write.")
 
+	cmd.PersistentFlags().IntVar(&args.ProxyAdminPort, "proxy-admin-port", util.DefaultProxyAdminPort,
+		"Envoy proxy admin port")
+
 	// full secrets
 	cmd.PersistentFlags().BoolVarP(&args.FullSecrets, "full-secrets", "", false,
 		"If set, secret contents are included in output.")
@@ -65,9 +69,9 @@ func addFlags(cmd *cobra.Command, args *config2.BugReportConfig) {
 		"Maximum amount of time to spend fetching logs. When timeout is reached "+
 			"only the logs captured so far are saved to the archive.")
 	// include / exclude specs
-	cmd.PersistentFlags().StringSliceVar(&included, "include", bugReportDefaultInclude,
+	cmd.PersistentFlags().StringArrayVar(&included, "include", bugReportDefaultInclude,
 		"Spec for which pod's proxy logs to include in the archive. See above for format and examples.")
-	cmd.PersistentFlags().StringSliceVar(&excluded, "exclude", bugReportDefaultExclude,
+	cmd.PersistentFlags().StringArrayVar(&excluded, "exclude", bugReportDefaultExclude,
 		"Spec for which pod's proxy logs to exclude from the archive, after the include spec "+
 			"is processed. See above for format and examples.")
 
@@ -99,6 +103,22 @@ func addFlags(cmd *cobra.Command, args *config2.BugReportConfig) {
 	// in-flight request limit
 	cmd.PersistentFlags().IntVar(&args.RequestConcurrency, "rq-concurrency", 0,
 		"Set the concurrency limit of requests to the Kubernetes API server, defaults to 32.")
+
+	// log line limit
+	cmd.PersistentFlags().Int64Var(&args.TailLines, "tail", 0,
+		"Maximum number of log lines to fetch per container. Set to 0 for unlimited.")
+
+	// skip flags for expensive sections
+	cmd.PersistentFlags().BoolVar(&args.SkipClusterDump, "skip-cluster-dump", false,
+		"Skip fetching cluster-wide resources (K8s resources, CRs, node info, secrets).")
+	cmd.PersistentFlags().BoolVar(&args.SkipAnalyze, "skip-analyze", false,
+		"Skip running istioctl analyze.")
+	cmd.PersistentFlags().BoolVar(&args.SkipProxyDebug, "skip-proxy-debug", false,
+		"Skip fetching envoy admin debug info from proxy pods.")
+	cmd.PersistentFlags().BoolVar(&args.SkipNetstat, "skip-netstat", false,
+		"Skip running netstat in proxy containers.")
+	cmd.PersistentFlags().BoolVar(&args.SkipCoredumps, "skip-coredumps", false,
+		"Skip collecting coredumps from proxy containers.")
 }
 
 func parseConfig() (*config2.BugReportConfig, error) {
@@ -145,11 +165,7 @@ func parseConfig() (*config2.BugReportConfig, error) {
 }
 
 func parseTimes(config *config2.BugReportConfig, startTime, endTime string, duration time.Duration) error {
-	if startTime == "" && endTime == "" {
-		config.TimeFilterApplied = false
-	} else {
-		config.TimeFilterApplied = true
-	}
+	config.TimeFilterApplied = startTime != "" || endTime != "" || duration != 0
 
 	config.EndTime = time.Now()
 	config.Since = config2.Duration(duration)

@@ -131,7 +131,7 @@ func (w *workload) Client() (c *echoClient.Client, err error) {
 			w.pod.Namespace, w.pod.Name, w.cluster.Name())
 	}
 	w.mutex.Unlock()
-	return
+	return c, err
 }
 
 func (w *workload) Update(pod corev1.Pod) error {
@@ -206,6 +206,14 @@ func (w *workload) Sidecar() echo.Sidecar {
 	w.mutex.Lock()
 	s := w.sidecar
 	w.mutex.Unlock()
+
+	// Return an untyped nil instead of a (*sidecar)(nil). An interface holding a nil concrete
+	// pointer is itself non-nil, so without this guard `wl.Sidecar() != nil` would be true even
+	// for pods without a sidecar.
+	if s == nil {
+		return nil
+	}
+
 	return s
 }
 

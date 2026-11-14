@@ -31,7 +31,7 @@ spec:
       serviceAccountName: bookinfo-details
       containers:
         - name: details
-          image: docker.io/istio/examples-bookinfo-details-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-details-v1:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9080
@@ -94,7 +94,7 @@ spec:
       serviceAccountName: bookinfo-details
       containers:
         - name: details
-          image: docker.io/istio/examples-bookinfo-details-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-details-v1:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9080
@@ -156,12 +156,12 @@ spec:
       serviceAccountName: bookinfo-reviews
       containers:
         - name: reviews
-          image: docker.io/istio/examples-bookinfo-reviews-v2:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-reviews-v2:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9080
         - name: reviews-2
-          image: docker.io/istio/examples-bookinfo-reviews-v2:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-reviews-v2:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090
@@ -222,7 +222,7 @@ spec:
       serviceAccountName: bookinfo-ratings
       containers:
         - name: ratings
-          image: docker.io/istio/examples-bookinfo-ratings-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-ratings-v1:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9080
@@ -252,7 +252,7 @@ spec:
       serviceAccountName: bookinfo-productpage
       containers:
         - name: productpage
-          image: docker.io/istio/examples-bookinfo-productpage-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-productpage-v1:1.15.0
           imagePullPolicy: IfNotPresent
 ---
 apiVersion: v1
@@ -305,16 +305,15 @@ spec:
       version: v1
   template:
     metadata:
-      annotations:
-        sidecar.istio.io/inject: "false"
       labels:
         app: productpage
         version: v1
+        sidecar.istio.io/inject: "false"
     spec:
       serviceAccountName: bookinfo-productpage
       containers:
         - name: productpage
-          image: docker.io/istio/examples-bookinfo-productpage-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-productpage-v1:1.15.0
           imagePullPolicy: IfNotPresent
 ---
 apiVersion: v1
@@ -324,7 +323,7 @@ metadata:
 spec: {}
 ---
 # Deployment has multiple service attached but using same port but different protocol.
-# Sidecar is enabled although the namespaced doesn't have automatic injection.
+# Sidecar is enabled via the label although the namespace doesn't have automatic injection.
 # It should generate a warning.
 apiVersion: apps/v1
 kind: Deployment
@@ -342,16 +341,15 @@ spec:
       version: v1
   template:
     metadata:
-      annotations:
-        sidecar.istio.io/inject: "true"
       labels:
         app: ratings
         version: v1
+        sidecar.istio.io/inject: "true"
     spec:
       serviceAccountName: bookinfo-ratings
       containers:
         - name: ratings
-          image: docker.io/istio/examples-bookinfo-ratings-v1:1.15.0
+          image: registry.istio.io/release/examples-bookinfo-ratings-v1:1.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9080
@@ -375,10 +373,9 @@ spec:
       labels:
         sidecar.istio.io/inject: "false"
         gateway.networking.k8s.io/gateway-name: productpage
-        istio.io/gateway-name: productpage
     spec:
       serviceAccountName: productpage-istio-waypoint
       containers:
         - name: istio-proxy
-          image: docker.io/istio/proxyv2:1.20.0-dev1
+          image: registry.istio.io/release/proxyv2:1.20.0-dev1
           imagePullPolicy: IfNotPresent

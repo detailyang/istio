@@ -16,13 +16,12 @@ package config
 
 import (
 	"bytes"
-	"reflect"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/kr/pretty"
 	"sigs.k8s.io/yaml"
+
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestUnmarshalKubeCaptureConfig(t *testing.T) {
@@ -117,9 +116,7 @@ ignoredErrors:
 		t.Fatal(err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got:\n%s\nwant:\n%s\n\ndiff (-got, +want):\n%s\n", pretty.Sprint(got), pretty.Sprint(want), cmp.Diff(got, want))
-	}
+	assert.Equal(t, got, want)
 }
 
 func TestUnmarshalSelectionSpec(t *testing.T) {
@@ -144,9 +141,14 @@ func TestUnmarshalSelectionSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got:\n%s\nwant:\n%s\n\ndiff (-got, +want):\n%s\n", pretty.Sprint(got), pretty.Sprint(want), cmp.Diff(got, want))
-	}
+	assert.Equal(t, got, want)
+}
+
+func TestUnmarshalSelectionSpecTooManyFields(t *testing.T) {
+	got := &SelectionSpec{}
+	err := got.UnmarshalJSON([]byte("ns/deployment/pod/label=value/annotation=value/container/extra"))
+
+	assert.Error(t, err)
 }
 
 func TestMarshalSelectionSpec(t *testing.T) {

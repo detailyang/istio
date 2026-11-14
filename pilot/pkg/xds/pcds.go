@@ -22,11 +22,11 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	tb "istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/config/schema/kind"
 )
 
 // PcdsGenerator generates proxy configuration for proxies to consume
 type PcdsGenerator struct {
-	Server      *DiscoveryServer
 	TrustBundle *tb.TrustBundle
 }
 
@@ -41,13 +41,13 @@ func pcdsNeedsPush(req *model.PushRequest) bool {
 		return true
 	}
 
-	if !req.Full {
-		return false
-	}
-
-	if len(req.ConfigsUpdated) == 0 {
+	if req.Forced {
 		// This needs to be better optimized
 		return true
+	}
+
+	if model.OnlyHasConfigsOfKind(req.ConfigsUpdated, kind.Endpoints) {
+		return false
 	}
 
 	return false

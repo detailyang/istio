@@ -15,28 +15,52 @@
 package install
 
 import (
-	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"istio.io/istio/cni/pkg/config"
+	"istio.io/istio/cni/pkg/constants"
 	testutils "istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/file"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
 )
 
+func TestPluginEqual(t *testing.T) {
+	base := map[string]any{"type": "istio-cni", "plugin_log_level": "debug"}
+	sameButVersion := map[string]any{"type": "istio-cni", "plugin_log_level": "debug", "cniVersion": "0.3.1"}
+	different := map[string]any{"type": "istio-cni", "plugin_log_level": "info"}
+
+	if !pluginEqual(base, sameButVersion) {
+		t.Errorf("expected equal ignoring cniVersion")
+	}
+	if pluginEqual(base, different) {
+		t.Errorf("expected not equal when a field differs")
+	}
+	// inputs must not be mutated
+	if _, ok := sameButVersion["cniVersion"]; !ok {
+		t.Errorf("pluginEqual must not mutate its inputs")
+	}
+}
+
 func TestCheckInstall(t *testing.T) {
 	cases := []struct {
-		name              string
-		expectedFailure   bool
-		cniConfigFilename string
-		cniConfName       string
-		chainedCNIPlugin  bool
-		existingConfFiles map[string]string // {srcFilename: targetFilename, ...}
+		name                        string
+		expectedFailure             bool
+		expectedErrSubstr           string
+		cniConfigFilename           string
+		cniConfName                 string
+		chainedCNIPlugin            bool
+		existingConfFiles           map[string]string // {srcFilename: targetFilename, ...}
+		ambientEnabled              bool
+		istioOwnedCNIConfig         bool
+		istioOwnedCNIConfigFilename string
 	}{
 		{
 			name:              "preempted config",
@@ -54,6 +78,16 @@ func TestCheckInstall(t *testing.T) {
 			existingConfFiles: map[string]string{"bridge.conf": "bridge.conf", "invalid-arr.conflist": "invalid-arr.conflist"},
 		},
 		{
+			name:                "intentional preempted config, missing istio owned config",
+			expectedFailure:     true,
+			cniConfigFilename:   "list.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			existingConfFiles:   map[string]string{"bridge.conf": "bridge.conf", "list.conflist.golden": "list.conflist"},
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+		},
+		{
 			name:              "intentional preempted config",
 			cniConfigFilename: "list.conflist",
 			cniConfName:       "list.conflist",
@@ -66,11 +100,125 @@ func TestCheckInstall(t *testing.T) {
 			cniConfigFilename: "file-removed.conflist",
 		},
 		{
+			name:                "istio-cni config removed from CNI config file - istio owned config",
+			expectedFailure:     true,
+			cniConfigFilename:   "02-istio-conf.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles:   map[string]string{"list.conflist": "02-istio-conf.conflist"},
+		},
+		{
 			name:              "istio-cni config removed from CNI config file",
 			expectedFailure:   true,
 			cniConfigFilename: "list.conflist",
 			chainedCNIPlugin:  true,
 			existingConfFiles: map[string]string{"list.conflist": "list.conflist"},
+		},
+		{
+			name:                "chained CNI plugin - istio owned",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned.conflist.golden": "02-istio-conf.conflist",
+				"list-no-istio.conflist":      "list.conflist",
+			},
+		},
+		{
+			name:                        "existing chained CNI plugin custom config name- istio owned",
+			cniConfigFilename:           "01-istio-conf.conflist",
+			cniConfName:                 "list.conflist",
+			chainedCNIPlugin:            true,
+			ambientEnabled:              true,
+			istioOwnedCNIConfig:         true,
+			istioOwnedCNIConfigFilename: "01-istio-conf.conflist",
+			existingConfFiles: map[string]string{
+				"istio-owned.conflist.golden": "01-istio-conf.conflist",
+				"list-no-istio.conflist":      "list.conflist",
+			},
+		},
+		{
+			name:                        "chained CNI plugin custom config name - istio owned",
+			cniConfigFilename:           "list.conflist",
+			chainedCNIPlugin:            true,
+			ambientEnabled:              true,
+			istioOwnedCNIConfig:         true,
+			istioOwnedCNIConfigFilename: "01-istio-conf.conflist",
+			existingConfFiles:           map[string]string{"list.conflist.golden": "list.conflist"},
+			expectedFailure:             true,
+		},
+		{
+			name:                "istio owned - extra plugin in istio-owned config",
+			expectedFailure:     true,
+			expectedErrSubstr:   "is not current",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned.conflist.golden": "02-istio-conf.conflist",
+				"single-bridge.conflist":      "list.conflist",
+			},
+		},
+		{
+			name:                "istio owned - primary plugin body drift",
+			expectedFailure:     true,
+			expectedErrSubstr:   "is not current",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned.conflist.golden": "02-istio-conf.conflist",
+				"list-primary-drift.conflist": "list.conflist",
+			},
+		},
+		{
+			name:                "istio owned - primary contains istio-cni",
+			expectedFailure:     true,
+			expectedErrSubstr:   "contains an istio-cni plugin",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned.conflist.golden": "02-istio-conf.conflist",
+				"list-with-istio.conflist":    "list.conflist",
+			},
+		},
+		{
+			name:                "istio owned - istio-cni body drift in owned file",
+			expectedFailure:     true,
+			expectedErrSubstr:   "istio-cni plugin contents differ",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned-drift.conflist": "02-istio-conf.conflist",
+				"list-no-istio.conflist":     "list.conflist",
+			},
+		},
+		{
+			name:                "istio owned - primary plugin missing from owned file",
+			expectedFailure:     true,
+			expectedErrSubstr:   "is not current",
+			cniConfigFilename:   "02-istio-conf.conflist",
+			cniConfName:         "list.conflist",
+			chainedCNIPlugin:    true,
+			ambientEnabled:      true,
+			istioOwnedCNIConfig: true,
+			existingConfFiles: map[string]string{
+				"istio-owned-missing-plugin.conflist": "02-istio-conf.conflist",
+				"list-no-istio.conflist":              "list.conflist",
+			},
 		},
 		{
 			name:              "chained CNI plugin",
@@ -89,6 +237,19 @@ func TestCheckInstall(t *testing.T) {
 			cniConfigFilename: "istio-cni.conf",
 			existingConfFiles: map[string]string{"istio-cni.conf": "istio-cni.conf"},
 		},
+		{
+			name:              "chained CNI plugin - istio-cni body drift",
+			expectedFailure:   true,
+			cniConfigFilename: "list.conflist",
+			chainedCNIPlugin:  true,
+			existingConfFiles: map[string]string{"list-istio-drift.conflist": "list.conflist"},
+		},
+		{
+			name:              "standalone CNI plugin - istio-cni body drift",
+			expectedFailure:   true,
+			cniConfigFilename: "istio-cni-drift.conf",
+			existingConfFiles: map[string]string{"istio-cni-drift.conf": "istio-cni-drift.conf"},
+		},
 	}
 
 	for _, c := range cases {
@@ -103,14 +264,29 @@ func TestCheckInstall(t *testing.T) {
 				}
 			}
 
+			if c.istioOwnedCNIConfig && len(c.istioOwnedCNIConfigFilename) == 0 {
+				c.istioOwnedCNIConfigFilename = "02-istio-conf.conflist"
+			}
+
 			cfg := &config.InstallConfig{
-				MountedCNINetDir: tempDir,
-				CNIConfName:      c.cniConfName,
-				ChainedCNIPlugin: c.chainedCNIPlugin,
+				MountedCNINetDir:            tempDir,
+				CNIConfName:                 c.cniConfName,
+				ChainedCNIPlugin:            c.chainedCNIPlugin,
+				AmbientEnabled:              c.ambientEnabled,
+				IstioOwnedCNIConfig:         c.istioOwnedCNIConfig,
+				IstioOwnedCNIConfigFilename: c.istioOwnedCNIConfigFilename,
+				PluginLogLevel:              "debug",
+				CNIAgentRunDir:              "/path/to/kubeconfig",
+				PodNamespace:                "my-namespace",
 			}
 			err := checkValidCNIConfig(cfg, filepath.Join(tempDir, c.cniConfigFilename))
 			if (c.expectedFailure && err == nil) || (!c.expectedFailure && err != nil) {
 				t.Fatalf("expected failure: %t, got %v", c.expectedFailure, err)
+			}
+			if c.expectedErrSubstr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.expectedErrSubstr) {
+					t.Fatalf("expected error containing %q, got %v", c.expectedErrSubstr, err)
+				}
 			}
 		})
 	}
@@ -118,13 +294,17 @@ func TestCheckInstall(t *testing.T) {
 
 func TestSleepCheckInstall(t *testing.T) {
 	cases := []struct {
-		name                  string
-		chainedCNIPlugin      bool
-		cniConfigFilename     string
-		invalidConfigFilename string
-		validConfigFilename   string
-		saFilename            string
-		saNewFilename         string
+		name                        string
+		chainedCNIPlugin            bool
+		cniConfigFilename           string
+		cniConfName                 string
+		invalidConfigFilename       string
+		validConfigFilename         string
+		saFilename                  string
+		saNewFilename               string
+		ambientEnabled              bool
+		istioOwnedCNIConfig         bool
+		istioOwnedCNIConfigFilename string
 	}{
 		{
 			name:                  "chained CNI plugin",
@@ -132,6 +312,17 @@ func TestSleepCheckInstall(t *testing.T) {
 			cniConfigFilename:     "plugins.conflist",
 			invalidConfigFilename: "list.conflist",
 			validConfigFilename:   "list.conflist.golden",
+			saFilename:            "token-foo",
+		},
+		{
+			name:                  "chained CNI plugin - istio owned",
+			chainedCNIPlugin:      true,
+			ambientEnabled:        true,
+			istioOwnedCNIConfig:   true,
+			cniConfigFilename:     "02-istio-conf.conflist",
+			cniConfName:           "list.conflist",
+			invalidConfigFilename: "list.conflist",
+			validConfigFilename:   "istio-owned.conflist.golden",
 			saFilename:            "token-foo",
 		},
 		{
@@ -149,15 +340,31 @@ func TestSleepCheckInstall(t *testing.T) {
 			tempDir := t.TempDir()
 
 			// Initialize parameters
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := t.Context()
+
+			if c.istioOwnedCNIConfig && len(c.istioOwnedCNIConfigFilename) == 0 {
+				c.istioOwnedCNIConfigFilename = "02-istio-conf.conflist"
+			}
+
+			cniConfName := c.cniConfigFilename
+			if len(c.cniConfName) > 0 {
+				cniConfName = c.cniConfName
+			}
+
 			cfg := &config.InstallConfig{
-				MountedCNINetDir: tempDir,
-				ChainedCNIPlugin: c.chainedCNIPlugin,
+				MountedCNINetDir:            tempDir,
+				ChainedCNIPlugin:            c.chainedCNIPlugin,
+				AmbientEnabled:              c.ambientEnabled,
+				IstioOwnedCNIConfig:         c.istioOwnedCNIConfig,
+				IstioOwnedCNIConfigFilename: c.istioOwnedCNIConfigFilename,
+				CNIConfName:                 cniConfName,
+				PluginLogLevel:              "debug",
+				CNIAgentRunDir:              "/path/to/kubeconfig",
+				PodNamespace:                "my-namespace",
 			}
 			cniConfigFilepath := filepath.Join(tempDir, c.cniConfigFilename)
 			isReady := &atomic.Value{}
-			SetNotReady(isReady)
+			setNotReady(isReady)
 			in := NewInstaller(cfg, isReady)
 			in.cniConfigFilepath = cniConfigFilepath
 
@@ -190,41 +397,35 @@ func TestSleepCheckInstall(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Listen for isReady to be set to true
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-			readyChan := make(chan bool)
-			go func(ctx context.Context, tick <-chan time.Time) {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-tick:
-						if isReady.Load().(bool) {
-							readyChan <- true
-						}
-					}
+			// For istio-owned cases, copy the primary config file
+			if c.istioOwnedCNIConfig && len(c.cniConfName) > 0 && c.cniConfName != c.cniConfigFilename {
+				if err := file.AtomicCopy(filepath.Join("testdata", "list-no-istio.conflist"), tempDir, c.cniConfName); err != nil {
+					t.Fatal(err)
 				}
-			}(ctx, ticker.C)
-
-			// Listen to sleepWatchInstall return value
-			// Should detect a valid configuration and wait indefinitely for a file modification
-			errChan := make(chan error)
-			go func(ctx context.Context) {
-				errChan <- in.sleepWatchInstall(ctx, sets.String{})
-			}(ctx)
-
-			select {
-			case <-readyChan:
-				assert.Equal(t, isReady.Load(), true)
-			case err := <-errChan:
-				if err == nil {
-					t.Fatal("invalid configuration detected")
-				}
-				t.Fatal(err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for isReady to be set to true")
 			}
+
+			// sleepWatchInstall should detect a valid configuration, become ready, and wait
+			// indefinitely for a file modification.
+			errChan := make(chan error, 1)
+			runAndWaitForReady := func() {
+				t.Helper()
+				go func() {
+					errChan <- in.sleepWatchInstall(ctx, sets.String{})
+				}()
+
+				retry.UntilOrFail(t, func() bool {
+					select {
+					case err := <-errChan:
+						if err == nil {
+							t.Fatal("invalid configuration detected")
+						}
+						t.Fatal(err)
+					default:
+					}
+					return isReady.Load().(bool)
+				}, retry.Timeout(5*time.Second), retry.Message("waiting for isReady to be set to true"))
+			}
+			runAndWaitForReady()
 
 			// Change SA token
 			if len(c.saNewFilename) > 0 {
@@ -249,10 +450,7 @@ func TestSleepCheckInstall(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				// Run sleepWatchInstall
-				go func(ctx context.Context, in *Installer) {
-					errChan <- in.sleepWatchInstall(ctx, sets.String{})
-				}(ctx, in)
+				runAndWaitForReady()
 			}
 
 			// Remove Istio CNI's config
@@ -290,6 +488,7 @@ func TestCleanup(t *testing.T) {
 		configFilename         string
 		existingConfigFilename string
 		expectedConfigFilename string
+		istioOwnedCNIConfig    bool
 	}{
 		{
 			name:                   "chained CNI plugin",
@@ -302,6 +501,13 @@ func TestCleanup(t *testing.T) {
 			name:                   "standalone CNI plugin",
 			configFilename:         "istio-cni.conf",
 			existingConfigFilename: "istio-cni.conf",
+		},
+		{
+			name:                   "istio owned CNI config",
+			chainedCNIPlugin:       true,
+			configFilename:         "istio-owned.conflist.golden",
+			existingConfigFilename: "istio-owned.conflist.golden",
+			istioOwnedCNIConfig:    true,
 		},
 	}
 
@@ -329,9 +535,11 @@ func TestCleanup(t *testing.T) {
 			}
 
 			cfg := &config.InstallConfig{
-				MountedCNINetDir: cniNetDir,
-				ChainedCNIPlugin: c.chainedCNIPlugin,
-				CNIBinTargetDirs: []string{cniBinDir},
+				MountedCNINetDir:            cniNetDir,
+				ChainedCNIPlugin:            c.chainedCNIPlugin,
+				CNIBinTargetDirs:            []string{cniBinDir},
+				IstioOwnedCNIConfig:         c.istioOwnedCNIConfig,
+				IstioOwnedCNIConfigFilename: c.configFilename,
 			}
 
 			isReady := &atomic.Value{}
@@ -345,7 +553,7 @@ func TestCleanup(t *testing.T) {
 			}
 
 			// check if conf file is deleted/conflist file is updated
-			if c.chainedCNIPlugin {
+			if c.chainedCNIPlugin && !c.istioOwnedCNIConfig {
 				resultConfig := testutils.ReadFile(t, cniConfigFilePath)
 
 				goldenFilepath := filepath.Join("testdata", c.expectedConfigFilename)
@@ -364,6 +572,286 @@ func TestCleanup(t *testing.T) {
 			if file.Exists(filepath.Join(cniBinDir, "istio-cni")) {
 				t.Fatalf("File %s was not deleted", "istio-cni")
 			}
+		})
+	}
+}
+
+func TestRemoveStaleIstioOwnedConfig(t *testing.T) {
+	t.Run("records the owned config name in the marker", func(t *testing.T) {
+		netDir := t.TempDir()
+		runDir := t.TempDir()
+		cfg := &config.InstallConfig{
+			MountedCNINetDir:            netDir,
+			CNIAgentRunDir:              runDir,
+			ChainedCNIPlugin:            true,
+			AmbientEnabled:              true,
+			IstioOwnedCNIConfig:         true,
+			IstioOwnedCNIConfigFilename: "02-istio-cni.conflist",
+		}
+		if err := removeStaleIstioOwnedConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		if got := readPreviousIstioOwnedMarker(cfg); got != "02-istio-cni.conflist" {
+			t.Errorf("expected marker to record owned config name, got %q", got)
+		}
+	})
+
+	customOwnedFilename := "01-custom.conflist"
+	custom2OwnedFilename := "03-custom.conflist"
+	for _, tt := range []struct {
+		name                   string
+		previousConfigs        []string
+		marker                 bool
+		toOwned                bool
+		toOwnedFilename        string
+		expectedMarkerContents string
+		expectedConfig         string
+	}{
+		// pre marker, may have multiple istio configs
+		{
+			name:            "owned to not owned, no marker",
+			previousConfigs: []string{constants.DefaultIstioOwnedCNIConfigFilename},
+			toOwned:         false,
+		},
+		{
+			name:            "custom owned to not owned, no marker",
+			previousConfigs: []string{customOwnedFilename},
+			toOwned:         false,
+			toOwnedFilename: customOwnedFilename,
+		},
+		{
+			name:            "owned to custom owned to not owned, no marker",
+			previousConfigs: []string{constants.DefaultIstioOwnedCNIConfigFilename, customOwnedFilename},
+			toOwned:         false,
+			toOwnedFilename: customOwnedFilename,
+		},
+		{
+			name:                   "not owned to owned, no marker",
+			toOwned:                true,
+			expectedMarkerContents: constants.DefaultIstioOwnedCNIConfigFilename,
+		},
+		{
+			name:                   "owned to owned, no marker",
+			previousConfigs:        []string{constants.DefaultIstioOwnedCNIConfigFilename},
+			toOwned:                true,
+			expectedMarkerContents: constants.DefaultIstioOwnedCNIConfigFilename,
+			expectedConfig:         constants.DefaultIstioOwnedCNIConfigFilename,
+		},
+		{
+			name:                   "custom owned to custom owned, no marker",
+			previousConfigs:        []string{customOwnedFilename},
+			toOwned:                true,
+			toOwnedFilename:        customOwnedFilename,
+			expectedMarkerContents: customOwnedFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+		// markers present
+		{
+			name:            "owned to not owned, with marker",
+			previousConfigs: []string{constants.DefaultIstioOwnedCNIConfigFilename},
+			marker:          true,
+			toOwned:         false,
+		},
+		{
+			name:            "custom owned to not owned, with marker",
+			previousConfigs: []string{customOwnedFilename},
+			marker:          true,
+			toOwned:         false,
+			toOwnedFilename: customOwnedFilename,
+		},
+		{
+			name:                   "owned to owned, marker",
+			previousConfigs:        []string{constants.DefaultIstioOwnedCNIConfigFilename},
+			marker:                 true,
+			toOwned:                true,
+			expectedMarkerContents: constants.DefaultIstioOwnedCNIConfigFilename,
+			expectedConfig:         constants.DefaultIstioOwnedCNIConfigFilename,
+		},
+		{
+			name:                   "custom owned to custom owned, marker",
+			previousConfigs:        []string{customOwnedFilename},
+			marker:                 true,
+			toOwned:                true,
+			toOwnedFilename:        customOwnedFilename,
+			expectedMarkerContents: customOwnedFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+		{
+			name:                   "custom owned to another custom owned, marker",
+			previousConfigs:        []string{customOwnedFilename},
+			marker:                 true,
+			toOwned:                true,
+			toOwnedFilename:        custom2OwnedFilename,
+			expectedMarkerContents: custom2OwnedFilename,
+		},
+		// mixed sequence
+		{
+			name:            "owned to custom owned to not owned, with marker",
+			previousConfigs: []string{constants.DefaultIstioOwnedCNIConfigFilename, customOwnedFilename},
+			marker:          true,
+			toOwned:         false,
+			toOwnedFilename: customOwnedFilename,
+		},
+		{
+			name:                   "owned to custom owned to custom owned, no marker",
+			previousConfigs:        []string{constants.DefaultIstioOwnedCNIConfigFilename, customOwnedFilename},
+			toOwned:                true,
+			toOwnedFilename:        customOwnedFilename,
+			expectedMarkerContents: customOwnedFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+		{
+			name:                   "owned to custom owned to custom owned, marker",
+			previousConfigs:        []string{constants.DefaultIstioOwnedCNIConfigFilename, customOwnedFilename},
+			marker:                 true,
+			toOwned:                true,
+			toOwnedFilename:        customOwnedFilename,
+			expectedMarkerContents: customOwnedFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+		{
+			name:                   "custom owned to owned to custom owned, marker custom",
+			previousConfigs:        []string{customOwnedFilename, constants.DefaultIstioOwnedCNIConfigFilename},
+			marker:                 true,
+			toOwned:                true,
+			toOwnedFilename:        customOwnedFilename,
+			expectedMarkerContents: customOwnedFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+		// cannot handle
+		{
+			name:                   "custom to owned, no marker",
+			previousConfigs:        []string{customOwnedFilename},
+			toOwned:                true,
+			expectedMarkerContents: constants.DefaultIstioOwnedCNIConfigFilename,
+			expectedConfig:         customOwnedFilename,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			netDir := t.TempDir()
+			runDir := t.TempDir()
+
+			cfg := &config.InstallConfig{
+				MountedCNINetDir:            netDir,
+				CNIAgentRunDir:              runDir,
+				ChainedCNIPlugin:            true,
+				AmbientEnabled:              true,
+				IstioOwnedCNIConfig:         tt.toOwned,
+				IstioOwnedCNIConfigFilename: tt.toOwnedFilename,
+			}
+
+			if len(tt.previousConfigs) > 0 {
+				for _, c := range tt.previousConfigs {
+					cpath := filepath.Join(netDir, c)
+					if err := os.WriteFile(cpath, []byte("{}"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tt.marker {
+					if err := writePreviousIstioOwnedMarker(cfg, tt.previousConfigs[0]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			if err := removeStaleIstioOwnedConfig(cfg); err != nil {
+				t.Fatal(err)
+			}
+
+			// check files in netDir
+			entries, err := os.ReadDir(netDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// the marker lives in the net dir too, but is checked separately below
+			actualFiles := slices.FilterInPlace(slices.Map(entries, os.DirEntry.Name), func(n string) bool {
+				return n != constants.IstioOwnedPreviousConfigFilename
+			})
+			expectedFiles := []string{}
+			if tt.expectedConfig != "" {
+				expectedFiles = []string{tt.expectedConfig}
+			}
+
+			if a, e := actualFiles, expectedFiles; !slices.Equal(a, e) {
+				t.Errorf("expected configs %v, got %v", e, a)
+			}
+
+			// check marker + contents
+			if a, e := readPreviousIstioOwnedMarker(cfg), tt.expectedMarkerContents; a != e {
+				t.Errorf("expected marker to record %q, got %q", e, a)
+			}
+		})
+	}
+}
+
+func TestWritePreviousIstioOwnedMarkerOnlyWhenChanged(t *testing.T) {
+	cfg := &config.InstallConfig{MountedCNINetDir: t.TempDir()}
+	path := previousIstioOwnedMarkerPath(cfg)
+
+	if err := writePreviousIstioOwnedMarker(cfg, "02-istio-cni.conflist"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate the file so a rewrite would be visible as a newer modification time.
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writePreviousIstioOwnedMarker(cfg, "02-istio-cni.conflist"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Errorf("marker was rewritten although unchanged: modtime %v, expected %v", info.ModTime(), old)
+	}
+
+	if err := writePreviousIstioOwnedMarker(cfg, "01-custom.conflist"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPreviousIstioOwnedMarker(cfg); got != "01-custom.conflist" {
+		t.Errorf("expected marker to be updated, got %q", got)
+	}
+	if info, err = os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().Equal(old) {
+		t.Error("marker was not rewritten although changed")
+	}
+}
+
+func TestBinDirMissingChainPlugins(t *testing.T) {
+	const chain = `{"cniVersion":"0.3.1","name":"k8s-pod-network","plugins":[` +
+		`{"type":"flannel"},{"type":"portmap"},{"type":"istio-cni"}]}`
+	cases := []struct {
+		name    string
+		chained bool
+		binDir  []string
+		want    []string
+	}{
+		{name: "primary plugins present", chained: true, binDir: []string{"flannel", "portmap", "istio-cni"}},
+		{name: "one primary plugin present", chained: true, binDir: []string{"portmap", "istio-cni"}},
+		{name: "only istio-cni present", chained: true, binDir: []string{"istio-cni"}, want: []string{"flannel", "portmap"}},
+		{name: "not chained", chained: false, binDir: []string{"istio-cni"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			netDir := t.TempDir()
+			binDir := t.TempDir()
+			cfgPath := filepath.Join(netDir, "10-flannel.conflist")
+			if err := os.WriteFile(cfgPath, []byte(chain), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range c.binDir {
+				if err := os.WriteFile(filepath.Join(binDir, b), nil, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := &config.InstallConfig{ChainedCNIPlugin: c.chained, CNIBinTargetDirs: []string{binDir}}
+			assert.Equal(t, binDirMissingChainPlugins(cfg, cfgPath), c.want)
 		})
 	}
 }

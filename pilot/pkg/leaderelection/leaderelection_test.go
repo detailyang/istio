@@ -17,17 +17,20 @@ package leaderelection
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/atomic"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"istio.io/istio/pkg/revisions"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -78,9 +81,8 @@ func createElectionMulticluster(t *testing.T,
 		cycle:          atomic.NewInt32(0),
 		enabled:        true,
 	}
-	gotLeader := make(chan struct{})
 	l.AddRunFunction(func(stop <-chan struct{}) {
-		gotLeader <- struct{}{}
+		<-stop
 	})
 	for _, fn := range fns {
 		l.AddRunFunction(fn)
@@ -114,7 +116,7 @@ func (w *fakeDefaultWatcher) AddHandler(handler revisions.DefaultHandler) {
 }
 
 func TestLeaderElection(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{}
 	// First pod becomes the leader
 	_, stop := createElection(t, "pod1", "", watcher, true, client)
@@ -125,7 +127,7 @@ func TestLeaderElection(t *testing.T) {
 }
 
 func TestPerRevisionElection(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{"foo"}
 	// First pod becomes the leader
 	_, stop := createPerRevisionElection(t, "pod1", "foo", watcher, true, client)
@@ -143,7 +145,7 @@ func TestPerRevisionElection(t *testing.T) {
 }
 
 func TestPrioritizedLeaderElection(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{defaultRevision: "red"}
 
 	// First pod, revision "green" becomes the leader, but is not the default revision
@@ -166,8 +168,51 @@ func TestPrioritizedLeaderElection(t *testing.T) {
 	close(stop6)
 }
 
+// countRunWatcherGoroutines returns the number of goroutines spawned by
+// LeaderElection.Run to watch the stop channel (one live per running cycle).
+func countRunWatcherGoroutines() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "leaderelection.(*LeaderElection).Run.func")
+}
+
+// TestRunCycleGoroutineLeak ensures repeated election cycles (leadership lost and
+// re-acquired) do not accumulate goroutines. Before the fix, each cycle leaked one
+// goroutine blocked on <-stop until process exit.
+func TestRunCycleGoroutineLeak(t *testing.T) {
+	client := fake.NewClientset()
+	watcher := &fakeDefaultWatcher{defaultRevision: "red"}
+
+	// pod1, non-default revision "green", becomes the leader.
+	l, stop := createElection(t, "pod1", "green", watcher, true, client)
+
+	const cycles = 3
+	for i := 0; i < cycles; i++ {
+		prev := l.cycle.Load()
+		// pod2, default revision "red", steals the lock from pod1.
+		_, stop2 := createElection(t, "pod2", "red", watcher, true, client)
+		// Wait until pod1's election loop actually starts a new cycle, i.e. its previous
+		// LeaderElector exited after losing the lock and its stop watcher was orphaned.
+		retry.UntilOrFail(t, func() bool { return l.cycle.Load() > prev },
+			retry.Delay(time.Millisecond*50), retry.Timeout(time.Second*30))
+		// pod2 releases the lock; pod1 re-acquires it, completing the cycle.
+		close(stop2)
+		retry.UntilOrFail(t, func() bool { return l.isLeader() },
+			retry.Delay(time.Millisecond*10), retry.Timeout(time.Second*30))
+	}
+	// Only the current cycle's stop watcher goroutine may remain. Before the fix,
+	// each completed cycle left one behind (cycles+1 total, plus transient pod2 ones).
+	retry.UntilSuccessOrFail(t, func() error {
+		if n := countRunWatcherGoroutines(); n > 1 {
+			return fmt.Errorf("%d stop watcher goroutines still alive after %d election cycles, expected 1", n, cycles)
+		}
+		return nil
+	}, retry.Delay(time.Millisecond*100), retry.Timeout(time.Second*5))
+	close(stop)
+}
+
 func TestMulticlusterLeaderElection(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{}
 	// First remote pod becomes the leader
 	_, stop := createElectionMulticluster(t, "pod1", "", true, false, watcher, true, client)
@@ -181,7 +226,7 @@ func TestMulticlusterLeaderElection(t *testing.T) {
 }
 
 func TestPrioritizedMulticlusterLeaderElection(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{defaultRevision: "red"}
 
 	// First pod, revision "green" becomes the remote leader
@@ -251,17 +296,8 @@ func TestPrioritizationCycles(t *testing.T) {
 	}
 }
 
-func alreadyHit(cur instance, chain []instance) bool {
-	for _, cc := range chain {
-		if cur == cc {
-			return true
-		}
-	}
-	return false
-}
-
 func checkCycles(t *testing.T, start instance, cases []instance, chain []instance) {
-	if alreadyHit(start, chain) {
+	if slices.Contains(chain, start) {
 		t.Fatalf("cycle on leader election: cur %v, chain %v", start, chain)
 	}
 	for _, nextHop := range cases {
@@ -280,7 +316,7 @@ func checkCycles(t *testing.T, start instance, cases []instance, chain []instanc
 }
 
 func TestLeaderElectionConfigMapRemoved(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{}
 	_, stop := createElection(t, "pod1", "", watcher, true, client)
 	if err := client.CoreV1().ConfigMaps("ns").Delete(context.TODO(), testLock, metav1.DeleteOptions{}); err != nil {
@@ -300,10 +336,10 @@ func TestLeaderElectionConfigMapRemoved(t *testing.T) {
 }
 
 func TestLeaderElectionNoPermission(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{}
 	allowRbac := atomic.NewBool(true)
-	client.Fake.PrependReactor("update", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	client.Fake.PrependReactor("update", "*", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
 		if allowRbac.Load() {
 			return false, nil, nil
 		}
@@ -318,7 +354,7 @@ func TestLeaderElectionNoPermission(t *testing.T) {
 	expectInt(t, completions.Load, 1)
 
 	// drop RBAC permissions to update the configmap
-	// This simulates loosing an active lease
+	// This simulates losing an active lease
 	allowRbac.Store(false)
 
 	// We should start a new cycle at this point
@@ -345,11 +381,11 @@ func expectInt(t *testing.T, f func() int32, expected int32) {
 }
 
 func TestLeaderElectionDisabled(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	watcher := &fakeDefaultWatcher{}
 	// Prevent LeaderElection from creating a lease, so that the runFn only runs
 	// if leader election is disabled.
-	client.Fake.PrependReactor("*", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	client.Fake.PrependReactor("*", "*", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
 		return true, nil, fmt.Errorf("nope, out of luck")
 	})
 

@@ -25,6 +25,7 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 )
 
 // delayedClient is a client wrapper that initially starts with an "empty client",
@@ -36,8 +37,56 @@ type delayedClient[T controllers.ComparableObject] struct {
 	delayed kubetypes.DelayedFilter
 
 	hm       sync.Mutex
-	handlers []cache.ResourceEventHandler
-	started  <-chan struct{}
+	handlers []delayedHandler
+	// registrations maps placeholders handed out before set() to the real registrations.
+	registrations map[delayedHandlerRegistration]cache.ResourceEventHandlerRegistration
+	indexers      []delayedIndex[T]
+	started       <-chan struct{}
+}
+
+type delayedHandler struct {
+	cache.ResourceEventHandler
+	hasSynced delayedHandlerRegistration
+}
+
+type delayedHandlerRegistration struct {
+	hasSynced *atomic.Pointer[func() bool]
+}
+
+func (r delayedHandlerRegistration) HasSyncedChecker() cache.DoneChecker {
+	panic("not implemented; use HasSynced")
+}
+
+func (r delayedHandlerRegistration) HasSynced() bool {
+	if s := r.hasSynced.Load(); s != nil {
+		return (*s)()
+	}
+	return false
+}
+
+type delayedIndex[T any] struct {
+	name    string
+	indexer *atomic.Pointer[RawIndexer]
+	extract func(o T) []string
+}
+
+func (d delayedIndex[T]) Lookup(key string) []interface{} {
+	if c := d.indexer.Load(); c != nil {
+		return (*c).Lookup(key)
+	}
+	// Not ready yet, return nil
+	return nil
+}
+
+func (s *delayedClient[T]) Index(name string, extract func(o T) []string) RawIndexer {
+	if c := s.inf.Load(); c != nil {
+		return (*c).Index(name, extract)
+	}
+	s.hm.Lock()
+	defer s.hm.Unlock()
+	di := delayedIndex[T]{name: name, indexer: new(atomic.Pointer[RawIndexer]), extract: extract}
+	s.indexers = append(s.indexers, di)
+	return di
 }
 
 func (s *delayedClient[T]) Get(name, namespace string) T {
@@ -61,14 +110,20 @@ func (s *delayedClient[T]) ListUnfiltered(namespace string, selector klabels.Sel
 	return nil
 }
 
-func (s *delayedClient[T]) AddEventHandler(h cache.ResourceEventHandler) {
+func (s *delayedClient[T]) AddEventHandler(h cache.ResourceEventHandler) cache.ResourceEventHandlerRegistration {
 	if c := s.inf.Load(); c != nil {
-		(*c).AddEventHandler(h)
-	} else {
-		s.hm.Lock()
-		defer s.hm.Unlock()
-		s.handlers = append(s.handlers, h)
+		return (*c).AddEventHandler(h)
 	}
+	s.hm.Lock()
+	defer s.hm.Unlock()
+
+	hasSynced := delayedHandlerRegistration{hasSynced: new(atomic.Pointer[func() bool])}
+	hasSynced.hasSynced.Store(ptr.Of(s.delayed.HasSynced))
+	s.handlers = append(s.handlers, delayedHandler{
+		ResourceEventHandler: h,
+		hasSynced:            hasSynced,
+	})
+	return hasSynced
 }
 
 func (s *delayedClient[T]) HasSynced() bool {
@@ -81,13 +136,47 @@ func (s *delayedClient[T]) HasSynced() bool {
 	return hs
 }
 
+func (s *delayedClient[T]) HasSyncedIgnoringHandlers() bool {
+	if c := s.inf.Load(); c != nil {
+		return (*c).HasSyncedIgnoringHandlers()
+	}
+	// If we haven't loaded the informer yet, we want to check if the delayed filter is synced.
+	// This ensures that at startup, we only return HasSynced=true if we are sure the CRD is not ready.
+	hs := s.delayed.HasSynced()
+	return hs
+}
+
 func (s *delayedClient[T]) ShutdownHandlers() {
 	if c := s.inf.Load(); c != nil {
 		(*c).ShutdownHandlers()
+		s.hm.Lock()
+		defer s.hm.Unlock()
+		s.registrations = nil
 	} else {
 		s.hm.Lock()
 		defer s.hm.Unlock()
 		s.handlers = nil
+	}
+}
+
+func (s *delayedClient[T]) ShutdownHandler(registration cache.ResourceEventHandlerRegistration) {
+	if c := s.inf.Load(); c != nil {
+		// Translate a placeholder handed out before set() to the real registration.
+		if dr, ok := registration.(delayedHandlerRegistration); ok {
+			s.hm.Lock()
+			if reg, f := s.registrations[dr]; f {
+				registration = reg
+				delete(s.registrations, dr)
+			}
+			s.hm.Unlock()
+		}
+		(*c).ShutdownHandler(registration)
+	} else {
+		s.hm.Lock()
+		defer s.hm.Unlock()
+		s.handlers = slices.FilterInPlace(s.handlers, func(handler delayedHandler) bool {
+			return handler.hasSynced != registration
+		})
 	}
 }
 
@@ -107,10 +196,20 @@ func (s *delayedClient[T]) set(inf Informer[T]) {
 		s.inf.Swap(&inf)
 		s.hm.Lock()
 		defer s.hm.Unlock()
+		if len(s.handlers) > 0 && s.registrations == nil {
+			s.registrations = make(map[delayedHandlerRegistration]cache.ResourceEventHandlerRegistration, len(s.handlers))
+		}
 		for _, h := range s.handlers {
-			inf.AddEventHandler(h)
+			reg := inf.AddEventHandler(h)
+			h.hasSynced.hasSynced.Store(ptr.Of(reg.HasSynced))
+			s.registrations[h.hasSynced] = reg
 		}
 		s.handlers = nil
+		for _, i := range s.indexers {
+			res := inf.Index(i.name, i.extract)
+			i.indexer.Store(&res)
+		}
+		s.indexers = nil
 		if s.started != nil {
 			inf.Start(s.started)
 		}

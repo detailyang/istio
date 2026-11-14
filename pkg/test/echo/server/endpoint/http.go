@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"math/rand"
 	"net"
@@ -30,9 +31,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/http2"
+	"github.com/pires/go-proxyproto"
 
-	"istio.io/istio/pkg/h2c"
 	"istio.io/istio/pkg/test/echo"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/util/retry"
@@ -68,15 +68,21 @@ func (s *httpInstance) GetConfig() Config {
 }
 
 func (s *httpInstance) Start(onReady OnReadyFunc) error {
-	h2s := &http2.Server{
-		IdleTimeout: idleTimeout,
-	}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	// Go 1.27: Server.Protocols is authoritative; must set explicitly to serve ALPN "h2" over TLS.
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
 
 	s.server = &http.Server{
 		IdleTimeout: idleTimeout,
-		Handler: h2c.NewHandler(&httpHandler{
+		Handler: &httpHandler{
 			Config: s.Config,
-		}, h2s),
+		},
+		Protocols: protocols,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, ConnContextKey, c)
+		},
 	}
 
 	var listener net.Listener
@@ -94,6 +100,15 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 		if s.DisableALPN {
 			nextProtos = nil
 		}
+		minVersion, err := common.ParseTLSVersion(s.TLSMinVersion)
+		if err != nil {
+			return fmt.Errorf("failed to parse min TLS version: %s", err)
+		}
+		curvePreferences, err := common.ParseTLSCurves(s.TLSCurvePreferences)
+		if err != nil {
+			return fmt.Errorf("failed to parse curve preferences: %s", err)
+		}
+		// nolint: gosec // test only code, TLS version is configurable for testing
 		config := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   nextProtos,
@@ -104,9 +119,26 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 				epLog.Infof("TLS connection with alpn: %v", info.SupportedProtos)
 				return nil, nil
 			},
-			MinVersion: tls.VersionTLS12,
+			MinVersion:       minVersion,
+			CurvePreferences: curvePreferences,
 		}
+		if s.Port.RequireClientCert {
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+			caCert, err := os.ReadFile(s.TLSCACert)
+			if err != nil {
+				return fmt.Errorf("could not load TLS CA certificate: %v", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+				return fmt.Errorf("could not append TLS CA certificate")
+			}
+			config.ClientCAs = caCertPool
+		}
+		// Go 1.27: Protocols is authoritative; http2.ConfigureServer is only called when
+		// TLSConfig is set. Set it here so the server registers TLSNextProto["h2"].
+		s.server.TLSConfig = config
 		// Listen on the given port and update the port if it changed from what was passed in.
+		//nolint:ineffassign,staticcheck // not true, we check all branches for error conditions below
 		listener, port, err = listenOnAddressTLS(s.ListenerIP, s.Port.Port, config)
 		// Store the actual listening port back to the argument.
 		s.Port.Port = port
@@ -117,6 +149,7 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 		s.Port.Port = port
 	}
 
+	// check error for all branches here!
 	if err != nil {
 		return err
 	}
@@ -129,6 +162,10 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 	} else {
 		s.server.Addr = fmt.Sprintf(":%d", port)
 		epLog.Infof("Listening HTTP/1.1 on %v\n", port)
+	}
+
+	if s.Port.ProxyProtocol {
+		listener = &proxyproto.Listener{Listener: listener}
 	}
 
 	// Start serving HTTP traffic.
@@ -162,6 +199,23 @@ func (s *httpInstance) awaitReady(onReady OnReadyFunc, address string) {
 	} else if s.Port.TLS {
 		url = fmt.Sprintf("https://%s", address)
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // nolint: gosec // test only code
+		if s.Port.RequireClientCert {
+			clientCert, err := tls.LoadX509KeyPair(s.TLSCert, s.TLSKey)
+			if err != nil {
+				epLog.Errorf("could not load TLS keys: %v", err)
+			}
+			client.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{clientCert}
+			caCert, err := os.ReadFile(s.TLSCACert)
+			if err != nil {
+				epLog.Errorf("could not load TLS CA certificate: %v", err)
+			}
+			if client.Transport.(*http.Transport).TLSClientConfig.RootCAs == nil {
+				client.Transport.(*http.Transport).TLSClientConfig.RootCAs = x509.NewCertPool()
+			}
+			if ok := client.Transport.(*http.Transport).TLSClientConfig.RootCAs.AppendCertsFromPEM(caCert); !ok {
+				epLog.Errorf("could not append TLS CA certificate: %v", err)
+			}
+		}
 	} else {
 		url = fmt.Sprintf("http://%s", address)
 	}
@@ -211,6 +265,7 @@ type codeAndSlices struct {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.ReportRequest()
 	id := uuid.New()
 	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -330,14 +385,23 @@ func (h *httpHandler) addResponsePayload(r *http.Request, body *bytes.Buffer) {
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 	echo.IPField.Write(body, ip)
 
-	// Note: since this is the NegotiatedProtocol, it will be set to empty if the client sends an ALPN
-	// not supported by the server (ie one of h2,http/1.1,http/1.0)
-	var alpn string
-	if r.TLS != nil {
-		alpn = r.TLS.NegotiatedProtocol
+	if tlsState := requestTLS(r); tlsState != nil {
+		// Note: since this is the NegotiatedProtocol, it will be set to empty if the client sends an ALPN
+		// not supported by the server (ie one of h2,http/1.1,http/1.0)
+		echo.AlpnField.WriteNonEmpty(body, tlsState.NegotiatedProtocol)
+		echo.SNIField.WriteNonEmpty(body, tlsState.ServerName)
+		// If the client cert is present, write the subject to the response
+		if len(tlsState.PeerCertificates) > 0 {
+			echo.ClientCertSubjectField.WriteNonEmpty(body, tlsState.PeerCertificates[0].Subject.String())
+			echo.ClientCertSerialNumberField.WriteNonEmpty(body, tlsState.PeerCertificates[0].SerialNumber.String())
+		}
 	}
-	echo.AlpnField.WriteNonEmpty(body, alpn)
 
+	if conn := GetConn(r); conn != nil {
+		if p, ok := conn.(*proxyproto.Conn); ok && p.ProxyHeader() != nil {
+			echo.ProxyProtocolField.Write(body, fmt.Sprint(p.ProxyHeader().Version))
+		}
+	}
 	var keys []string
 	for k := range r.Header {
 		keys = append(keys, k)
@@ -475,4 +539,48 @@ func validateCodeAndSlices(codecount string) (codeAndSlices, error) {
 	}
 
 	return codeAndSlices{n, count}, nil
+}
+
+type contextKey struct {
+	key string
+}
+
+var ConnContextKey = &contextKey{"http-conn"}
+
+func GetConn(r *http.Request) net.Conn {
+	v, ok := r.Context().Value(ConnContextKey).(net.Conn)
+	if ok {
+		return v
+	}
+	return nil
+}
+
+type connectionStater interface {
+	ConnectionState() tls.ConnectionState
+}
+
+// requestTLS returns the TLS state for r.
+// Go 1.27's HTTP/2 server only sets Request.TLS when :scheme is "https". Envoy TLS
+// origination of an HTTP request keeps :scheme=http, so fall back to the connection
+// stored in ConnContext.
+func requestTLS(r *http.Request) *tls.ConnectionState {
+	if r.TLS != nil {
+		return r.TLS
+	}
+	return connTLS(GetConn(r))
+}
+
+func connTLS(conn net.Conn) *tls.ConnectionState {
+	for conn != nil {
+		if p, ok := conn.(*proxyproto.Conn); ok {
+			conn = p.Raw()
+			continue
+		}
+		if tc, ok := conn.(connectionStater); ok {
+			cs := tc.ConnectionState()
+			return &cs
+		}
+		return nil
+	}
+	return nil
 }

@@ -19,12 +19,12 @@ import (
 	"fmt"
 	"time"
 
-	"istio.io/istio/pilot/pkg/features"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/keepalive"
+	"istio.io/istio/pkg/kube/krt"
 )
 
 // RegistryOptions provide configuration options for the configuration controller. If FileDir is set, that directory will
@@ -41,12 +41,6 @@ type RegistryOptions struct {
 	// ClusterRegistriesNamespace specifies where the multi-cluster secret resides
 	ClusterRegistriesNamespace string
 	KubeConfig                 string
-
-	// DistributionTracking control
-	DistributionCacheRetention time.Duration
-
-	// DistributionTracking control
-	DistributionTrackingEnabled bool
 }
 
 // PilotArgs provides all of the configuration parameters for the Pilot discovery service.
@@ -55,11 +49,13 @@ type PilotArgs struct {
 	InjectionOptions   InjectionOptions
 	PodName            string
 	Namespace          string
+	CniNamespace       string
 	Revision           string
 	MeshConfigFile     string
 	NetworksConfigFile string
 	RegistryOptions    RegistryOptions
 	CtrlZOptions       *ctrlz.Options
+	KrtDebugger        *krt.DebugHandler `json:"-"`
 	KeepaliveOptions   *keepalive.Options
 	ShutdownDuration   time.Duration
 	JwtRule            string
@@ -101,13 +97,21 @@ type InjectionOptions struct {
 	InjectionDirectory string
 }
 
+const (
+	TLSMinVersion1_2 = "1.2"
+	TLSMinVersion1_3 = "1.3"
+)
+
 // TLSOptions is optional TLS parameters for Istiod server.
 type TLSOptions struct {
+	// CaCertFile and related are set using CLI flags.
 	CaCertFile      string
 	CertFile        string
 	KeyFile         string
 	TLSCipherSuites []string
-	CipherSuits     []uint16 // This is the parsed cipher suites
+	CipherSuites    []uint16 // This is the parsed cipher suites
+	TLSMinVersion   string   // Minimum TLS version for the server (e.g., "1.2", "1.3")
+	MinVersion      uint16   // This is the parsed minimum TLS version
 }
 
 var (
@@ -139,21 +143,27 @@ func NewPilotArgs(initFuncs ...func(*PilotArgs)) *PilotArgs {
 // Apply default value to PilotArgs
 func (p *PilotArgs) applyDefaults() {
 	p.Namespace = PodNamespace
+	p.CniNamespace = PodNamespace
 	p.PodName = PodName
 	p.Revision = Revision
+	p.RegistryOptions.KubeOptions.Revision = Revision
 	p.JwtRule = JwtRule
 	p.KeepaliveOptions = keepalive.DefaultOption()
-	p.RegistryOptions.DistributionTrackingEnabled = features.EnableDistributionTracking
-	p.RegistryOptions.DistributionCacheRetention = features.DistributionHistoryRetention
 	p.RegistryOptions.ClusterRegistriesNamespace = p.Namespace
+	p.KrtDebugger = new(krt.DebugHandler)
 }
 
 func (p *PilotArgs) Complete() error {
-	cipherSuits, err := TLSCipherSuites(p.ServerOptions.TLSOptions.TLSCipherSuites)
+	cipherSuites, err := TLSCipherSuites(p.ServerOptions.TLSOptions.TLSCipherSuites)
 	if err != nil {
 		return err
 	}
-	p.ServerOptions.TLSOptions.CipherSuits = cipherSuits
+	p.ServerOptions.TLSOptions.CipherSuites = cipherSuites
+	minVersion, err := TLSMinVersion(p.ServerOptions.TLSOptions.TLSMinVersion)
+	if err != nil {
+		return err
+	}
+	p.ServerOptions.TLSOptions.MinVersion = minVersion
 	return nil
 }
 
@@ -183,4 +193,16 @@ func TLSCipherSuites(cipherNames []string) ([]uint16, error) {
 		ciphersIntSlice = append(ciphersIntSlice, intValue)
 	}
 	return ciphersIntSlice, nil
+}
+
+// TLSMinVersion returns the golang TLS version from the version string passed.
+func TLSMinVersion(version string) (uint16, error) {
+	switch version {
+	case TLSMinVersion1_2:
+		return tls.VersionTLS12, nil
+	case TLSMinVersion1_3:
+		return tls.VersionTLS13, nil
+	default:
+		return tls.VersionTLS12, fmt.Errorf("minimum TLS version: %s is not supported. Only %s and %s are supported", version, TLSMinVersion1_2, TLSMinVersion1_3)
+	}
 }

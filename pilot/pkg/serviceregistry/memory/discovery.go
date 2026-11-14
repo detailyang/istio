@@ -16,7 +16,6 @@ package memory
 
 import (
 	"fmt"
-	"net/netip"
 	"sync"
 
 	"istio.io/istio/pilot/pkg/model"
@@ -26,11 +25,7 @@ import (
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/util/sets"
-	"istio.io/istio/pkg/workloadapi"
-	"istio.io/istio/pkg/workloadapi/security"
 )
 
 // ServiceDiscovery is a mock discovery interface
@@ -57,8 +52,6 @@ type ServiceDiscovery struct {
 	// Used by GetProxyWorkloadLabels
 	ip2workloadLabels map[string]labels.Instance
 
-	addresses map[string]*model.AddressInfo
-
 	// XDSUpdater will push EDS changes to the ADS model.
 	XdsUpdater model.XDSUpdater
 
@@ -83,7 +76,6 @@ func NewServiceDiscovery(services ...*model.Service) *ServiceDiscovery {
 		instancesByPortName: map[string][]*model.ServiceInstance{},
 		ip2instance:         map[string][]*model.ServiceInstance{},
 		ip2workloadLabels:   map[string]labels.Instance{},
-		addresses:           map[string]*model.AddressInfo{},
 	}
 }
 
@@ -136,6 +128,13 @@ func (sd *ServiceDiscovery) RemoveService(name host.Name) {
 	svc := sd.services[name]
 	delete(sd.services, name)
 
+	// remove old entries
+	for k, v := range sd.ip2instance {
+		sd.ip2instance[k] = slices.FilterInPlace(v, func(instance *model.ServiceInstance) bool {
+			return instance.Service == nil || instance.Service.Hostname != name
+		})
+	}
+
 	if sd.XdsUpdater != nil {
 		sd.XdsUpdater.SvcUpdate(sd.shardKey(), string(svc.Hostname), svc.Attributes.Namespace, model.EventDelete)
 	}
@@ -156,7 +155,7 @@ func (sd *ServiceDiscovery) AddInstance(instance *model.ServiceInstance) {
 		instance.Endpoint.ServicePortName = instance.ServicePort.Name
 	}
 	instance.Service = svc
-	sd.ip2instance[instance.Endpoint.Address] = append(sd.ip2instance[instance.Endpoint.Address], instance)
+	sd.ip2instance[instance.Endpoint.FirstAddressOrNil()] = append(sd.ip2instance[instance.Endpoint.FirstAddressOrNil()], instance)
 
 	key := fmt.Sprintf("%s:%d", service, instance.ServicePort.Port)
 	instanceList := sd.instancesByPortNum[key]
@@ -182,7 +181,7 @@ func (sd *ServiceDiscovery) AddEndpoint(service host.Name, servicePortName strin
 	instance := &model.ServiceInstance{
 		Service: &model.Service{Hostname: service},
 		Endpoint: &model.IstioEndpoint{
-			Address:         address,
+			Addresses:       []string{address},
 			ServicePortName: servicePortName,
 			EndpointPort:    uint32(port),
 		},
@@ -240,7 +239,7 @@ func (sd *ServiceDiscovery) SetEndpoints(service string, namespace string, endpo
 			},
 			Endpoint: e,
 		}
-		sd.ip2instance[instance.Endpoint.Address] = []*model.ServiceInstance{instance}
+		sd.ip2instance[instance.Endpoint.FirstAddressOrNil()] = []*model.ServiceInstance{instance}
 
 		key := fmt.Sprintf("%s:%d", service, instance.ServicePort.Port)
 
@@ -333,91 +332,6 @@ func (sd *ServiceDiscovery) AppendServiceHandler(f model.ServiceHandler) {
 func (sd *ServiceDiscovery) Run(<-chan struct{}) {}
 
 // HasSynced always returns true
-func (sd *ServiceDiscovery) HasSynced() bool { return true }
-
-func (sd *ServiceDiscovery) AddressInformation(requests sets.String) ([]*model.AddressInfo, sets.String) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-	if len(requests) == 0 {
-		return maps.Values(sd.addresses), nil
-	}
-
-	var infos []*model.AddressInfo
-	removed := sets.String{}
-	for req := range requests {
-		if _, found := sd.addresses[req]; !found {
-			removed.Insert(req)
-		} else {
-			infos = append(infos, sd.addresses[req])
-		}
-	}
-	return infos, removed
-}
-
-func (sd *ServiceDiscovery) AdditionalPodSubscriptions(
-	*model.Proxy,
-	sets.String,
-	sets.String,
-) sets.String {
-	return nil
-}
-
-func (sd *ServiceDiscovery) Policies(sets.Set[model.ConfigKey]) []*security.Authorization {
-	return nil
-}
-
-func (sd *ServiceDiscovery) Waypoint(model.WaypointScope) []netip.Addr {
-	return nil
-}
-
-func (sd *ServiceDiscovery) WorkloadsForWaypoint(scope model.WaypointScope) []*model.WorkloadInfo {
-	return nil
-}
-
-func (sd *ServiceDiscovery) AddWorkloadInfo(infos ...*model.WorkloadInfo) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-	for _, info := range infos {
-		sd.addresses[info.ResourceName()] = workloadToAddressInfo(info.Workload)
-	}
-}
-
-func (sd *ServiceDiscovery) RemoveWorkloadInfo(info *model.WorkloadInfo) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-	delete(sd.addresses, info.ResourceName())
-}
-
-func (sd *ServiceDiscovery) AddServiceInfo(infos ...*model.ServiceInfo) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-	for _, info := range infos {
-		sd.addresses[info.ResourceName()] = serviceToAddressInfo(info.Service)
-	}
-}
-
-func (sd *ServiceDiscovery) RemoveServiceInfo(info *model.ServiceInfo) {
-	sd.mutex.Lock()
-	defer sd.mutex.Unlock()
-	delete(sd.addresses, info.ResourceName())
-}
-
-func workloadToAddressInfo(w *workloadapi.Workload) *model.AddressInfo {
-	return &model.AddressInfo{
-		Address: &workloadapi.Address{
-			Type: &workloadapi.Address_Workload{
-				Workload: w,
-			},
-		},
-	}
-}
-
-func serviceToAddressInfo(s *workloadapi.Service) *model.AddressInfo {
-	return &model.AddressInfo{
-		Address: &workloadapi.Address{
-			Type: &workloadapi.Address_Service{
-				Service: s,
-			},
-		},
-	}
+func (sd *ServiceDiscovery) HasSynced() bool {
+	return true
 }

@@ -18,56 +18,23 @@ import (
 	"fmt"
 	"reflect"
 
+	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
 
 	"istio.io/api/type/v1beta1"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/ptr"
-	"istio.io/istio/pkg/slices"
 )
 
 // registerHandlerAsBatched is a helper to register the provided handler as a batched handler. This allows collections to
 // only implement RegisterBatch.
-func registerHandlerAsBatched[T any](c internalCollection[T], f func(o Event[T])) Syncer {
+func registerHandlerAsBatched[T any](c internalCollection[T], f func(o Event[T])) HandlerRegistration {
 	return c.RegisterBatch(func(events []Event[T]) {
 		for _, o := range events {
 			f(o)
 		}
 	}, true)
-}
-
-// erasedCollection is a Collection[T] that has been type-erased so it can be stored in collections
-// that do not have type information.
-type erasedCollection struct {
-	// original stores the original typed Collection
-	original any
-	// registerFunc registers any Event[any] handler. These will be mapped to Event[T] when connected to the original collection.
-	registerFunc func(f func(o []Event[any]))
-	name         string
-	synced       Syncer
-}
-
-func (e erasedCollection) register(f func(o []Event[any])) {
-	e.registerFunc(f)
-}
-
-func eraseCollection[T any](c internalCollection[T]) erasedCollection {
-	return erasedCollection{
-		name:     c.name(),
-		original: c,
-		synced:   c.Synced(),
-		registerFunc: func(f func(o []Event[any])) {
-			ff := func(o []Event[T]) {
-				f(slices.Map(o, castEvent[T, any]))
-			}
-			// Skip calling all the existing state for secondary dependencies, otherwise we end up with a deadlock due to
-			// rerunning the same collection's recomputation at the same time (once for the initial event, then for the initial registration).
-			c.RegisterBatch(ff, false)
-		},
-	}
 }
 
 // castEvent converts an Event[I] to Event[O].
@@ -86,12 +53,27 @@ func castEvent[I, O any](o Event[I]) Event[O] {
 	return e
 }
 
+func GetStop(opts ...CollectionOption) <-chan struct{} {
+	o := buildCollectionOptions(opts...)
+	return o.stop
+}
+
 func buildCollectionOptions(opts ...CollectionOption) collectionOptions {
 	c := &collectionOptions{}
 	for _, o := range opts {
 		o(c)
 	}
+	c.stopProvided = c.stop != nil
 	if c.stop == nil {
+		// TODO: https://github.com/istio/istio/issues/58791
+		// if EnableAssertions {
+		// 	panic("collection " + c.name + " created with no stop channel provided; will likely cause goroutine leaks")
+		// }
+		if len(opts) > 0 {
+			log.Debugf("collection %s did not have a stop channel in opts, creating a default which may cause goroutines to leak", c.name)
+		} else {
+			log.Debugf("collection was created with no opts, creating a default stop channel which may cause goroutines to leak")
+		}
 		c.stop = make(chan struct{})
 	}
 	return *c
@@ -102,76 +84,53 @@ type collectionOptions struct {
 	name         string
 	augmentation func(o any) any
 	stop         <-chan struct{}
+	// stopProvided reports whether the caller explicitly supplied a stop channel (via WithStop).
+	// When false, `stop` is a manufactured default that is never closed, so any goroutine waiting
+	// on it would leak. Lifecycle goroutines (e.g. debugger unregistration) must not be started in
+	// that case.
+	stopProvided    bool
+	debugger        *DebugHandler
+	joinUnchecked   bool
+	mapDiscardEqual bool
+
+	indexCollectionFromString func(string) any
+	metadata                  Metadata
+}
+
+type indexedDependency struct {
+	id  collectionUID
+	key string
+	typ indexedDependencyType
 }
 
 // dependency is a specific thing that can be depended on
 type dependency struct {
-	// The actual collection containing this
-	collection erasedCollection
+	id             collectionUID
+	collectionName string
 	// Filter over the collection
 	filter filter
 }
+
+type erasedEventHandler = func(o []Event[any])
 
 // registerDependency is an internal interface for things that can register dependencies.
 // This is called from Fetch to Collections, generally.
 type registerDependency interface {
 	// Registers a dependency, returning true if it is finalized
-	registerDependency(dependency)
+	registerDependency(*dependency, Syncer, func(f erasedEventHandler) HandlerRegistration)
 	name() string
-}
-
-// getName returns the name for an object, if possible.
-// Warning: this will panic if the name is not available.
-func getName(a any) string {
-	ak, ok := a.(Namer)
-	if ok {
-		return ak.GetName()
-	}
-	panic(fmt.Sprintf("No Name, got %T %+v", a, a))
-}
-
-// tryGetKey returns the Key for an object. If not possible, returns false
-func tryGetKey[O any](a O) (Key[O], bool) {
-	as, ok := any(a).(string)
-	if ok {
-		return Key[O](as), true
-	}
-	ao, ok := any(a).(controllers.Object)
-	if ok {
-		k, _ := cache.MetaNamespaceKeyFunc(ao)
-		return Key[O](k), true
-	}
-	ac, ok := any(a).(config.Config)
-	if ok {
-		return Key[O](keyFunc(ac.Name, ac.Namespace)), true
-	}
-	arn, ok := any(a).(ResourceNamer)
-	if ok {
-		return Key[O](arn.ResourceName()), true
-	}
-	ack := GetApplyConfigKey(a)
-	if ack != nil {
-		return *ack, true
-	}
-	return "", false
-}
-
-// getNamespace returns the namespace for an object, if possible.
-// Warning: this will panic if the namespace is not available.
-func getNamespace(a any) string {
-	ak, ok := a.(Namespacer)
-	if ok {
-		return ak.GetNamespace()
-	}
-	panic(fmt.Sprintf("No Namespace, got %T", a))
 }
 
 // getLabels returns the labels for an object, if possible.
 // Warning: this will panic if the labels is not available.
 func getLabels(a any) map[string]string {
-	al, ok := a.(labeler)
+	al, ok := a.(Labeler)
 	if ok {
 		return al.GetLabels()
+	}
+	pal, ok := any(&a).(Labeler)
+	if ok {
+		return pal.GetLabels()
 	}
 	ak, ok := a.(metav1.Object)
 	if ok {
@@ -193,7 +152,7 @@ func getLabelSelector(a any) map[string]string {
 	}
 	val := reflect.ValueOf(a)
 
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		val = val.Elem()
 	}
 
@@ -217,12 +176,30 @@ func getLabelSelector(a any) map[string]string {
 	}
 }
 
-// equal checks if two objects are equal. This is done through a variety of different methods, depending on the input type.
-func equal[O any](a, b O) bool {
-	ak, ok := any(a).(Equaler[O])
-	if ok {
+// Equal checks if two objects are equal. This is done through a variety of different methods, depending on the input type.
+func Equal[O any](a, b O) bool {
+	if ak, ok := any(a).(Equaler[O]); ok {
 		return ak.Equals(b)
 	}
+	if ak, ok := any(a).(Equaler[*O]); ok {
+		return ak.Equals(&b)
+	}
+	if pk, ok := any(&a).(Equaler[O]); ok {
+		return pk.Equals(b)
+	}
+	if pk, ok := any(&a).(Equaler[*O]); ok {
+		return pk.Equals(&b)
+	}
+
+	// Collections are compared by identity: two collections are equal only if they are the same
+	// collection, no matter what they currently contain. Changes to their contents are reported by their
+	// own events, not by comparing them here. This also avoids falling through to reflect.DeepEqual,
+	// which would walk a collection's live internal state without holding its lock.
+	if au, ok := any(a).(uidable); ok {
+		bu, ok := any(b).(uidable)
+		return ok && au.uid() == bu.uid()
+	}
+
 	// Future improvement: add a default Kubernetes object implementation
 	// ResourceVersion is tempting but probably not safe. If we are comparing objects from the API server its fine,
 	// but often we will be operating on types generated by the controller itself.
@@ -237,5 +214,14 @@ func equal[O any](a, b O) bool {
 		// DeepEqual on proto is broken, so fail fast to avoid subtle errors.
 		panic(fmt.Sprintf("unable to compare object %T; perhaps it is embedding a protobuf? Provide an Equaler implementation", a))
 	}
+
 	return reflect.DeepEqual(a, b)
+}
+
+type collectionUID uint64
+
+var globalUIDCounter = atomic.NewUint64(1)
+
+func nextUID() collectionUID {
+	return collectionUID(globalUIDCounter.Inc())
 }

@@ -8,27 +8,30 @@ This folder contains Istio integration tests that use the test framework checked
 1. [Overview](#overview)
 1. [Writing Tests](#writing-tests)
     1. [Adding a Test Suite](#adding-a-test-suite)
+    1. [Classifying Test Coverage](#classifying-test-coverage)
     1. [Sub-Tests](#sub-tests)
+    1. [Assertion & Retry Conventions](#assertion--retry-conventions)
     1. [Parallel Tests](#parallel-tests)
     1. [Using Components](#using-components)
     1. [Writing Components](#writing-components)
 1. [Running Tests](#running-tests)
-    1. [Test Parallelism and Kubernetes](#test-parellelism-and-kubernetes)
+    1. [Test Parallelism and Kubernetes](#test-parallelism-and-kubernetes)
     1. [Test Selection](#test-selection)
     1. [Running Tests on CI](#running-tests-on-ci)
-        1. [Step 1: Add a Test Script](#step-1-add-a-test-script)
-        1. [Step 2: Add a Prow Job](#step-2-add-a-prow-job)
-        1. [Step 3: Update TestGrid](#step-3-update-testgrid)
+    1. [Running Tests on Custom Deployment](#running-tests-on-custom-deployment)
+        1. [External Installation Executable API](#external-installation-executable-api)
+            1. ['install' command](#install-command)
+            1. ['cleanup' command](#cleanup-command)
 1. [Environments](#environments)
+    1. [KinD Cluster Environment Variables](#kind-cluster-environment-variables)
 1. [Diagnosing Failures](#diagnosing-failures)
     1. [Working Directory](#working-directory)
     1. [Enabling CI Mode](#enabling-ci-mode)
     1. [Preserving State (No Cleanup)](#preserving-state-no-cleanup)
     1. [Additional Logging](#additional-logging)
-    1. [Running Tests Under Debugger](#running-tests-under-debugger-goland)
+    1. [Running Tests Under Debugger (GoLand)](#running-tests-under-debugger-goland)
 1. [Reference](#reference)
-    1. [Helm Values Overrides](#helm-values-overrides)
-    1. [Commandline Flags](#command-line-flags)
+    1. [Command-Line Flags](#command-line-flags)
 1. [Notes](#notes)
     1. [Running on a Mac](#running-on-a-mac)
 
@@ -43,7 +46,7 @@ practices, see [Writing Good Integration Tests](https://github.com/istio/istio/w
 ## Writing Tests
 
 The test framework is designed to work with standard go tooling and allows developers
-to write environment-agnostics tests in a high-level fashion.
+to write environment-agnostic tests in a high-level fashion.
 
 ### Adding a Test Suite
 
@@ -110,6 +113,54 @@ func mySetup(ctx resource.Context) error {
 }
 ```
 
+### Classifying Test Coverage
+
+In Istio, we have many features and many deployment/configuration models.
+This creates a huge matrix of possible test coverage.
+To optimize our CI, we try to run only a subset of tests in presubmit jobs while running the full test sutie in postsubmit jobs.
+We do this by having two additional types of tests: `full` and `multicluster`.
+By default, tests always run.
+A `full` test is more involved and is likely probably not affected by deployment model and configuration.
+In practice, this means that we only run `full` test in a standard single-cluster ipv4 environment in presubmits.
+A `multiclsuter` test is one that requires multiple clusters.
+
+Use `framework.NewTest` for a default test.
+
+Use `framework.NewFullTest` for a `full` test.
+
+```go
+func TestAdditionalCoverage(t *testing.T) {
+    framework.NewFullTest(t).Run(func(ctx framework.TestContext) {
+        // Additional standard single-cluster coverage.
+    })
+}
+```
+
+Use `framework.NewMulticlusterTest` when a test requires multiple clusters:
+
+```go
+func TestMulticluster(t *testing.T) {
+    framework.NewMulticlusterTest(t).Run(func(ctx framework.TestContext) {
+        // Multicluster-only coverage.
+    })
+}
+```
+
+When every test in a package has the same classification, apply its label to
+the suite rather than each test. The framework then skips the suite setup when
+the selected target excludes that label:
+
+```go
+func TestMain(m *testing.M) {
+    framework.NewSuite(m).
+        Label(label.Full).
+        Setup(setup).
+        Run()
+}
+
+This is quite important because it allows us to skip the costly setup of each test suite.
+```
+
 ### Sub-Tests
 
 Go allows you to run sub-tests with `t.Run()`. Similarly, this framework supports nesting tests with `ctx.NewSubTest()`:
@@ -142,6 +193,83 @@ func TestMyLogic(t *testing.T) {
 ```
 
 Under the hood, calling `subtest.Run()` delegates to `t.Run()` in order to create a child `testing.T`.
+
+### Assertion & Retry Conventions
+
+Integration tests run against real clusters where configuration propagation, pod startup, and
+control-plane reconciliation are inherently asynchronous. Prefer Istio-native helpers over ad-hoc
+timing or manual retry loops to reduce flakiness and keep failure output consistent.
+
+#### Async polling
+
+Use `istio.io/istio/pkg/test/util/retry` for anything that may not be immediately true:
+
+| Scenario | Preferred pattern | Avoid |
+|---|---|---|
+| Wait for API/K8s state | `retry.UntilSuccessOrFail` | `for i := 0; i < N; i++` loops |
+| Wait for a bool condition | `retry.UntilOrFail` | `time.Sleep` then a single check |
+| Require N consecutive successes | `retry.Converge(N)` with `UntilSuccessOrFail` | Tight loops without backoff |
+| Poll until a value equals expected | `assert.EventuallyEqual` | Manual compare inside a retry loop |
+
+Example:
+
+```go
+retry.UntilSuccessOrFail(t, func() error {
+    got, err := fetchStatus()
+    if err != nil {
+        return err
+    }
+    if got != want {
+        return fmt.Errorf("got %q, want %q", got, want)
+    }
+    return nil
+}, retry.Timeout(30*time.Second), retry.Delay(time.Second))
+```
+
+For equality polling, prefer `assert.EventuallyEqual` from `istio.io/istio/pkg/test/util/assert`:
+
+```go
+assert.EventuallyEqual(t, func() string { return getPhase() }, "Running",
+    retry.Timeout(30*time.Second), retry.Delay(time.Second))
+```
+
+#### Negative and stability checks
+
+When asserting that something does **not** happen (for example, logs must not appear, or a status
+field must not be cleared), avoid blind `time.Sleep` inside a retry loop. Prefer polling with an
+explicit timeout:
+
+- `assert.Consistently` — value must remain stable for a duration
+- `retry.UntilSuccessOrFail` — retry until a negative condition holds (for example, `count == 0`)
+
+#### Synchronous assertions
+
+| Scenario | Preferred pattern | Avoid |
+|---|---|---|
+| HTTP/traffic validation | `CallOrFail` + `check.*` matchers | Raw HTTP clients + `t.Fatalf` |
+| Struct/value comparison | `assert.Equal` | `t.Fatalf` with manual diff |
+| Resource setup failures | `ApplyOrFail`, `BuildOrFail`, `NewOrFail` | `t.Fatal` after every setup step |
+
+#### Structured output (istioctl, JSON dumps, analyzer messages)
+
+For complex parsed output, use Gomega via `NewWithT(t)` inside `framework.NewTest`:
+
+```go
+g := NewWithT(t)
+g.Expect(parsed).To(HaveKey("bootstrap"))
+g.Expect(parsed["endpoints"]).ToNot(BeEmpty())
+```
+
+Keep async polling on `retry.*`; use Gomega only for synchronous assertions on data already fetched.
+
+#### When `time.Sleep` is acceptable
+
+Fixed sleeps are acceptable only when the delay itself is the test condition:
+
+- Traffic generator soak/baseline windows (collecting samples over a duration)
+- Rate-limit guards between infrastructure operations (for example, CNI daemonset restart throttling)
+
+If a sleep exists only to wait for propagation before a single check, replace it with `retry.*`.
 
 ### Parallel Tests
 
@@ -359,7 +487,7 @@ Note that samples below invoking variations of ```go test ./...``` are intended 
 
 Tests are tagged with the `integ` build target to avoid accidental invocation. If this is not set, no tests will be run.
 
-### Test Parellelism and Kubernetes
+### Test Parallelism and Kubernetes
 
 By default, Go will run tests within the same package (i.e. suite) synchronously. However, tests in other packages
 may be run concurrently.
@@ -386,7 +514,7 @@ For example, if a test, or test suite uses labels in this fashion:
 func TestMain(m *testing.M) {
     framework.
         NewSuite("galley_conversion", m).
-        // Test is tagged with "Presubmit" label
+        // Test is tagged with "CustomSetup" label
         Label(label.CustomSetup).
         Run()
 ```
@@ -422,9 +550,45 @@ Tool | Description |
 [Prow](https://github.com/kubernetes/test-infra/tree/master/prow) | Kubernetes-based CI/CD system developed by the Kubernetes community and is deployed in Google Kubernetes Engine (GKE).
 [TestGrid](https://k8s-testgrid.appspot.com/istio-release) | A Kubernetes dashboard used for visualizing the status of the Prow jobs.
 
-Test suites are defined for each toplevel directory (such as `pilot` and `telemetry`), so any tests added to these directories will automatically be run in CI.
+Test suites are defined for each top level directory (such as `pilot` and `telemetry`), so any tests added to these directories will automatically be run in CI.
 
 If you need to add a new test suite, it can be added to the [job configuration](https://github.com/istio/test-infra/blob/master/prow/config/jobs/istio.yaml).
+
+### Running Tests on Custom Deployment
+
+You can run integration tests against a control plane deployed by another operator such as [sail-operator](https://github.com/istio-ecosystem/sail-operator):
+
+With setting ```--istio.test.kube.controlPlaneInstaller=#{path/to/script}``` and ```--istio.test.kube.deploy=false``` you can skip internal istio operator installation and be able to call a script which lets you install another control plane.
+
+> [!WARNING]
+> Note that Istio does not perform any testing for this option in its CI nor maintains custom scripts or config files in its repository. You will be responsible to maintain your
+> files in another repository.
+
+#### External Installation Executable API
+
+The External Installation Executable can be any executable, be it a script or a binary as long as the host OS can execute it. The script should take work directory as argument. The iop.yaml file under work directory which is generated by the integration test framework can be used to extract control plane values of the running test.
+
+Examples will use `extinst` as script name.
+
+##### 'install' command
+
+Installs the Istio control plane for this test run. Takes 1 argument, work directory of integration test.
+
+Example:
+
+```console
+$ extinst install /work/test1/integ-test
+```
+
+##### 'cleanup' command
+
+Cleans up the previously-installed control plane. Takes 1 argument, work directory of integration test.
+
+Example:
+
+```console
+$ extinst cleanup /work/test1/integ-test
+```
 
 ## Environments
 
@@ -452,6 +616,24 @@ If not specified, `~/.kube/config` will be used by default.
 **Be aware that any existing content will be altered and/or removed from the cluster**.
 
 Note that the HUB and TAG environment variables **must** be set when running tests in the Kubernetes environment.
+
+### KinD Cluster Environment Variables
+
+The following environment variables can be used to configure the KinD cluster setup when running tests via `prow/integ-suite-kind.sh`:
+
+| Name | Description |
+|---|---|
+| `SKIP_SETUP` | Skip KinD cluster setup entirely if set. Useful when reusing an existing cluster. |
+| `NOMETALBINSTALL` | Skip MetalLB installation if set. Useful when using [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind). |
+| `ISTIO_BASE_REGISTRY` | Registry containing the base images used by `dockerx.pushx`. Defaults to `docker.io/istio`. |
+| `ISTIO_BUILDKIT_IMAGE` | BuildKit image used by the Docker builder. Defaults to `registry.istio.io/testing/buildkit:v0.11.0`. |
+| `WASM_REGISTRY` | Registry containing the Wasm test artifacts copied to the KinD registry. Defaults to `registry.istio.io/testing`. |
+| `METALLB_REGISTRY` | Registry containing the MetalLB images deployed to KinD. Defaults to `registry.istio.io/testing`. |
+| `ECR_REGISTRY` | ECR registry host. Configures an ECR image-pull secret for MetalLB when set. |
+| `PROMETHEUS_REGISTRY` | Repository prefix for the Prometheus image. Defaults to `quay.io/prometheus`; may include a pull-through cache path. |
+| `PROMETHEUS_CONFIG_RELOADER_REGISTRY` | Repository prefix for the Prometheus config-reloader image. Defaults to `ghcr.io/prometheus-operator`; may include a pull-through cache path. |
+| `ZIPKIN_REGISTRY` | Repository prefix for the Zipkin image. Defaults to `ghcr.io/openzipkin`; may include a pull-through cache path. |
+| `OTEL_REGISTRY` | Repository prefix for the OpenTelemetry Collector image. Defaults to `docker.io/otel`; may include a pull-through cache path. |
 
 ## Diagnosing Failures
 
@@ -514,67 +696,39 @@ pass command-line flags to the test while running under the debugger, you can us
 
 The test framework supports the following command-line flags:
 
-```plain
-  -istio.test.work_dir string
-        Local working directory for creating logs/temp files. If left empty, os.TempDir() is used.
-
- -istio.test.ci
-        Enable CI Mode. Additional logging and state dumping will be enabled.
-
-  -istio.test.nocleanup
-        Do not cleanup resources after test completion
-
-  -istio.test.select string
-        Comma separatated list of labels for selecting tests to run (e.g. 'foo,+bar-baz').
-
-  -istio.test.hub string
-        Container registry hub to use (default HUB environment variable)
-
-  -istio.test.tag string
-        Common Container tag to use when deploying container images (default TAG environment variable)
-
-  -istio.test.pullpolicy string
-        Common image pull policy to use when deploying container images
-
-  -istio.test.kube.config string
-        A comma-separated list of paths to kube config files for cluster environments. (default ~/.kube/config)
-
-  -istio.test.kube.deploy
-        Deploy Istio into the target Kubernetes environment. (default true)
-
-  -istio.test.kube.deployEastWestGW
-        Deploy Istio east west gateway into the target Kubernetes environment. (default true)
-
-  -istio.test.kube.systemNamespace string
-        The namespace where the Istio components reside in a typical deployment. (default "istio-system")
-
-  -istio.test.kube.helm.values string
-        Manual overrides for Helm values file. Only valid when deploying Istio.
-
-  -istio.test.kube.helm.iopFile string
-        IstioOperator spec file. This can be an absolute path or relative to the repository root. Defaults to "tests/integration/iop-integration-test-defaults.yaml".
-
-  -istio.test.kube.loadbalancer bool
-        Used to obtain the right IP address for ingress gateway. This should be false for any environment that doesn't support a LoadBalancer type.
-
-  -istio.test.revision string
-        Overwrite the default namespace label (istio-enabled=true) with revision lable (istio.io/rev=XXX). (default is no overwrite)
-
-  -istio.test.skipVM bool
-        Skip all the VM related parts in all the tests. (default is "false")
-
-  -istio.test.helmRepo string
-        Overwrite the default helm Repo used for the tests.
-
-  -istio.test.ambient bool
-        Indicate the use of ambient mesh.
-```
+| Name                               | Type | Description                                                                                                                                                   |
+|------------------------------------|------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| --istio.test.work_dir              | string | Local working directory for creating logs/temp files. If left empty, os.TempDir() is used.                                                                    |
+| --istio.test.ci                    | bool | Enable CI Mode. Additional logging and state dumping will be enabled.                                                                                         |
+| --istio.test.nocleanup             | bool | Do not cleanup resources after test completion.                                                                                                               |
+| --istio.test.select                | string | Comma separated list of labels for selecting tests to run (e.g. 'foo,+bar-baz').                                                                              |
+| --istio.test.hub                   | string | Container registry hub to use (default HUB environment variable).                                                                                             |
+| --istio.test.tag                   | string | Common Container tag to use when deploying container images (default TAG environment variable).                                                               |
+| --istio.test.pullpolicy            | string | Common image pull policy to use when deploying container images.                                                                                              |
+| --istio.test.kube.config           | string | A comma-separated list of paths to kube config files for cluster environments. (default ~/.kube/config).                                                      |
+| --istio.test.kube.deploy           | bool | Deploy Istio into the target Kubernetes environment. (default true).                                                                                          |
+| --istio.test.kube.deployEastWestGW | bool | Deploy Istio east west gateway into the target Kubernetes environment. (default true).                                                                        |
+| --istio.test.kube.systemNamespace  | string | The namespace where the Istio components reside in a typical deployment. (default "istio-system").                                                            |
+| --istio.test.kube.helm.values      | string | Manual overrides for Helm values file. Only valid when deploying Istio.                                                                                       |
+| --istio.test.kube.helm.iopFile     | string | IstioOperator spec file. This can be an absolute path or relative to the repository root. Defaults to "tests/integration/iop-integration-test-defaults.yaml". |
+| --istio.test.kube.loadbalancer     | bool | Used to obtain the right IP address for ingress gateway. This should be false for any environment that doesn't support a LoadBalancer type.                   |
+| --istio.test.kube.deployGatewayAPI | bool | Deploy gateway API during tests execution. (default is "true").                                                                                               |
+| --istio.test.revision              | string | Overwrite the default namespace label (istio-enabled=true) with revision label (istio.io/rev=XXX). (default is no overwrite).                                 |
+| --istio.test.skip                  | []string | Skip tests matching the regular expression. This follows the semantics of -test.run.                                                                          |
+| --istio.test.skipVM                | bool | Skip all the VM related parts in all the tests. (default is "false").                                                                                         |
+| --istio.test.helmRepo              | string | Overwrite the default helm Repo used for the tests.                                                                                                           |
+| --istio.test.ambient               | bool | Indicate the use of ambient mesh.                                                                                                                             |
+| --istio.test.openshift             | bool | Set to `true` when running the tests in an OpenShift cluster, rather than in KinD.                                                                            |
+| --istio.test.stableNamespaces      | bool | Set to `true` to use stable namespaces for the test. Useful with nocleanup to develop tests                                                                   |
+| --istio.test.nativeNftables        | bool | Set to `true` to use native nftable rules instead of iptable rules                      |
+| --istio.test.kube.gatewayClassName | string | The name of the GatewayClass to use for Gateway API tests. (default is "istio"). |
+| --istio.test.gatewayAPIOnly        | bool | Indicate a Gateway API-only cluster (no sidecar injection). Echo apps will be deployed without istio-proxy overlay. Useful for testing Gateway API on clusters without full Istio mesh capabilities. (default is "false"). |
 
 ## Notes
 
 ### Running on a Mac
 
-* Currently some _native_ tests fail when being run on a Mac with an error like:
+- Currently some _native_ tests fail when being run on a Mac with an error like:
 
 ```plain
 unable to locate an Envoy binary
@@ -583,7 +737,7 @@ unable to locate an Envoy binary
 This is documented in this [PR](https://github.com/istio/istio/issues/13677). Once the Envoy binary is available for the Mac,
 these tests will hopefully succeed.
 
-* If one uses Docker for Mac for the kubernetes environment be sure to specify the `-istio.test.kube.loadbalancer=false` parameter. This solves an error like:
+- If one uses Docker for Mac for the kubernetes environment be sure to specify the `-istio.test.kube.loadbalancer=false` parameter. This solves an error like:
 
 ```plain
 service ingress is not available yet

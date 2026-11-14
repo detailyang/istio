@@ -37,12 +37,37 @@ setup_and_export_git_sha
 source "${ROOT}/common/scripts/kind_provisioner.sh"
 
 TOPOLOGY=SINGLE_CLUSTER
-NODE_IMAGE="gcr.io/istio-testing/kind-node:v1.29.0"
+NODE_IMAGE="registry.istio.io/testing/kind-node:v1.36.0"
 KIND_CONFIG=""
 CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/prow/config/topology/multicluster.json"
+CLUSTER_NAME="${CLUSTER_NAME:-istio-testing}"
+CLUSTER_YAML="${CLUSTER_YAML:-prow/config/default.yaml}"
 
 export FAST_VM_BUILDS=true
 export ISTIO_DOCKER_BUILDER="${ISTIO_DOCKER_BUILDER:-crane}"
+# Override these registries to route integration-test image pulls through a
+# registry cache. ISTIO_BASE_REGISTRY is consumed by dockerx.pushx.
+export ISTIO_BASE_REGISTRY="${ISTIO_BASE_REGISTRY:-docker.io/istio}"
+export WASM_REGISTRY="${WASM_REGISTRY:-registry.istio.io/testing}"
+export METALLB_REGISTRY="${METALLB_REGISTRY:-registry.istio.io/testing}"
+# DEVCONTAINER controls a set of features that allow this script to be run from
+# within a dev container using ghcr.io/devcontainers/features/docker-outside-of-docker
+export DEVCONTAINER="${DEVCONTAINER:-}"
+if [[ "${DEVCONTAINER}" ]]; then
+  export ISTIO_DOCKER_BUILDER=docker
+fi
+export NOMETALBINSTALL="${NOMETALBINSTALL:-}"
+
+# With rootless podman, the kind network lives in podman's rootless network namespace, which is not
+# reachable from the host. Tests talk directly to node and MetalLB IPs, so they are run from within
+# that network namespace (see the test step below).
+ROOTLESS_PODMAN=""
+if [[ "${CONTAINER_CLI:-}" == "podman" ]] && [[ "$(podman info --format '{{.Host.Security.Rootless}}')" == "true" ]]; then
+  ROOTLESS_PODMAN=true
+  export KIND_EXPERIMENTAL_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-podman}"
+  # TPROXY interception does not work in rootless kind nodes.
+  export INTEGRATION_TEST_FLAGS="${INTEGRATION_TEST_FLAGS:-} --istio.test.skipTProxy"
+fi
 
 PARAMS=()
 
@@ -77,8 +102,7 @@ while (( "$#" )); do
     ;;
     --topology)
       case $2 in
-        # TODO(landow) get rid of MULTICLUSTER_SINGLE_NETWORK after updating Prow job
-        SINGLE_CLUSTER | MULTICLUSTER_SINGLE_NETWORK | MULTICLUSTER )
+        SINGLE_CLUSTER | MULTICLUSTER | AMBIENT_MULTICLUSTER )
           TOPOLOGY=$2
           echo "Running with topology ${TOPOLOGY}"
           ;;
@@ -110,7 +134,14 @@ if [ -f /proc/cpuinfo ]; then
 fi
 
 # Default IP family of the cluster is IPv4
-export IP_FAMILY="${IP_FAMILY:-ipv4}"
+KIND_IP_FAMILY="ipv4"
+export IP_FAMILIES="${IP_FAMILIES:-IPv4}"
+if [[ "$IP_FAMILIES" == "IPv6" ]]; then
+   KIND_IP_FAMILY="ipv6"
+elif [[ "$IP_FAMILIES" =~ "IPv6" ]] && [[ "$IP_FAMILIES" =~ "IPv4" ]]; then
+   KIND_IP_FAMILY="dual"
+fi
+export KIND_IP_FAMILY
 
 # LoadBalancer in Kind is supported using metallb
 export TEST_ENV=kind-metallb
@@ -123,9 +154,11 @@ export PULL_POLICY=IfNotPresent
 export KIND_REGISTRY_NAME="kind-registry"
 export KIND_REGISTRY_PORT="5000"
 export KIND_REGISTRY="localhost:${KIND_REGISTRY_PORT}"
+export KIND_REGISTRY_DIR="/etc/containerd/certs.d/localhost:${KIND_REGISTRY_PORT}"
 
-export HUB=${HUB:-"istio-testing"}
+export HUB=${HUB:-"testing"}
 export TAG="${TAG:-"istio-testing"}"
+export VARIANT
 
 # If we're not intending to pull from an actual remote registry, use the local kind registry
 if [[ -z "${SKIP_BUILD:-}" ]]; then
@@ -140,15 +173,27 @@ export CI="true"
 export ARTIFACTS="${ARTIFACTS:-$(mktemp -d)}"
 trace "init" make init
 
+BUILD_IMAGES_PID=""
+if [[ -n "${CI}" && -z "${SKIP_SETUP:-}" && -z "${SKIP_BUILD:-}" && -z "${DEVCONTAINER}" ]]; then
+  trace "start kind registry" start_kind_registry
+  trace "build images" build_images "${PARAMS[*]}" &
+  BUILD_IMAGES_PID=$!
+fi
+
 if [[ -z "${SKIP_SETUP:-}" ]]; then
-  export DEFAULT_CLUSTER_YAML="./prow/config/default.yaml"
+  # Use KIND_CONFIG if specified, otherwise fall back to CLUSTER_YAML
+  if [[ -n "${KIND_CONFIG}" ]]; then
+    export DEFAULT_CLUSTER_YAML="${ROOT}/${KIND_CONFIG}"
+  else
+    export DEFAULT_CLUSTER_YAML="${ROOT}/${CLUSTER_YAML}"
+  fi
   export METRICS_SERVER_CONFIG_DIR='./prow/config/metrics'
 
   if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
-    trace "setup kind cluster" setup_kind_cluster_retry "istio-testing" "${NODE_IMAGE}" "${KIND_CONFIG}"
+    trace "setup kind cluster" setup_kind_cluster_retry "${CLUSTER_NAME}" "${NODE_IMAGE}" "${KIND_CONFIG}"
   else
     trace "load cluster topology" load_cluster_topology "${CLUSTER_TOPOLOGY_CONFIG_FILE}"
-    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${IP_FAMILY}"
+    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${KIND_IP_FAMILY}"
 
     TOPOLOGY_JSON=$(cat "${CLUSTER_TOPOLOGY_CONFIG_FILE}")
     for i in $(seq 0 $((${#CLUSTER_NAMES[@]} - 1))); do
@@ -168,18 +213,81 @@ if [[ -z "${SKIP_SETUP:-}" ]]; then
 fi
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then
-  trace "setup kind registry" setup_kind_registry
-  trace "build images" build_images "${PARAMS[*]}"
-fi
+  if [[ -n "${BUILD_IMAGES_PID}" ]]; then
+    wait "${BUILD_IMAGES_PID}"
+  else
+    trace "start kind registry" start_kind_registry
+  fi
+  trace "configure kind registry" configure_kind_registry
+  if [[ -z "${BUILD_IMAGES_PID}" ]]; then
+    trace "build images" build_images "${PARAMS[*]}"
+  fi
 
-# If a variant is defined, update the tag accordingly
-if [[ -n "${VARIANT:-}" ]]; then
-  export TAG="${TAG}-${VARIANT}"
+  # upload WASM plugins to kind-registry
+  registry_url=$(if [ -z "$DEVCONTAINER" ]; then echo "localhost"; else echo $KIND_REGISTRY_NAME; fi):$KIND_REGISTRY_PORT
+  crane copy "${WASM_REGISTRY}/wasm/attributegen:359dcd3a19f109c50e97517fe6b1e2676e870c4d" "$registry_url/testing/wasm/attributegen:0.0.1" --insecure
+  crane copy "${WASM_REGISTRY}/wasm/header-injector:0.0.1" "$registry_url/testing/wasm/header-injector:0.0.1" --insecure
+  crane copy "${WASM_REGISTRY}/wasm/header-injector:0.0.2" "$registry_url/testing/wasm/header-injector:0.0.2" --insecure
+
+  # Make "kind-registry" resolvable in IPv6 cluster
+  if [[ "$KIND_IP_FAMILY" == "ipv6" ]]; then
+    kind_registry_ip=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "kind"}}{{.GlobalIPv6Address}}{{end}}{{end}}' kind-registry)
+    coredns_config=$(kubectl get -oyaml -n=kube-system configmap/coredns)
+    echo "Current CoreDNS config:"
+    echo "${coredns_config}"
+    patched_coredns_config=$(kubectl get -oyaml -n=kube-system configmap/coredns | sed -e '/^ *ready/i\
+        hosts {\
+            '"$kind_registry_ip"' kind-registry.lan\
+            '"$kind_registry_ip"' kind-registry.\
+            fallthrough\
+        }')
+    echo "Patched CoreDNS config:"
+    echo "${patched_coredns_config}"
+    printf '%s' "${patched_coredns_config}" | kubectl apply -f -
+  fi
+  # CoreDNS by default caches Kubernetes objects for 30s. This leads to problematic timing issues when we tear down + re-install
+  # in our tests. We will negative-cache the object, adding up to 30s on each test suite.
+  # See https://github.com/coredns/coredns/pull/2348
+  kubectl get -oyaml -n=kube-system configmap/coredns | sed 's/ttl 30/ttl 0/g' | kubectl apply -f -
 fi
 
 # Run the test target if provided.
 if [[ -n "${PARAMS:-}" ]]; then
-  trace "test" make "${PARAMS[*]}"
+  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
+    # The setup and registry steps above enumerate every kind cluster on the host (e.g.
+    # configure_kind_registry loops over `kind get clusters`) and leave the shared kubeconfig's
+    # current-context on an arbitrary one. Single-cluster tests otherwise inherit that context and
+    # can install into an unrelated bystander cluster. Hand the framework an isolated kubeconfig for
+    # just the cluster we provisioned -- mirroring the per-cluster kubeconfigs the multicluster path
+    # builds under ARTIFACTS -- so it can only ever act on that cluster.
+    SINGLE_CLUSTER_KUBECONFIG="${ARTIFACTS}/kubeconfig/${CLUSTER_NAME}"
+    mkdir -p "$(dirname "${SINGLE_CLUSTER_KUBECONFIG}")"
+    if [[ -n "${ROOTLESS_PODMAN}" ]]; then
+      # The host-mapped API server port is not reachable from podman's rootless network namespace,
+      # so address the control plane by its IP on the kind network instead.
+      if [[ "${KIND_IP_FAMILY}" == "ipv6" ]]; then
+        control_plane_ip="[$(docker inspect "${CLUSTER_NAME}-control-plane" --format '{{ .NetworkSettings.Networks.kind.GlobalIPv6Address }}')]"
+      else
+        control_plane_ip=$(docker inspect "${CLUSTER_NAME}-control-plane" --format '{{ .NetworkSettings.Networks.kind.IPAddress }}')
+      fi
+      kind get kubeconfig --name="${CLUSTER_NAME}" --internal | \
+        sed "s/${CLUSTER_NAME}-control-plane/${control_plane_ip}/g" > "${SINGLE_CLUSTER_KUBECONFIG}"
+    else
+      kind export kubeconfig --name="${CLUSTER_NAME}" ${DEVCONTAINER:+--internal} \
+        --kubeconfig "${SINGLE_CLUSTER_KUBECONFIG}"
+    fi
+    export KUBECONFIG="${SINGLE_CLUSTER_KUBECONFIG}"
+  fi
+  if [[ -n "${ROOTLESS_PODMAN}" && "${BUILD_WITH_CONTAINER:-1}" == "1" ]]; then
+    # Attach the build container to the kind network instead of the host network.
+    CONTAINER_OPTIONS="${CONTAINER_OPTIONS:---mount type=bind,source=/tmp,destination=/tmp --net=host}"
+    export CONTAINER_OPTIONS="${CONTAINER_OPTIONS//--net=host/} --net=kind"
+    trace "test" make "${PARAMS[*]}"
+  elif [[ -n "${ROOTLESS_PODMAN}" ]]; then
+    trace "test" podman unshare --rootless-netns make "${PARAMS[*]}"
+  else
+    trace "test" make "${PARAMS[*]}"
+  fi
 fi
 
 # Check if the user is running the clusters in manual mode.

@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"istio.io/istio/pkg/log"
@@ -59,9 +60,9 @@ func GetPrivateIPs(ctx context.Context) ([]string, bool) {
 	for {
 		select {
 		case <-ctx.Done():
-			return getPrivateIPsIfAvailable()
+			return GetPrivateIPsIfAvailable()
 		default:
-			addr, ok := getPrivateIPsIfAvailable()
+			addr, ok := GetPrivateIPsIfAvailable()
 			if ok {
 				return addr, true
 			}
@@ -70,8 +71,8 @@ func GetPrivateIPs(ctx context.Context) ([]string, bool) {
 	}
 }
 
-// Returns all the private IP addresses
-func getPrivateIPsIfAvailable() ([]string, bool) {
+// GetPrivateIPsIfAvailable returns all the private IP addresses
+func GetPrivateIPsIfAvailable() ([]string, bool) {
 	ok := true
 	ipAddresses := make([]string, 0)
 
@@ -95,6 +96,7 @@ func getPrivateIPsIfAvailable() ([]string, bool) {
 				ip = v.IP
 			default:
 				continue
+
 			}
 			ipAddr, okay := netip.AddrFromSlice(ip)
 			if !okay {
@@ -233,4 +235,67 @@ func GlobalUnicastIP(ipAddrs []string) string {
 		}
 	}
 	return ""
+}
+
+// FilterAddressesByIPFamily filters a list of addresses by IP family support.
+func FilterAddressesByIPFamily(addresses []string, supportsV4, supportsV6 bool) []string {
+	if len(addresses) == 0 {
+		return nil
+	}
+
+	var ipv4Addresses []string
+	var ipv6Addresses []string
+	for _, addr := range addresses {
+		if strings.Contains(addr, "/") {
+			if prefix, err := netip.ParsePrefix(addr); err != nil {
+				log.Warnf("failed to parse prefix address '%s': %s", addr, err)
+				continue
+			} else if supportsV4 && prefix.Addr().Is4() {
+				ipv4Addresses = append(ipv4Addresses, addr)
+			} else if supportsV6 && prefix.Addr().Is6() {
+				ipv6Addresses = append(ipv6Addresses, addr)
+			}
+		} else {
+			if ipAddr, err := netip.ParseAddr(addr); err != nil {
+				log.Warnf("failed to parse address '%s': %s", addr, err)
+				continue
+			} else if supportsV4 && ipAddr.Is4() {
+				ipv4Addresses = append(ipv4Addresses, addr)
+			} else if supportsV6 && ipAddr.Is6() {
+				ipv6Addresses = append(ipv6Addresses, addr)
+			}
+		}
+	}
+
+	if supportsV4 && supportsV6 {
+		firstAddrFamily := ""
+		if strings.Contains(addresses[0], "/") {
+			if prefix, err := netip.ParsePrefix(addresses[0]); err == nil {
+				if prefix.Addr().Is4() {
+					firstAddrFamily = "v4"
+				} else if prefix.Addr().Is6() {
+					firstAddrFamily = "v6"
+				}
+			}
+		} else {
+			if ipAddr, err := netip.ParseAddr(addresses[0]); err == nil {
+				if ipAddr.Is4() {
+					firstAddrFamily = "v4"
+				} else if ipAddr.Is6() {
+					firstAddrFamily = "v6"
+				}
+			}
+		}
+
+		if firstAddrFamily == "v4" {
+			return ipv4Addresses
+		} else if firstAddrFamily == "v6" {
+			return ipv6Addresses
+		}
+	}
+
+	if len(ipv4Addresses) > 0 {
+		return ipv4Addresses
+	}
+	return ipv6Addresses
 }

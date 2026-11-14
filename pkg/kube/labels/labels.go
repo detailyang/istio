@@ -16,7 +16,11 @@
 // from Kubernetes resources.
 package labels
 
-import "istio.io/istio/pilot/pkg/model"
+import (
+	"istio.io/api/annotation"
+	"istio.io/api/label"
+	"istio.io/istio/pkg/model"
+)
 
 var (
 	// These are the labels that are checked for canonical service name and revision.
@@ -31,7 +35,26 @@ var (
 		"app.kubernetes.io/version",
 		"version",
 	}
+	// nameLabelsBackwardCompatible is the reverse order of nameLabels for backward compatibility.
+	// It checks app first, then app.kubernetes.io/name, and finally service.istio.io/canonical-name.
+	// This is used in serviceClusterOrDefault to maintain backward compatibility.
+	nameLabelsBackwardCompatible = []string{
+		"app",
+		"app.kubernetes.io/name",
+		model.IstioCanonicalServiceLabelName,
+	}
 )
+
+// WorkloadNameFromWorkloadEntry derives the workload name from a WorkloadEntry
+func WorkloadNameFromWorkloadEntry(name string, annos map[string]string, labels map[string]string) string {
+	if arg, f := annos[annotation.IoIstioAutoRegistrationGroup.Name]; f {
+		return arg
+	}
+	if wn, f := labels[label.ServiceWorkloadName.Name]; f {
+		return wn
+	}
+	return name
+}
 
 // CanonicalService returns the values of the following labels from the supplied map:
 // - service.istio.io/canonical-name
@@ -80,4 +103,16 @@ func canonicalServiceName(labels map[string]string, workloadName string) string 
 		return workloadName
 	}
 	return value
+}
+
+// GetApp returns the app name from labels using a backward-compatible
+// priority order that checks "app" first for backward compatibility:
+// 1. app
+// 2. app.kubernetes.io/name
+// 3. service.istio.io/canonical-name
+// This is used in serviceClusterOrDefault to maintain backward compatibility for existing users
+// who have both "app" and "app.kubernetes.io/name" labels with different values.
+// Returns the value and true if found, or empty string and false if none of the labels are present.
+func GetApp(labels map[string]string) (string, bool) {
+	return lookupLabelValue(labels, nameLabelsBackwardCompatible...)
 }

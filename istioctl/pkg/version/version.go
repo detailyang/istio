@@ -19,9 +19,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	statusv3 "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -29,19 +31,17 @@ import (
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/clioptions"
 	"istio.io/istio/istioctl/pkg/multixds"
-	"istio.io/istio/operator/cmd/mesh"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/xds"
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proxy"
 	istioVersion "istio.io/istio/pkg/version"
 )
 
 func NewVersionCommand(ctx cli.Context) *cobra.Command {
-	profileCmd := mesh.ProfileCmd(ctx, log.DefaultOptions())
 	var opts clioptions.ControlPlaneOptions
-	versionCmd := istioVersion.CobraCommandWithOptions(istioVersion.CobraOptions{
-		GetRemoteVersion: getRemoteInfoWrapper(ctx, &profileCmd, &opts),
+	var versionCmd *cobra.Command
+	versionCmd = istioVersion.CobraCommandWithOptions(istioVersion.CobraOptions{
+		GetRemoteVersion: getRemoteInfoWrapper(ctx, &versionCmd, &opts),
 		GetProxyVersions: getProxyInfoWrapper(ctx, &opts),
 	})
 	opts.AttachControlPlaneFlags(versionCmd)
@@ -64,7 +64,7 @@ func NewVersionCommand(ctx cli.Context) *cobra.Command {
 }
 
 func getRemoteInfo(ctx cli.Context, opts clioptions.ControlPlaneOptions) (*istioVersion.MeshInfo, error) {
-	kubeClient, err := ctx.CLIClientWithRevision(opts.Revision)
+	kubeClient, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(opts.Revision))
 	if err != nil {
 		return nil, err
 	}
@@ -75,21 +75,27 @@ func getRemoteInfo(ctx cli.Context, opts clioptions.ControlPlaneOptions) (*istio
 func getRemoteInfoWrapper(ctx cli.Context, pc **cobra.Command, opts *clioptions.ControlPlaneOptions) func() (*istioVersion.MeshInfo, error) {
 	return func() (*istioVersion.MeshInfo, error) {
 		remInfo, err := getRemoteInfo(ctx, *opts)
-		if err != nil {
-			fmt.Fprintf((*pc).OutOrStderr(), "%v\n", err)
-			// Return nil so that the client version is printed
-			return nil, nil
-		}
+		var errMses []string
+
 		if remInfo == nil {
-			fmt.Fprintf((*pc).OutOrStderr(), "Istio is not present in the cluster with namespace %q\n", ctx.IstioNamespace())
+			errMses = append(errMses, "Istio is not present in the cluster")
 		}
+
+		if err != nil {
+			errMses = append(errMses, fmt.Sprintf(": %v", err))
+		}
+
+		if len(errMses) > 0 {
+			fmt.Fprintln((*pc).OutOrStderr(), strings.Join(errMses, ""))
+		}
+
 		return remInfo, err
 	}
 }
 
 func getProxyInfoWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptions) func() (*[]istioVersion.ProxyInfo, error) {
 	return func() (*[]istioVersion.ProxyInfo, error) {
-		client, err := ctx.CLIClientWithRevision(opts.Revision)
+		client, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(opts.Revision))
 		if err != nil {
 			return nil, err
 		}
@@ -102,8 +108,9 @@ func XdsVersionCommand(ctx cli.Context) *cobra.Command {
 	var opts clioptions.ControlPlaneOptions
 	var centralOpts clioptions.CentralControlPlaneOptions
 	var xdsResponses *discovery.DiscoveryResponse
-	versionCmd := istioVersion.CobraCommandWithOptions(istioVersion.CobraOptions{
-		GetRemoteVersion: xdsRemoteVersionWrapper(ctx, &opts, &centralOpts, &xdsResponses),
+	var versionCmd *cobra.Command
+	versionCmd = istioVersion.CobraCommandWithOptions(istioVersion.CobraOptions{
+		GetRemoteVersion: xdsRemoteVersionWrapper(ctx, &versionCmd, &opts, &centralOpts, &xdsResponses),
 		GetProxyVersions: xdsProxyVersionWrapper(&xdsResponses),
 	})
 	opts.AttachControlPlaneFlags(versionCmd)
@@ -154,10 +161,10 @@ func XdsVersionCommand(ctx cli.Context) *cobra.Command {
 // xdsRemoteVersionWrapper uses outXDS to share the XDS response with xdsProxyVersionWrapper.
 // (Screwy API on istioVersion.CobraCommandWithOptions)
 // nolint: lll
-func xdsRemoteVersionWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptions, centralOpts *clioptions.CentralControlPlaneOptions, outXDS **discovery.DiscoveryResponse) func() (*istioVersion.MeshInfo, error) {
+func xdsRemoteVersionWrapper(ctx cli.Context, pc **cobra.Command, opts *clioptions.ControlPlaneOptions, centralOpts *clioptions.CentralControlPlaneOptions, outXDS **discovery.DiscoveryResponse) func() (*istioVersion.MeshInfo, error) {
 	return func() (*istioVersion.MeshInfo, error) {
 		xdsRequest := discovery.DiscoveryRequest{
-			TypeUrl: xds.TypeURLConnect,
+			TypeUrl: xds.TypeDebugSyncronization,
 		}
 		kubeClient, err := ctx.CLIClientWithRevision(opts.Revision)
 		if err != nil {
@@ -165,6 +172,7 @@ func xdsRemoteVersionWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptio
 		}
 		xdsResponse, err := multixds.RequestAndProcessXds(&xdsRequest, *centralOpts, ctx.IstioNamespace(), kubeClient)
 		if err != nil {
+			fmt.Fprintf((*pc).ErrOrStderr(), "unable to retrieve the control plane version over XDS: %v\n", err)
 			return nil, err
 		}
 		*outXDS = xdsResponse
@@ -197,6 +205,9 @@ func xdsRemoteVersionWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptio
 func xdsProxyVersionWrapper(xdsResponse **discovery.DiscoveryResponse) func() (*[]istioVersion.ProxyInfo, error) {
 	return func() (*[]istioVersion.ProxyInfo, error) {
 		pi := []istioVersion.ProxyInfo{}
+		if *xdsResponse == nil {
+			return nil, fmt.Errorf("invalid xdsResponse")
+		}
 		for _, resource := range (*xdsResponse).Resources {
 			switch resource.TypeUrl {
 			case "type.googleapis.com/envoy.config.core.v3.Node":
@@ -210,6 +221,17 @@ func xdsProxyVersionWrapper(xdsResponse **discovery.DiscoveryResponse) func() (*
 					// Skip non-sidecars (e.g. istioctl queries)
 					continue
 				}
+				pi = append(pi, istioVersion.ProxyInfo{
+					ID:           node.Id,
+					IstioVersion: getIstioVersionFromXdsMetadata(node.Metadata),
+				})
+			case "type.googleapis.com/envoy.service.status.v3.ClientConfig":
+				cc := statusv3.ClientConfig{}
+				err := resource.UnmarshalTo(&cc)
+				if err != nil {
+					return nil, fmt.Errorf("could not unmarshal Node: %w", err)
+				}
+				node := cc.Node
 				pi = append(pi, istioVersion.ProxyInfo{
 					ID:           node.Id,
 					IstioVersion: getIstioVersionFromXdsMetadata(node.Metadata),

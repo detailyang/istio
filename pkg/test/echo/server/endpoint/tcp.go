@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pires/go-proxyproto"
 
 	"istio.io/istio/pkg/test/echo"
 	"istio.io/istio/pkg/test/echo/common"
@@ -58,7 +59,20 @@ func (s *tcpInstance) Start(onReady OnReadyFunc) error {
 		if cerr != nil {
 			return fmt.Errorf("could not load TLS keys: %v", cerr)
 		}
-		config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		minVersion, minVerErr := common.ParseTLSVersion(s.TLSMinVersion)
+		if minVerErr != nil {
+			return fmt.Errorf("failed to parse min TLS version: %s", minVerErr)
+		}
+		curvePreferences, curPrefErr := common.ParseTLSCurves(s.TLSCurvePreferences)
+		if curPrefErr != nil {
+			return fmt.Errorf("failed to parse curve preferences: %s", curPrefErr)
+		}
+		// nolint: gosec // test only code, TLS version is configurable for testing
+		config := &tls.Config{
+			Certificates:     []tls.Certificate{cert},
+			MinVersion:       minVersion,
+			CurvePreferences: curvePreferences,
+		}
 		// Listen on the given port and update the port if it changed from what was passed in.
 		listener, port, err = listenOnAddressTLS(s.ListenerIP, s.Port.Port, config)
 		// Store the actual listening port back to the argument.
@@ -71,6 +85,10 @@ func (s *tcpInstance) Start(onReady OnReadyFunc) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	if s.Port.ProxyProtocol {
+		listener = &proxyproto.Listener{Listener: listener}
 	}
 
 	s.l = listener
@@ -119,6 +137,7 @@ func (s *tcpInstance) Start(onReady OnReadyFunc) error {
 
 // Handles incoming connection.
 func (s *tcpInstance) echo(id uuid.UUID, conn net.Conn) {
+	s.ReportRequest()
 	common.Metrics.TCPRequests.With(common.PortLabel.Value(strconv.Itoa(s.Port.Port))).Increment()
 
 	var err error
@@ -191,6 +210,9 @@ func (s *tcpInstance) getResponseFields(conn net.Conn) string {
 	echo.IPField.Write(out, ip)
 	echo.ProtocolField.Write(out, "TCP")
 
+	if p, ok := conn.(*proxyproto.Conn); ok && p.ProxyHeader() != nil {
+		echo.ProxyProtocolField.Write(out, fmt.Sprint(p.ProxyHeader().Version))
+	}
 	if hostname, err := os.Hostname(); err == nil {
 		echo.HostnameField.Write(out, hostname)
 	}

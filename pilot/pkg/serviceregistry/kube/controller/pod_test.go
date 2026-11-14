@@ -17,15 +17,16 @@ package controller
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	"istio.io/istio/pkg/config/labels"
@@ -95,7 +96,6 @@ func initTestEnv(t *testing.T, ki kubernetes.Interface, fx *xdsfake.Updater) {
 
 func cleanup(ki kubernetes.Interface) {
 	for _, n := range []string{"nsa", "nsb"} {
-		n := n
 		pods, err := ki.CoreV1().Pods(n).List(context.TODO(), metav1.ListOptions{})
 		if err == nil {
 			// Make sure the pods don't exist
@@ -106,45 +106,46 @@ func cleanup(ki kubernetes.Interface) {
 	}
 }
 
-func TestPodCache(t *testing.T) {
+func TestPodLabelUpdate(t *testing.T) {
 	c, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{
 		WatchedNamespaces: "nsa,nsb",
 	})
 
 	initTestEnv(t, c.client.Kube(), fx)
-
-	// Namespace must be lowercase (nsA doesn't work)
-	pods := []*v1.Pod{
-		generatePod("128.0.0.1", "cpod1", "nsa", "", "", map[string]string{"app": "test-app"}, map[string]string{}),
-		generatePod("128.0.0.2", "cpod2", "nsa", "", "", map[string]string{"app": "prod-app-1"}, map[string]string{}),
-		generatePod("128.0.0.3", "cpod3", "nsb", "", "", map[string]string{"app": "prod-app-2"}, map[string]string{}),
-	}
-
-	addPods(t, c, fx, pods...)
+	// Setup a service with 1 pod and endpointslices
+	createServiceWait(c, "ratings", "nsa", []string{"10.0.0.1"},
+		nil, nil, []int32{8080}, map[string]string{"app": "test"}, t)
+	pod := generatePod([]string{"128.0.0.1"}, "cpod1", "nsa", "", "", map[string]string{"app": "test", "foo": "bar"}, map[string]string{})
+	addPods(t, c, fx, pod)
+	createEndpoints(t, c, "rating", "nsa", []string{"tcp-port"}, []string{"128.0.0.1"}, []*v1.ObjectReference{
+		{
+			Kind:      "Pod",
+			Namespace: "nsa",
+			Name:      "cpod1",
+		},
+	}, nil)
+	fx.WaitOrFail(t, "eds")
+	fx.Clear()
 
 	// Verify podCache
-	wantLabels := map[string]labels.Instance{
-		"128.0.0.1": {"app": "test-app"},
-		"128.0.0.2": {"app": "prod-app-1"},
-		"128.0.0.3": {"app": "prod-app-2"},
-	}
-	for addr, wantTag := range wantLabels {
-		pod := c.pods.getPodsByIP(addr)
-		if pod == nil {
-			t.Error("Not found ", addr)
-			continue
-		}
-		if !reflect.DeepEqual(wantTag, labels.Instance(pod[0].Labels)) {
-			t.Errorf("Expected %v got %v", wantTag, labels.Instance(pod[0].Labels))
-		}
-	}
+	got := c.pods.getPodsByIP("128.0.0.1")
+	assert.Equal(t, got != nil, true)
+	assert.Equal(t, map[string]string{"app": "test", "foo": "bar"}, got[0].Labels)
 
-	// This pod exists, but should not be in the cache because it is in a
-	// namespace not watched by the controller.
-	assert.Equal(t, c.pods.getPodsByIP("128.0.0.4"), nil)
+	pod.Labels["foo"] = "not-bar"
+	clienttest.Wrap(t, c.podsClient).CreateOrUpdate(pod)
+	fx.StrictMatchOrFail(t, xdsfake.Event{
+		Type: "proxy",
+		ID:   "128.0.0.1",
+	},
+		xdsfake.Event{
+			Type: "xds",
+			ID:   "ratings.nsa.svc.company.com",
+		})
 
-	// This pod should not be in the cache because it never existed.
-	assert.Equal(t, c.pods.getPodsByIP("128.0.0.128"), nil)
+	got = c.pods.getPodsByIP("128.0.0.1")
+	assert.Equal(t, got != nil, true)
+	assert.Equal(t, map[string]string{"app": "test", "foo": "not-bar"}, got[0].Labels)
 }
 
 func TestHostNetworkPod(t *testing.T) {
@@ -156,7 +157,7 @@ func TestHostNetworkPod(t *testing.T) {
 	})
 	initTestEnv(t, c.client.Kube(), fx)
 	createPod := func(ip, name string) {
-		addPods(t, c, fx, generatePod(ip, name, "ns", "1", "", map[string]string{}, map[string]string{}))
+		addPods(t, c, fx, generatePod([]string{ip}, name, "ns", "1", "", map[string]string{}, map[string]string{}))
 	}
 
 	createPod("128.0.0.1", "pod1")
@@ -185,7 +186,7 @@ func TestIPReuse(t *testing.T) {
 	initTestEnv(t, c.client.Kube(), fx)
 
 	createPod := func(ip, name string) {
-		addPods(t, c, fx, generatePod(ip, name, "ns", "1", "", map[string]string{}, map[string]string{}))
+		addPods(t, c, fx, generatePod([]string{ip}, name, "ns", "1", "", map[string]string{}, map[string]string{}))
 	}
 
 	createPod("128.0.0.1", "pod")
@@ -234,7 +235,8 @@ func waitForNode(t test.Failer, c *FakeController, name string) {
 
 // Checks that events from the watcher create the proper internal structures
 func TestPodCacheEvents(t *testing.T) {
-	t.Parallel()
+	test.SetAtomicBoolForTest(t, features.DefaultSendUnhealthyEndpoints, false)
+	test.SetAtomicBoolForTest(t, features.GlobalSendUnhealthyEndpoints, false)
 	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{})
 
 	ns := "default"
@@ -256,7 +258,7 @@ func TestPodCacheEvents(t *testing.T) {
 	notReadyCondition := []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionFalse}}
 	readyCondition := []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
 
-	if err := f(nil,
+	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: notReadyCondition, PodIP: ip, Phase: v1.PodPending}},
 		&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: notReadyCondition, PodIP: ip, Phase: v1.PodPending}},
 		model.EventUpdate); err != nil {
 		t.Error(err)
@@ -265,7 +267,9 @@ func TestPodCacheEvents(t *testing.T) {
 		t.Errorf("notified workload handler %d times, want %d", handled, 0)
 	}
 
-	if err := f(nil, &v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodPending}}, model.EventUpdate); err != nil {
+	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: notReadyCondition, PodIP: ip, Phase: v1.PodPending}},
+		&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodPending}},
+		model.EventUpdate); err != nil {
 		t.Error(err)
 	}
 	if handled != 1 {
@@ -273,7 +277,7 @@ func TestPodCacheEvents(t *testing.T) {
 	}
 	assert.Equal(t, c.pods.getPodKeys(ip), []types.NamespacedName{{Name: "pod1", Namespace: "default"}})
 
-	if err := f(nil,
+	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodPending}},
 		&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
 		t.Error(err)
 	}
@@ -283,7 +287,8 @@ func TestPodCacheEvents(t *testing.T) {
 	assert.Equal(t, podCache.getPodKeys(ip), nil)
 
 	pod1.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-	if err := f(nil, &v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
+	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodFailed}},
+		&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
 		t.Error(err)
 	}
 	if handled != 2 {
@@ -291,7 +296,9 @@ func TestPodCacheEvents(t *testing.T) {
 	}
 
 	pod2 := metav1.ObjectMeta{Name: "pod2", Namespace: ns}
-	if err := f(nil, &v1.Pod{ObjectMeta: pod2, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodRunning}}, model.EventAdd); err != nil {
+	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodFailed}},
+		&v1.Pod{ObjectMeta: pod2, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodRunning}},
+		model.EventAdd); err != nil {
 		t.Error(err)
 	}
 	if handled != 3 {
@@ -307,9 +314,12 @@ func TestPodCacheEvents(t *testing.T) {
 	}
 	assert.Equal(t, sets.New(c.pods.getPodKeys(ip)...), sets.New(types.NamespacedName{Name: "pod2", Namespace: "default"}))
 
-	if err := f(nil, &v1.Pod{ObjectMeta: pod2, Spec: v1.PodSpec{
+	if err := f(&v1.Pod{ObjectMeta: pod2, Spec: v1.PodSpec{
 		RestartPolicy: v1.RestartPolicyOnFailure,
-	}, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
+	}, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodFailed}},
+		&v1.Pod{ObjectMeta: pod2, Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyOnFailure,
+		}, Status: v1.PodStatus{Conditions: readyCondition, PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
 		t.Error(err)
 	}
 	if handled != 4 {
@@ -323,5 +333,192 @@ func TestPodCacheEvents(t *testing.T) {
 	}
 	if handled != 4 {
 		t.Errorf("notified workload handler %d times, want %d", handled, 5)
+	}
+}
+
+func TestPodCacheUnhealthyWorkloadEvents(t *testing.T) {
+	for _, flags := range []struct {
+		auto   bool
+		global bool
+	}{
+		{auto: false, global: false},
+		{auto: true, global: false},
+		{auto: false, global: true},
+		{auto: true, global: true},
+	} {
+		t.Run(fmt.Sprintf("auto=%v/global=%v", flags.auto, flags.global), func(t *testing.T) {
+			test.SetAtomicBoolForTest(t, features.DefaultSendUnhealthyEndpoints, flags.auto)
+			test.SetAtomicBoolForTest(t, features.GlobalSendUnhealthyEndpoints, flags.global)
+			c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{})
+			sendUnhealthy := flags.auto || flags.global
+			type workloadEvent struct {
+				Event  model.Event
+				Health model.HealthStatus
+			}
+			var events []workloadEvent
+			c.AppendWorkloadHandler(func(wi *model.WorkloadInstance, event model.Event) {
+				assert.Equal(t, wi.Endpoint.SendUnhealthyEndpoints, sendUnhealthy)
+				events = append(events, workloadEvent{Event: event, Health: wi.Endpoint.HealthStatus})
+			})
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"},
+				Status: v1.PodStatus{
+					Phase:      v1.PodRunning,
+					Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionFalse}},
+				},
+			}
+			var want []workloadEvent
+			apply := func(next *v1.Pod, event model.Event, registered bool) {
+				t.Helper()
+				assert.NoError(t, c.pods.onEvent(pod, next, event))
+				pod = next
+				assert.Equal(t, events, want)
+				assert.Equal(t, len(c.pods.getPodKeys("172.0.3.35")) > 0, registered)
+			}
+			// Even with unhealthy endpoints enabled, pods need an IP.
+			apply(pod, model.EventAdd, false)
+			pod.Status.PodIP = "172.0.3.35"
+			if sendUnhealthy {
+				want = append(want, workloadEvent{model.EventAdd, model.UnHealthy})
+			}
+			apply(pod, model.EventAdd, sendUnhealthy)
+
+			ready := pod.DeepCopy()
+			ready.Status.Conditions[0].Status = v1.ConditionTrue
+			want = append(want, workloadEvent{model.EventUpdate, model.Healthy})
+			apply(ready, model.EventUpdate, true)
+
+			unready := pod.DeepCopy()
+			unready.Status.Conditions[0].Status = v1.ConditionFalse
+			event := model.EventDelete
+			if sendUnhealthy {
+				event = model.EventUpdate
+			}
+			want = append(want, workloadEvent{event, model.UnHealthy})
+			apply(unready, model.EventUpdate, sendUnhealthy)
+
+			ready = pod.DeepCopy()
+			ready.Status.Conditions[0].Status = v1.ConditionTrue
+			want = append(want, workloadEvent{model.EventUpdate, model.Healthy})
+			apply(ready, model.EventUpdate, true)
+
+			terminating := pod.DeepCopy()
+			terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			want = append(want, workloadEvent{model.EventDelete, model.Healthy})
+			apply(terminating, model.EventUpdate, false)
+			// The final delete must not notify handlers twice.
+			apply(pod, model.EventDelete, false)
+
+			// An eviction can remove the IP at the same time the pod becomes terminal.
+			active := ready.DeepCopy()
+			want = append(want, workloadEvent{model.EventAdd, model.Healthy})
+			apply(active, model.EventAdd, true)
+			failed := pod.DeepCopy()
+			failed.Status.Phase = v1.PodFailed
+			failed.Status.PodIP = ""
+			want = append(want, workloadEvent{model.EventDelete, model.Healthy})
+			apply(failed, model.EventUpdate, false)
+		})
+	}
+}
+
+func TestPodUpdates(t *testing.T) {
+	c, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{
+		WatchedNamespaces: "nsa,nsb",
+	})
+
+	initTestEnv(t, c.client.Kube(), fx)
+
+	// Namespace must be lowercase (nsA doesn't work)
+	pods := []*v1.Pod{
+		generatePod([]string{"128.0.0.1"}, "cpod1", "nsa", "", "", map[string]string{"app": "test-app"}, map[string]string{}),
+		generatePod([]string{"128.0.0.2"}, "cpod2", "nsa", "", "", map[string]string{"app": "prod-app-1"}, map[string]string{}),
+		generatePod([]string{"128.0.0.3"}, "cpod3", "nsb", "", "", map[string]string{"app": "prod-app-2"}, map[string]string{}),
+	}
+
+	addPods(t, c, fx, pods...)
+
+	// Verify podCache
+	wantLabels := map[string]labels.Instance{
+		"128.0.0.1": {"app": "test-app"},
+		"128.0.0.2": {"app": "prod-app-1"},
+		"128.0.0.3": {"app": "prod-app-2"},
+	}
+	for addr, wantTag := range wantLabels {
+		pod := c.pods.getPodsByIP(addr)
+		if pod == nil {
+			t.Error("Not found ", addr)
+			continue
+		}
+		if !apiequality.Semantic.DeepEqual(wantTag, labels.Instance(pod[0].Labels)) {
+			t.Errorf("Expected %v got %v", wantTag, labels.Instance(pod[0].Labels))
+		}
+	}
+
+	// This pod exists, but should not be in the cache because it is in a
+	// namespace not watched by the controller.
+	assert.Equal(t, c.pods.getPodsByIP("128.0.0.4"), nil)
+
+	// This pod should not be in the cache because it never existed.
+	assert.Equal(t, c.pods.getPodsByIP("128.0.0.128"), nil)
+}
+
+func TestGetPortMapNativeSidecar(t *testing.T) {
+	nativeSidecarRestartPolicy := v1.ContainerRestartPolicyAlways
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{
+				{
+					Name: "regular-init",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          "init-port",
+							ContainerPort: 9090,
+							Protocol:      v1.ProtocolTCP,
+						},
+					},
+				},
+				{
+					Name:          "native-sidecar",
+					RestartPolicy: &nativeSidecarRestartPolicy,
+					Ports: []v1.ContainerPort{
+						{
+							Name:          "grpc",
+							ContainerPort: 8080,
+							Protocol:      v1.ProtocolTCP,
+						},
+					},
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name: "main",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          "http",
+							ContainerPort: 80,
+							Protocol:      v1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pmap := getPortMap(pod)
+
+	// Regular container port should be included.
+	if port, ok := pmap["http"]; !ok || port != 80 {
+		t.Errorf("expected http port 80, got %d (found=%v)", port, ok)
+	}
+
+	// Native sidecar init container port should be included.
+	if port, ok := pmap["grpc"]; !ok || port != 8080 {
+		t.Errorf("expected grpc port 8080, got %d (found=%v)", port, ok)
+	}
+
+	// Regular init container port should NOT be included.
+	if _, ok := pmap["init-port"]; ok {
+		t.Error("regular init container port should not be in port map")
 	}
 }

@@ -16,34 +16,31 @@ package gateway
 
 import (
 	"testing"
-	"time"
 
-	. "github.com/onsi/gomega"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
-	k8s "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	k8s "sigs.k8s.io/gateway-api/apis/v1"
 
+	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/config/memory"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
-	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 var (
 	gatewayClassSpec = &k8s.GatewayClassSpec{
-		ControllerName: constants.ManagedGatewayController,
+		ControllerName: k8s.GatewayController(features.ManagedGatewayController),
 	}
 	gatewaySpec = &k8s.GatewaySpec{
 		GatewayClassName: "gwclass",
@@ -52,7 +49,7 @@ var (
 				Name:          "default",
 				Port:          9009,
 				Protocol:      "HTTP",
-				AllowedRoutes: &k8s.AllowedRoutes{Namespaces: &k8s.RouteNamespaces{From: func() *k8s.FromNamespaces { x := k8sv1.NamespacesFromAll; return &x }()}},
+				AllowedRoutes: &k8s.AllowedRoutes{Namespaces: &k8s.RouteNamespaces{From: func() *k8s.FromNamespaces { x := k8s.NamespacesFromAll; return &x }()}},
 			},
 		},
 	}
@@ -81,124 +78,161 @@ var AlwaysReady = func(class schema.GroupVersionResource, stop <-chan struct{}) 
 	return true
 }
 
+func setupController(t *testing.T, objs ...runtime.Object) *Controller {
+	return setupControllerWithRevision(t, "", objs...)
+}
+
+func setupControllerWithRevision(t *testing.T, revision string, objs ...runtime.Object) *Controller {
+	kc := kube.NewFakeClient(objs...)
+	setupClientCRDs(t, kc)
+	stop := test.NewStop(t)
+	controller := NewController(
+		kc,
+		AlwaysReady,
+		controller.Options{KrtDebugger: krt.GlobalDebugHandler, Revision: revision},
+		nil)
+	kc.RunAndWait(stop)
+	go controller.Run(stop)
+	cg := core.NewConfigGenTest(t, core.TestOptions{})
+	controller.Reconcile(cg.PushContext())
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+
+	return controller
+}
+
 func TestListInvalidGroupVersionKind(t *testing.T) {
-	g := NewWithT(t)
-	clientSet := kube.NewFakeClient()
-	clientSet.RunAndWait(test.NewStop(t))
-	store := memory.NewController(memory.Make(collections.All))
-	controller := NewController(clientSet, store, AlwaysReady, nil, controller.Options{})
+	controller := setupController(t)
 
 	typ := config.GroupVersionKind{Kind: "wrong-kind"}
 	c := controller.List(typ, "ns1")
-	g.Expect(c).To(HaveLen(0))
+	assert.Equal(t, len(c), 0)
 }
 
 func TestListGatewayResourceType(t *testing.T) {
-	g := NewWithT(t)
-
-	clientSet := kube.NewFakeClient()
-	clientSet.RunAndWait(test.NewStop(t))
-	store := memory.NewController(memory.Make(collections.All))
-	controller := NewController(clientSet, store, AlwaysReady, nil, controller.Options{})
-
-	store.Create(config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.GatewayClass,
-			Name:             "gwclass",
-			Namespace:        "ns1",
+	controller := setupController(t,
+		&k8s.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "gwclass",
+			},
+			Spec: *gatewayClassSpec,
 		},
-		Spec: gatewayClassSpec,
-	})
-	if _, err := store.Create(config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.KubernetesGateway,
-			Name:             "gwspec",
-			Namespace:        "ns1",
+		&k8s.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "gwspec",
+				Namespace: "ns1",
+			},
+			Spec: *gatewaySpec,
 		},
-		Spec: gatewaySpec,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	store.Create(config.Config{
-		Meta: config.Meta{
-			GroupVersionKind: gvk.HTTPRoute,
-			Name:             "http-route",
-			Namespace:        "ns1",
-		},
-		Spec: httpRouteSpec,
-	})
+		&k8s.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "http-route",
+				Namespace: "ns1",
+			},
+			Spec: *httpRouteSpec,
+		})
 
-	cg := v1alpha3.NewConfigGenTest(t, v1alpha3.TestOptions{})
-	g.Expect(controller.Reconcile(cg.PushContext())).ToNot(HaveOccurred())
+	dumpOnFailure(t, krt.GlobalDebugHandler)
 	cfg := controller.List(gvk.Gateway, "ns1")
-	g.Expect(cfg).To(HaveLen(1))
+	assert.Equal(t, len(cfg), 1)
 	for _, c := range cfg {
-		g.Expect(c.GroupVersionKind).To(Equal(gvk.Gateway))
-		g.Expect(c.Name).To(Equal("gwspec" + "-" + constants.KubernetesGatewayName + "-default"))
-		g.Expect(c.Namespace).To(Equal("ns1"))
-		g.Expect(c.Spec).To(Equal(expectedgw))
+		assert.Equal(t, c.GroupVersionKind, gvk.Gateway)
+		assert.Equal(t, c.Name, "gwspec"+"~"+constants.KubernetesGatewayName+"~default")
+		assert.Equal(t, c.Namespace, "ns1")
+		assert.Equal(t, c.Spec, any(expectedgw))
 	}
 }
 
-func TestNamespaceEvent(t *testing.T) {
-	clientSet := kube.NewFakeClient()
-	store := memory.NewController(memory.Make(collections.All))
-	c := NewController(clientSet, store, AlwaysReady, nil, controller.Options{})
-	s := xdsfake.NewFakeXDS()
+// TestListGatewayResourceAcrossRevisions verifies that a Gateway whose istio.io/rev label
+// points to a different revision is still emitted as config by this control plane. Without
+// this behavior, changing the istio.io/rev label on a live Gateway causes the previously
+// owning control plane to push empty xDS config to pods still running on the old revision,
+// breaking traffic for ~30s during a canary upgrade. See issue #59959.
+//
+// Status writes for non-owning revisions are filtered separately in
+// pilot/pkg/status/collections.go (RegisterStatus), and Deployment management is filtered in
+// pilot/pkg/config/kube/gatewaycommon/deploymentcontroller.go, so cross-revision config
+// emission does not cause status flapping or duplicate Deployment management.
+func TestListGatewayResourceAcrossRevisions(t *testing.T) {
+	controller := setupControllerWithRevision(t, "stable",
+		&k8s.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "gwclass",
+			},
+			Spec: *gatewayClassSpec,
+		},
+		// Gateway labeled for a *different* revision than the one we're running.
+		// Pre-fix, this Gateway would be filtered out by tagWatcher.IsMine in
+		// gateway_collection.go and produce no config, leading to an empty xDS push.
+		&k8s.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "canary-gw",
+				Namespace: "ns1",
+				Labels: map[string]string{
+					label.IoIstioRev.Name: "canary",
+				},
+			},
+			Spec: *gatewaySpec,
+		},
+	)
 
-	c.RegisterEventHandler(gvk.Namespace, func(_, cfg config.Config, _ model.Event) {
-		s.ConfigUpdate(&model.PushRequest{
-			Full:   true,
-			Reason: model.NewReasonStats(model.NamespaceUpdate),
+	dumpOnFailure(t, krt.GlobalDebugHandler)
+	cfg := controller.List(gvk.Gateway, "ns1")
+	assert.Equal(t, len(cfg), 1)
+	got := cfg[0]
+	assert.Equal(t, got.GroupVersionKind, gvk.Gateway)
+	assert.Equal(t, got.Name, "canary-gw"+"~"+constants.KubernetesGatewayName+"~default")
+	assert.Equal(t, got.Namespace, "ns1")
+	assert.Equal(t, got.Spec, any(expectedgw))
+}
+
+// TestHTTPRouteAndGRPCRouteWithSameName verifies that an HTTPRoute and a GRPCRoute that share a
+// name and namespace are both programmed when they attach to the same Gateway and hostname, even
+// when the GRPCRoute is created after the HTTPRoute. See https://github.com/istio/istio/issues/61191.
+func TestHTTPRouteAndGRPCRouteWithSameName(t *testing.T) {
+	controller := setupController(t,
+		&k8s.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "gwclass"},
+			Spec:       *gatewayClassSpec,
+		},
+		&k8s.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Name: "gwspec", Namespace: "ns1"},
+			Spec:       *gatewaySpec,
+		},
+		&k8s.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns1"},
+			Spec: k8s.HTTPRouteSpec{
+				CommonRouteSpec: k8s.CommonRouteSpec{ParentRefs: []k8s.ParentReference{{Name: "gwspec"}}},
+				Hostnames:       []k8s.Hostname{"test.cluster.local"},
+				Rules: []k8s.HTTPRouteRule{{
+					Matches: []k8s.HTTPRouteMatch{{
+						Path: &k8s.HTTPPathMatch{Type: ptr.Of(k8s.PathMatchPathPrefix), Value: ptr.Of("/http")},
+					}},
+				}},
+			},
 		})
+	dumpOnFailure(t, krt.GlobalDebugHandler)
+
+	routeCount := func() int {
+		total := 0
+		for _, c := range controller.List(gvk.VirtualService, "ns1") {
+			total += len(c.Spec.(*networking.VirtualService).Http)
+		}
+		return total
+	}
+	assert.EventuallyEqual(t, routeCount, 1)
+
+	// Create a GRPCRoute with the same name and namespace after the HTTPRoute has been processed.
+	clienttest.NewWriter[*k8s.GRPCRoute](t, controller.client).Create(&k8s.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns1"},
+		Spec: k8s.GRPCRouteSpec{
+			CommonRouteSpec: k8s.CommonRouteSpec{ParentRefs: []k8s.ParentReference{{Name: "gwspec"}}},
+			Hostnames:       []k8s.Hostname{"test.cluster.local"},
+			Rules: []k8s.GRPCRouteRule{{
+				Matches: []k8s.GRPCRouteMatch{{
+					Method: &k8s.GRPCMethodMatch{Service: ptr.Of("grpc.health.v1.Health"), Method: ptr.Of("Check")},
+				}},
+			}},
+		},
 	})
-
-	stop := test.NewStop(t)
-	c.Run(stop)
-	kube.WaitForCacheSync("test", stop, c.HasSynced)
-	c.state.ReferencedNamespaceKeys = sets.String{"allowed": struct{}{}}
-
-	ns1 := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name: "ns1",
-		Labels: map[string]string{
-			"foo": "bar",
-		},
-	}}
-	ns2 := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name: "ns2",
-		Labels: map[string]string{
-			"allowed": "true",
-		},
-	}}
-	ns := clienttest.Wrap(t, c.namespaces)
-
-	ns.Create(ns1)
-	s.AssertEmpty(t, time.Millisecond*10)
-
-	ns.Create(ns2)
-	s.AssertEmpty(t, time.Millisecond*10)
-
-	ns1.Annotations = map[string]string{"foo": "bar"}
-	ns.Update(ns1)
-	s.AssertEmpty(t, time.Millisecond*10)
-
-	ns2.Annotations = map[string]string{"foo": "bar"}
-	ns.Update(ns2)
-	s.AssertEmpty(t, time.Millisecond*10)
-
-	ns1.Labels["bar"] = "foo"
-	ns.Update(ns1)
-	s.AssertEmpty(t, time.Millisecond*10)
-
-	ns2.Labels["foo"] = "bar"
-	ns.Update(ns2)
-	s.WaitOrFail(t, "xds full")
-
-	ns1.Labels["allowed"] = "true"
-	ns.Update(ns1)
-	s.WaitOrFail(t, "xds full")
-
-	ns2.Labels["allowed"] = "false"
-	ns.Update(ns2)
-	s.WaitOrFail(t, "xds full")
+	assert.EventuallyEqual(t, routeCount, 2)
 }

@@ -90,7 +90,7 @@ func (n *kubeNamespace) Prefix() string {
 }
 
 func (n *kubeNamespace) Labels() (map[string]string, error) {
-	perCluster := make([]map[string]string, len(n.ctx.AllClusters().Kube()))
+	perCluster := make([]map[string]string, len(n.ctx.AllClusters()))
 	if err := n.forEachCluster(func(i int, c cluster.Cluster) error {
 		ns, err := c.Kube().CoreV1().Namespaces().Get(context.TODO(), n.Name(), metav1.GetOptions{})
 		if err != nil {
@@ -134,7 +134,7 @@ func (n *kubeNamespace) Close() error {
 	// Perform the cleanup across all clusters concurrently.
 	var err error
 	if len(cleanupFuncs) > 0 {
-		scopes.Framework.Debugf("%s deleting namespace", n.id)
+		scopes.Framework.Debugf("%s deleting namespace %v", n.id, n.name)
 
 		g := multierror.Group{}
 		for _, cleanup := range cleanupFuncs {
@@ -233,9 +233,11 @@ func (n *kubeNamespace) createInCluster(c cluster.Cluster, cfg Config) error {
 		return err
 	}
 
-	n.addCleanup(func() error {
-		return c.Kube().CoreV1().Namespaces().Delete(context.TODO(), n.name, kube2.DeleteOptionsForeground())
-	})
+	if !cfg.SkipCleanup {
+		n.addCleanup(func() error {
+			return c.Kube().CoreV1().Namespaces().Delete(context.TODO(), n.name, kube2.DeleteOptionsForeground())
+		})
+	}
 
 	s := n.ctx.Settings()
 	if s.Image.PullSecret != "" {
@@ -259,8 +261,7 @@ func (n *kubeNamespace) createInCluster(c cluster.Cluster, cfg Config) error {
 
 func (n *kubeNamespace) forEachCluster(fn func(i int, c cluster.Cluster) error) error {
 	errG := multierror.Group{}
-	for i, c := range n.ctx.AllClusters().Kube() {
-		i, c := i, c
+	for i, c := range n.ctx.AllClusters() {
 		errG.Go(func() error {
 			return fn(i, c)
 		})
@@ -307,7 +308,10 @@ func createNamespaceLabels(ctx resource.Context, cfg Config) map[string]string {
 		if !ctx.Settings().Compatibility {
 			if cfg.Revision != "" {
 				l[label.IoIstioRev.Name] = cfg.Revision
-			} else {
+			} else if !ctx.Settings().GatewayAPIOnly {
+				// GatewayAPIOnly mode runs istiod without the sidecar-injector webhook,
+				// so the istio-injection label has no effect. Skip it to make intent clear
+				// and to avoid confusion when reading the namespace state.
 				l["istio-injection"] = "enabled"
 			}
 		}
@@ -315,6 +319,10 @@ func createNamespaceLabels(ctx resource.Context, cfg Config) map[string]string {
 		// if we're running compatibility tests, disable injection in the namespace
 		// explicitly so that object selectors are ignored
 		if ctx.Settings().Compatibility {
+			l["istio-injection"] = "disabled"
+		}
+		if cfg.Revision != "" {
+			l[label.IoIstioRev.Name] = cfg.Revision
 			l["istio-injection"] = "disabled"
 		}
 	}

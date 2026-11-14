@@ -1,4 +1,4 @@
-FROM ubuntu:jammy
+FROM ubuntu:noble
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -12,10 +12,11 @@ RUN apt-get update && \
   ca-certificates \
   curl \
   iptables \
+  nftables \
   iproute2 \
   iputils-ping \
   knot-dnsutils \
-  netcat \
+  netcat-openbsd \
   tcpdump \
   conntrack \
   bsdmainutils \
@@ -26,8 +27,8 @@ RUN apt-get update && \
   && apt-get upgrade -y \
   && apt-get clean \
   && rm -rf  /var/log/*log /var/lib/apt/lists/* /var/log/apt/* /var/lib/dpkg/*-old /var/cache/debconf/*-old \
-  && update-alternatives --set iptables /usr/sbin/iptables-legacy \
-  && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+  && update-alternatives --set iptables /usr/sbin/iptables-nft \
+  && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
 
 # Sudoers used to allow tcpdump and other debug utilities.
 RUN useradd -m --uid 1337 istio-proxy && \

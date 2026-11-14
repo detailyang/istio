@@ -19,11 +19,12 @@ import (
 	"testing"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 
-	istio_route "istio.io/istio/pilot/pkg/networking/core/v1alpha3/route"
+	istio_route "istio.io/istio/pilot/pkg/networking/core/route"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/util/sets"
 )
@@ -31,7 +32,13 @@ import (
 func ValidateListeners(t testing.TB, ls []*listener.Listener) {
 	t.Helper()
 	found := sets.New[string]()
+	foundAddresses := sets.New[string]()
 	for _, l := range ls {
+		for _, addr := range ExtractListenerAddresses(l) {
+			if foundAddresses.InsertContains(addr) {
+				t.Errorf("found duplicate address %s", addr)
+			}
+		}
 		if found.InsertContains(l.Name) {
 			t.Errorf("duplicate listener name %v", l.Name)
 		}
@@ -66,6 +73,10 @@ func validateInboundListener(t testing.TB, l *listener.Listener) {
 		// Not an inbound port
 		return
 	}
+	if l.GetTrafficDirection() != core.TrafficDirection_INBOUND {
+		// Not an inbound listener
+		return
+	}
 	for i, fc := range l.GetFilterChains() {
 		if fc.FilterChainMatch == nil {
 			t.Errorf("nil filter chain %d", i)
@@ -81,6 +92,20 @@ func validateInboundListener(t testing.TB, l *listener.Listener) {
 
 func validateFilterChainMatch(t testing.TB, l *listener.Listener) {
 	t.Helper()
+
+	// With a filter chain matcher, Envoy selects chains by name and requires the names to be unique.
+	if l.GetFilterChainMatcher() != nil {
+		names := sets.New[string]()
+		for _, fc := range l.FilterChains {
+			if fc.GetFilterChainMatch() != nil {
+				t.Errorf("filter chain %q has a filter chain match, which a filter chain matcher ignores", fc.Name)
+			}
+			if names.InsertContains(fc.Name) {
+				t.Errorf("duplicate filter chain name %q", fc.Name)
+			}
+		}
+		return
+	}
 
 	// Check for duplicate filter chains, to avoid "multiple filter chains with the same matching rules are defined" error
 	check := map[string]int{}
@@ -154,10 +179,18 @@ func validateListenerTLS(t testing.TB, l *listener.Listener) {
 // matches logic in https://github.com/envoyproxy/envoy/blob/22683a0a24ffbb0cdeb4111eec5ec90246bec9cb/source/server/listener_impl.cc#L41
 func validateInspector(t testing.TB, l *listener.Listener) {
 	t.Helper()
+	hasTLSInspector := false
+	hasHTTPInspector := false
 	for _, lf := range l.ListenerFilters {
 		if lf.Name == xdsfilters.TLSInspector.Name {
-			return
+			hasTLSInspector = true
 		}
+		if lf.Name == xdsfilters.HTTPInspector.Name {
+			hasHTTPInspector = true
+		}
+	}
+	if hasTLSInspector {
+		return
 	}
 	for _, fc := range l.FilterChains {
 		m := fc.FilterChainMatch
@@ -170,10 +203,8 @@ func validateInspector(t testing.TB, l *listener.Listener) {
 		if m.TransportProtocol == "" && len(m.ServerNames) > 0 {
 			t.Errorf("server names set, but missing tls inspector: %v", Dump(t, l))
 		}
-		// This is a bit suspect; I suspect this could be done with just http inspector without tls inspector,
-		// but this mirrors Envoy validation logic
-		if m.TransportProtocol == "" && len(m.ApplicationProtocols) > 0 {
-			t.Errorf("application protocol set, but missing tls inspector: %v", Dump(t, l))
+		if m.TransportProtocol == "" && len(m.ApplicationProtocols) > 0 && !hasHTTPInspector {
+			t.Errorf("application protocol set, but missing tls inspector or http inspector: %v", Dump(t, l))
 		}
 	}
 }

@@ -17,7 +17,7 @@ package xds
 import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/host"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/util/sets"
 )
@@ -30,26 +30,56 @@ var UnAffectedConfigKinds = map[model.NodeType]sets.Set[kind.Kind]{
 	model.SidecarProxy: sets.New(kind.Gateway),
 }
 
-// ConfigAffectsProxy checks if a pushEv will affect a specified proxy. That means whether the push will be performed
-// towards the proxy.
-func ConfigAffectsProxy(req *model.PushRequest, proxy *model.Proxy) bool {
-	// Empty changes means "all" to get a backward compatibility.
+// filterRelevantUpdates filters PushRequest.ConfigsUpdated so that only configs relevant to the proxy are included,
+// returning the original PushRequest if no filtering was needed or a new PushRequest if some config filtering was performed.
+// The returned PushRequest should not be modified since it might be the original global PushRequest.
+func filterRelevantUpdates(proxy *model.Proxy, req *model.PushRequest) *model.PushRequest {
 	if len(req.ConfigsUpdated) == 0 {
-		return true
-	}
-	if proxy.IsWaypointProxy() || proxy.IsZTunnel() {
-		// Optimizations do not apply since scoping uses different mechanism
-		// TODO: implement ambient aware scoping
-		return true
+		return req
 	}
 
+	relevantUpdates := make(sets.Set[model.ConfigKey])
+	changed := false
 	for config := range req.ConfigsUpdated {
 		if proxyDependentOnConfig(proxy, config, req.Push) {
-			return true
+			relevantUpdates.Insert(config)
+			continue
+		}
+		// if proxy enables self-discovery, we need to always include LocalService related configs.
+		// we can avoid this elsewhere to avoid unnecessary proxy pushes.
+		if proxy.Metadata.EnableSelfDiscovery && (config.Kind == kind.ServiceEntry || config.Kind == kind.Endpoints) {
+			if (config.Name == proxy.PrevLocalService.Name && config.Namespace == proxy.PrevLocalService.Namespace) ||
+				(config.Name == proxy.LocalService.Name && config.Namespace == proxy.LocalService.Namespace) {
+				relevantUpdates.Insert(config)
+				continue
+			}
+		}
+
+		// we have filtered out a config
+		changed = true
+	}
+
+	// If the proxy's service updated, need push for it.
+	if len(proxy.ServiceTargets) > 0 && req.ConfigsUpdated != nil {
+		for _, svc := range proxy.ServiceTargets {
+			key := model.ConfigKey{
+				Kind:      kind.ServiceEntry,
+				Name:      string(svc.Service.Hostname),
+				Namespace: svc.Service.Attributes.Namespace,
+			}
+			if req.ConfigsUpdated.Contains(key) {
+				relevantUpdates.Insert(key)
+			}
 		}
 	}
 
-	return false
+	if changed {
+		newPushRequest := *req
+		newPushRequest.ConfigsUpdated = relevantUpdates
+		return &newPushRequest
+	}
+
+	return req
 }
 
 func proxyDependentOnConfig(proxy *model.Proxy, config model.ConfigKey, push *model.PushContext) bool {
@@ -57,31 +87,29 @@ func proxyDependentOnConfig(proxy *model.Proxy, config model.ConfigKey, push *mo
 	if UnAffectedConfigKinds[proxy.Type].Contains(config.Kind) {
 		return false
 	}
+	// Keep Address config keys only for AddressType subscribers. WorkloadType subscribers
+	// are selected in DefaultProxyNeedsPush via AddressesUpdated without retaining config keys.
+	// Other sidecar and gateway dependencies are surfaced as ServiceEntry or Endpoints updates.
+	if features.ScopedAddressPushes && config.Kind == kind.Address {
+		return proxy.GetWatchedResource(v3.AddressType) != nil
+	}
 	// Detailed config dependencies check.
 	switch proxy.Type {
-	case model.SidecarProxy:
-		if proxy.SidecarScope.DependsOnConfig(config) {
-			return true
-		} else if proxy.PrevSidecarScope != nil && proxy.PrevSidecarScope.DependsOnConfig(config) {
-			return true
-		}
 	case model.Router:
-		if config.Kind == kind.ServiceEntry {
-			// If config is ServiceEntry, name of the config is service's FQDN
-			if features.FilterGatewayClusterConfig && !push.ServiceAttachedToGateway(config.Name, proxy) {
-				return false
-			}
-
-			hostname := host.Name(config.Name)
-			// gateways have default sidecar scopes
-			if proxy.SidecarScope.GetService(hostname) == nil &&
-				proxy.PrevSidecarScope.GetService(hostname) == nil {
-				// skip the push when the service is not visible to the gateway,
-				// and the old service is not visible/existent
-				return false
-			}
+		// With filtered gateway clusters, only services referenced by the proxy's gateways are pushed,
+		// whatever their visibility. The ServiceEntry key names the service's FQDN.
+		if config.Kind == kind.ServiceEntry && features.FilterGatewayClusterConfig &&
+			!push.ServiceAttachedToGateway(config.Name, config.Namespace, proxy) {
+			return false
 		}
-		return true
+		// fallthrough to the standard sidecar proxy dependency check.
+		fallthrough
+	case model.SidecarProxy:
+		if proxy.SidecarScope.DependsOnConfig(config, push.Mesh.RootNamespace) {
+			return true
+		} else if proxy.PrevSidecarScope != nil && proxy.PrevSidecarScope.DependsOnConfig(config, push.Mesh.RootNamespace) {
+			return true
+		}
 	default:
 		// TODO We'll add the check for other proxy types later.
 		return true
@@ -89,24 +117,20 @@ func proxyDependentOnConfig(proxy *model.Proxy, config model.ConfigKey, push *mo
 	return false
 }
 
-// DefaultProxyNeedsPush check if a proxy needs push for this push event.
-func DefaultProxyNeedsPush(proxy *model.Proxy, req *model.PushRequest) bool {
-	if ConfigAffectsProxy(req, proxy) {
-		return true
+// DefaultProxyNeedsPush check if a proxy needs push for this push event and returns a new PushRequest in the case
+// it needs to filter relevant updates for this proxy.
+func DefaultProxyNeedsPush(proxy *model.Proxy, req *model.PushRequest) (*model.PushRequest, bool) {
+	if req.Forced {
+		return req, true
 	}
 
-	// If the proxy's service updated, need push for it.
-	if len(proxy.ServiceTargets) > 0 && req.ConfigsUpdated != nil {
-		for _, svc := range proxy.ServiceTargets {
-			if _, ok := req.ConfigsUpdated[model.ConfigKey{
-				Kind:      kind.ServiceEntry,
-				Name:      string(svc.Service.Hostname),
-				Namespace: svc.Service.Attributes.Namespace,
-			}]; ok {
-				return true
-			}
-		}
+	if proxy.IsWaypointProxy() || proxy.IsZTunnel() || proxy.IsAgentgateway() {
+		// Optimizations do not apply since scoping uses different mechanism
+		// TODO: implement ambient aware scoping
+		return req, true
 	}
 
-	return false
+	req = filterRelevantUpdates(proxy, req)
+	workloadsUpdated := len(req.AddressesUpdated) > 0 && proxy.GetWatchedResource(v3.WorkloadType) != nil
+	return req, workloadsUpdated || len(req.ConfigsUpdated) > 0
 }

@@ -21,7 +21,6 @@ import (
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
 	dnsProto "istio.io/istio/pkg/dns/proto"
 )
 
@@ -43,6 +42,11 @@ type ConfigGenerator interface {
 	// BuildHTTPRoutes returns the list of HTTP routes for the given proxy. This is the RDS output
 	BuildHTTPRoutes(node *model.Proxy, req *model.PushRequest, routeNames []string) ([]*discovery.Resource, model.XdsLogDetails)
 
+	// BuildDeltaHTTPRoutes returns both a list of resources that need to be pushed for a given proxy and a list of
+	// resources that have been deleted and should be removed from a given proxy. This is Delta RDS output.
+	BuildDeltaHTTPRoutes(node *model.Proxy, req *model.PushRequest,
+		watched *model.WatchedResource) ([]*discovery.Resource, []string, model.XdsLogDetails, bool)
+
 	// BuildNameTable returns list of hostnames and the associated IPs
 	BuildNameTable(node *model.Proxy, push *model.PushContext) *dnsProto.NameTable
 
@@ -54,7 +58,17 @@ type ConfigGenerator interface {
 	MeshConfigChanged(mesh *meshconfig.MeshConfig)
 }
 
-// NewConfigGenerator creates a new instance of the dataplane configuration generator
-func NewConfigGenerator(cache model.XdsCache) ConfigGenerator {
-	return v1alpha3.NewConfigGenerator(cache)
+type ConfigGeneratorImpl struct {
+	Cache model.XdsCache
+}
+
+func NewConfigGenerator(cache model.XdsCache) *ConfigGeneratorImpl {
+	return &ConfigGeneratorImpl{
+		Cache: cache,
+	}
+}
+
+// MeshConfigChanged is called when mesh config is changed.
+func (configgen *ConfigGeneratorImpl) MeshConfigChanged(_ *meshconfig.MeshConfig) {
+	accessLogBuilder.reset()
 }

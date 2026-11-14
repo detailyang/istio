@@ -141,10 +141,20 @@ func (s Schemas) FindByGroupVersionKind(gvk config.GroupVersionKind) (resource.S
 // if not found, it will search for version aliases for the schema to see if there is a match.
 func (s Schemas) FindByGroupVersionAliasesKind(gvk config.GroupVersionKind) (resource.Schema, bool) {
 	for _, rs := range s.byAddOrder {
-		for _, va := range rs.GroupVersionAliasKinds() {
-			if va == gvk {
-				return rs, true
-			}
+		if slices.Contains(rs.GroupVersionAliasKinds(), gvk) {
+			return rs, true
+		}
+	}
+	return nil, false
+}
+
+// FindByGroupKind searches and returns the first schema with the given GVK, ignoring versions.
+// Generally it's a good idea to use FindByGroupVersionAliasesKind, which validates the version as well.
+// FindByGroupKind provides future proofing against versions we don't yet know about; given we don't know them, its risky.
+func (s Schemas) FindByGroupKind(gvk config.GroupVersionKind) (resource.Schema, bool) {
+	for _, rs := range s.byAddOrder {
+		if rs.Group() == gvk.Group && rs.Kind() == gvk.Kind {
+			return rs, true
 		}
 	}
 	return nil, false
@@ -226,7 +236,7 @@ func (s Schemas) Validate() (err error) {
 	for _, c := range s.byAddOrder {
 		err = multierror.Append(err, c.Validate()).ErrorOrNil()
 	}
-	return
+	return err
 }
 
 func (s Schemas) Equal(o Schemas) bool {

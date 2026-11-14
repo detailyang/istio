@@ -1,5 +1,4 @@
 //go:build integfuzz
-// +build integfuzz
 
 // Copyright Istio Authors
 //
@@ -49,8 +48,10 @@ spec:
     - operation:
         paths: ["/private/secret.html"]
 `
-	jwtTool            = "jwttool"
-	requestAuthnPolicy = `
+	jwtTool = "jwttool"
+)
+
+var requestAuthnPolicy = `
 apiVersion: security.istio.io/v1
 kind: RequestAuthentication
 metadata:
@@ -58,11 +59,10 @@ metadata:
 spec:
   jwtRules:
   - issuer: "test-issuer-1@istio.io"
-    jwksUri: "https://raw.githubusercontent.com/istio/istio/release-1.10/tests/common/jwt/jwks.json"
+    jwks: '` + jwt.JwksJSON + `'
   - issuer: "test-issuer-2@istio.io"
-    jwksUri: "https://raw.githubusercontent.com/istio/istio/release-1.10/tests/common/jwt/jwks.json"
+    jwks: '` + jwt.JwksJSON + `'
 `
-)
 
 var (
 	// Known unsupported path parameter ("/bla;foo") normalization for Tomcat.
@@ -206,10 +206,9 @@ func runFuzzer(t framework.TestContext, fuzzer, ns, server string) {
 
 func TestFuzzAuthorization(t *testing.T) {
 	framework.NewTest(t).
-		Features("security.fuzz.authorization").
 		Run(func(t framework.TestContext) {
 			ns := "fuzz-authz"
-			namespace.ClaimOrFail(t, t, ns)
+			namespace.ClaimOrFail(t, ns)
 
 			t.ConfigIstio().YAML(ns, authzDenyPolicy).ApplyOrFail(t)
 			t.Logf("authorization policy applied")
@@ -265,7 +264,7 @@ func runJwtToolTest(t framework.TestContext, ns, server, jwtToken string) {
 	t.Logf("jwttool fuzz test completed for %s", server)
 
 	if !strings.Contains(stdout, "Prescan: original token Response Code: 200") {
-		t.Fatalf("could not find prescan check, please make sure the jwt_tool.py completed successfully")
+		t.Fatal("could not find prescan check, please make sure the jwt_tool.py completed successfully")
 	}
 	errCases := []string{}
 	scanStarted := false
@@ -291,10 +290,9 @@ func runJwtToolTest(t framework.TestContext, ns, server, jwtToken string) {
 
 func TestRequestAuthentication(t *testing.T) {
 	framework.NewTest(t).
-		Features("security.fuzz.jwt").
 		Run(func(t framework.TestContext) {
 			ns := "fuzz-jwt"
-			namespace.ClaimOrFail(t, t, ns)
+			namespace.ClaimOrFail(t, ns)
 
 			t.ConfigIstio().YAML(ns, requestAuthnPolicy).ApplyOrFail(t)
 			t.Logf("request authentication policy applied")

@@ -23,33 +23,38 @@ import (
 	"istio.io/istio/pilot/test/mock"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test"
 )
 
 func TestStoreInvariant(t *testing.T) {
-	store := Make(collections.Mocks)
+	store := Make(collections.Mocks, false, test.NewStop(t))
 	mock.CheckMapInvariant(store, t, "some-namespace", 10)
 }
 
 func TestIstioConfig(t *testing.T) {
-	store := Make(collections.Pilot)
+	store := Make(collections.Pilot, false, test.NewStop(t))
 	mock.CheckIstioConfigTypes(store, "some-namespace", t)
 }
 
 func BenchmarkStoreGet(b *testing.B) {
 	s := initStore(b)
-	gvk := config.GroupVersionKind{
-		Group:   "networking.istio.io",
-		Version: "v1alpha3",
-		Kind:    "ServiceEntry",
-	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		// get one thousand times
 		for i := 0; i < 1000; i++ {
-			if s.Get(gvk, strconv.Itoa(i), "ns") == nil {
+			if s.Get(gvk.ServiceEntry, strconv.Itoa(i), "ns") == nil {
 				b.Fatal("get failed")
 			}
 		}
+	}
+}
+
+func BenchmarkStoreList(b *testing.B) {
+	s := initStore(b)
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		s.List(gvk.ServiceEntry, "")
 	}
 }
 
@@ -62,12 +67,8 @@ func BenchmarkStoreCreate(b *testing.B) {
 func BenchmarkStoreUpdate(b *testing.B) {
 	cfg := config.Config{
 		Meta: config.Meta{
-			GroupVersionKind: config.GroupVersionKind{
-				Group:   "networking.istio.io",
-				Version: "v1alpha3",
-				Kind:    "ServiceEntry",
-			},
-			Namespace: "ns",
+			GroupVersionKind: gvk.ServiceEntry,
+			Namespace:        "ns",
 		},
 		Spec: &v1alpha3.ServiceEntry{
 			Hosts: []string{"www.foo.com"},
@@ -89,18 +90,13 @@ func BenchmarkStoreUpdate(b *testing.B) {
 }
 
 func BenchmarkStoreDelete(b *testing.B) {
-	gvk := config.GroupVersionKind{
-		Group:   "networking.istio.io",
-		Version: "v1alpha3",
-		Kind:    "ServiceEntry",
-	}
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		s := initStore(b)
 		b.StartTimer()
 		// delete one thousand times
 		for i := 0; i < 1000; i++ {
-			if err := s.Delete(gvk, strconv.Itoa(i), "ns", nil); err != nil {
+			if err := s.Delete(gvk.ServiceEntry, strconv.Itoa(i), "ns", nil); err != nil {
 				b.Fatalf("delete failed: %v", err)
 			}
 		}
@@ -109,15 +105,11 @@ func BenchmarkStoreDelete(b *testing.B) {
 
 // make a new store and add 1000 configs to it
 func initStore(b *testing.B) model.ConfigStore {
-	s := MakeSkipValidation(collections.Pilot)
+	s := Make(collections.Pilot, true, test.NewStop(b))
 	cfg := config.Config{
 		Meta: config.Meta{
-			GroupVersionKind: config.GroupVersionKind{
-				Group:   "networking.istio.io",
-				Version: "v1alpha3",
-				Kind:    "ServiceEntry",
-			},
-			Namespace: "ns",
+			GroupVersionKind: gvk.ServiceEntry,
+			Namespace:        "ns",
 		},
 		Spec: &v1alpha3.ServiceEntry{
 			Hosts: []string{"www.foo.com"},

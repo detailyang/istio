@@ -21,6 +21,7 @@ import (
 	core_v1 "k8s.io/api/core/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
 
+	"istio.io/api/label"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/analysis"
 	"istio.io/istio/pkg/config/analysis/analyzers/util"
@@ -28,6 +29,7 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/resource"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/slices"
 )
 
 type ServiceAssociationAnalyzer struct{}
@@ -70,7 +72,7 @@ func (s *ServiceAssociationAnalyzer) Analyze(c analysis.Context) {
 }
 
 func isWaypointDeployment(r *resource.Instance) bool {
-	return r.Metadata.Labels[constants.ManagedGatewayLabel] == constants.ManagedGatewayMeshControllerLabel
+	return r.Metadata.Labels[label.GatewayManaged.Name] == constants.ManagedGatewayMeshControllerLabel
 }
 
 // analyzeDeploymentPortProtocol analyzes the specific service mesh deployment
@@ -93,6 +95,7 @@ func (s *ServiceAssociationAnalyzer) analyzeDeploymentPortProtocol(r *resource.I
 			for protocol := range protMap {
 				svcNames = append(svcNames, protMap[protocol]...)
 			}
+			slices.Sort(svcNames)
 			m := msg.NewDeploymentAssociatedToMultipleServices(r, r.Metadata.FullName.Name.String(), port, svcNames)
 
 			if line, ok := util.ErrorLine(r, fmt.Sprintf(util.MetadataName)); ok {
@@ -122,6 +125,9 @@ func (s *ServiceAssociationAnalyzer) analyzeDeploymentTargetPorts(r *resource.In
 				svcNames = append(svcNames, s)
 				ports = append(ports, p)
 			}
+
+			slices.Sort(svcNames)
+			slices.Sort(ports)
 			m := msg.NewDeploymentConflictingPorts(r, r.Metadata.FullName.Name.String(), svcNames, targetPort, ports)
 
 			if line, ok := util.ErrorLine(r, fmt.Sprintf(util.MetadataName)); ok {

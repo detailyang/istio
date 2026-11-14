@@ -15,37 +15,32 @@
 package controller
 
 import (
-	"fmt"
-	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
-	"sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvr"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/istio/pkg/util/sets"
 )
 
 func TestNetworkUpdateTriggers(t *testing.T) {
 	test.SetForTest(t, &features.MultiNetworkGatewayAPI, true)
-	meshNetworks := mesh.NewFixedNetworksWatcher(nil)
+	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
 	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
-		ClusterID:       "Kubernetes",
+		ClusterID:       constants.DefaultClusterName,
 		NetworksWatcher: meshNetworks,
 		DomainSuffix:    "cluster.local",
 		CRDs:            []schema.GroupVersionResource{gvr.KubernetesGateway},
@@ -55,70 +50,52 @@ func TestNetworkUpdateTriggers(t *testing.T) {
 		t.Fatal("did not expect any gateways yet")
 	}
 
-	notifyCh := make(chan struct{}, 1)
-	var (
-		gwMu sync.Mutex
-		gws  []model.NetworkGateway
-	)
-	setGws := func(v []model.NetworkGateway) {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		gws = v
-	}
-	getGws := func() []model.NetworkGateway {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		return gws
-	}
-
-	c.AppendNetworkGatewayHandler(func() {
-		setGws(c.NetworkGateways())
-		notifyCh <- struct{}{}
-	})
+	// Poll the controller's reported state rather than counting notify events.
+	// Counting events races with the informer queue: a SetNetworks call can fire
+	// before the Service Adds are drained, producing a partial notification first
+	// and the full one once the queue catches up. State polling does not care
+	// about the order or how many partial notifications fire.
 	expectGateways := func(t *testing.T, expectedGws int) {
-		// wait for a notification
-		assert.ChannelHasItem(t, notifyCh)
-		if n := len(getGws()); n != expectedGws {
-			t.Errorf("expected %d gateways but got %d", expectedGws, n)
-		}
+		assert.EventuallyEqual(t, func() int { return len(c.NetworkGateways()) }, expectedGws,
+			retry.Timeout(30*time.Second), retry.BackoffDelay(5*time.Millisecond))
 	}
 
 	t.Run("add meshnetworks", func(t *testing.T) {
 		addMeshNetworksFromRegistryGateway(t, c, meshNetworks)
-		expectGateways(t, 2)
+		expectGateways(t, 3)
 	})
 	t.Run("add labeled service", func(t *testing.T) {
 		addLabeledServiceGateway(t, c, "nw0")
-		expectGateways(t, 3)
+		expectGateways(t, 4)
 	})
 	t.Run("update labeled service network", func(t *testing.T) {
 		addLabeledServiceGateway(t, c, "nw1")
-		expectGateways(t, 3)
+		expectGateways(t, 4)
 	})
 	t.Run("add kubernetes gateway", func(t *testing.T) {
 		addOrUpdateGatewayResource(t, c, 35443)
-		expectGateways(t, 7)
+		expectGateways(t, 8)
 	})
 	t.Run("update kubernetes gateway", func(t *testing.T) {
 		addOrUpdateGatewayResource(t, c, 45443)
-		expectGateways(t, 7)
+		expectGateways(t, 8)
 	})
 	t.Run("remove kubernetes gateway", func(t *testing.T) {
 		removeGatewayResource(t, c)
-		expectGateways(t, 3)
+		expectGateways(t, 4)
 	})
 	t.Run("remove labeled service", func(t *testing.T) {
 		removeLabeledServiceGateway(t, c)
-		expectGateways(t, 2)
+		expectGateways(t, 3)
 	})
 	// gateways are created even with out service
 	t.Run("add kubernetes gateway", func(t *testing.T) {
 		addOrUpdateGatewayResource(t, c, 35443)
-		expectGateways(t, 6)
+		expectGateways(t, 7)
 	})
 	t.Run("remove kubernetes gateway", func(t *testing.T) {
 		removeGatewayResource(t, c)
-		expectGateways(t, 2)
+		expectGateways(t, 3)
 	})
 	t.Run("remove meshnetworks", func(t *testing.T) {
 		meshNetworks.SetNetworks(nil)
@@ -151,47 +128,47 @@ func removeLabeledServiceGateway(t *testing.T, c *FakeController) {
 // and it does so on an IP and a hostname
 func addOrUpdateGatewayResource(t *testing.T, c *FakeController, customPort int) {
 	passthroughMode := k8sv1.TLSModePassthrough
-	ipType := v1beta1.IPAddressType
-	hostnameType := v1beta1.HostnameAddressType
-	clienttest.Wrap(t, kclient.New[*v1beta1.Gateway](c.client)).CreateOrUpdate(&v1beta1.Gateway{
+	ipType := k8sv1.IPAddressType
+	hostnameType := k8sv1.HostnameAddressType
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).CreateOrUpdate(&k8sv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "eastwest-gwapi",
 			Namespace: "istio-system",
 			Labels:    map[string]string{label.TopologyNetwork.Name: "nw2"},
 		},
-		Spec: v1beta1.GatewaySpec{
+		Spec: k8sv1.GatewaySpec{
 			GatewayClassName: "istio",
-			Addresses: []v1beta1.GatewayAddress{
+			Addresses: []k8sv1.GatewaySpecAddress{
 				{Type: &ipType, Value: "1.2.3.4"},
 				{Type: &hostnameType, Value: "some hostname"},
 			},
-			Listeners: []v1beta1.Listener{
+			Listeners: []k8sv1.Listener{
 				{
 					Name: "detected-by-options",
-					TLS: &v1beta1.GatewayTLSConfig{
+					TLS: &k8sv1.ListenerTLSConfig{
 						Mode: &passthroughMode,
-						Options: map[v1beta1.AnnotationKey]v1beta1.AnnotationValue{
+						Options: map[k8sv1.AnnotationKey]k8sv1.AnnotationValue{
 							constants.ListenerModeOption: constants.ListenerModeAutoPassthrough,
 						},
 					},
-					Port: v1beta1.PortNumber(customPort),
+					Port: k8sv1.PortNumber(customPort),
 				},
 				{
 					Name: "detected-by-number",
-					TLS:  &v1beta1.GatewayTLSConfig{Mode: &passthroughMode},
+					TLS:  &k8sv1.ListenerTLSConfig{Mode: &passthroughMode},
 					Port: 15443,
 				},
 			},
 		},
-		Status: v1beta1.GatewayStatus{},
+		Status: k8sv1.GatewayStatus{},
 	})
 }
 
 func removeGatewayResource(t *testing.T, c *FakeController) {
-	clienttest.Wrap(t, kclient.New[*v1beta1.Gateway](c.client)).Delete("eastwest-gwapi", "istio-system")
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).Delete("eastwest-gwapi", "istio-system")
 }
 
-func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher mesh.NetworksWatcher) {
+func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher meshwatcher.TestNetworksWatcher) {
 	clienttest.Wrap(t, c.services).Create(&corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "istio-meshnetworks-gw", Namespace: "istio-system"},
 		Spec: corev1.ServiceSpec{
@@ -200,6 +177,17 @@ func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher
 		},
 		Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{
 			IP:    "1.2.3.4",
+			Ports: []corev1.PortStatus{{Port: 15443, Protocol: corev1.ProtocolTCP}},
+		}}}},
+	})
+	clienttest.Wrap(t, c.services).Create(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "istio-meshnetworks-gw-2", Namespace: "istio-system"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 15443, Protocol: corev1.ProtocolTCP}},
+		},
+		Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{
+			IP:    "1.2.3.5",
 			Ports: []corev1.PortStatus{{Port: 15443, Protocol: corev1.ProtocolTCP}},
 		}}}},
 	})
@@ -222,110 +210,71 @@ func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher
 				Gw:   &meshconfig.Network_IstioNetworkGateway_RegistryServiceName{RegistryServiceName: "istio-meshnetworks-gw.istio-system.svc.cluster.local"},
 			}},
 		},
+		"nw2": {
+			Endpoints: []*meshconfig.Network_NetworkEndpoints{{
+				Ne: &meshconfig.Network_NetworkEndpoints_FromRegistry{FromRegistry: "Kubernetes"},
+			}},
+			Gateways: []*meshconfig.Network_IstioNetworkGateway{{
+				Port: 15443,
+				Gw:   &meshconfig.Network_IstioNetworkGateway_RegistryServiceName{RegistryServiceName: "istio-meshnetworks-gw-2.istio-system.svc.cluster.local"},
+			}},
+		},
 	}})
 }
 
-func TestAmbientSystemNamespaceNetworkChange(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbientControllers, true)
-
-	s := newAmbientTestServer(t, testC, "")
-
-	tracker := assert.NewTracker[string](t)
-
-	s.controller.namespaces.AddEventHandler(controllers.ObjectHandler(func(o controllers.Object) {
-		tracker.Record(o.GetName())
-	}))
-
-	expectNetwork := func(t *testing.T, c *FakeController, network string) {
-		retry.UntilSuccessOrFail(t, func() error {
-			t.Helper()
-			if c.networkFromSystemNamespace().String() != network {
-				return fmt.Errorf("no network notify")
-			}
-			podNames := sets.New[string]("pod1", "pod2")
-			svcNames := sets.New[string]("svc1")
-			addresses := c.ambientIndex.All()
-			for _, addr := range addresses {
-				wl := addr.GetWorkload()
-				if wl != nil {
-					if !podNames.Contains(wl.Name) {
-						continue
-					}
-					if addr.GetWorkload().Network != network {
-						return fmt.Errorf("no network notify")
-					}
-				}
-				svc := addr.GetService()
-				if svc != nil {
-					if !svcNames.Contains(svc.Name) {
-						continue
-					}
-					for _, saddr := range svc.GetAddresses() {
-						if saddr.GetNetwork() != network {
-							return fmt.Errorf("no network notify")
-						}
-					}
-				}
-			}
-			return nil
-		})
-	}
-
-	s.addPods(t, "127.0.0.1", "pod1", "sa1", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
-	s.assertAddresses(t, s.addrXdsName("127.0.0.1"), "pod1")
-
-	s.addPods(t, "127.0.0.2", "pod2", "sa2", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
-	s.assertAddresses(t, s.addrXdsName("127.0.0.2"), "pod2")
-
-	s.addService(t, "svc1", map[string]string{}, // labels
-		map[string]string{}, // annotations
-		[]int32{80},
-		map[string]string{"app": "a"}, // selector
-		"10.0.0.1",
-	)
-	s.assertAddresses(t, "", "pod1", "pod2", "svc1")
-
-	createOrUpdateNamespace(t, s.controller, testNS, "")
-	createOrUpdateNamespace(t, s.controller, systemNS, "")
-
-	tracker.WaitOrdered(testNS, systemNS)
-
-	t.Run("change namespace network to nw1", func(t *testing.T) {
-		createOrUpdateNamespace(t, s.controller, systemNS, "nw1")
-		tracker.WaitOrdered(systemNS)
-		expectNetwork(t, s.controller, "nw1")
+func TestGatewayResourceHBONEListener(t *testing.T) {
+	test.SetForTest(t, &features.MultiNetworkGatewayAPI, true)
+	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
+		ClusterID:    constants.DefaultClusterName,
+		DomainSuffix: "cluster.local",
+		CRDs:         []schema.GroupVersionResource{gvr.KubernetesGateway},
 	})
 
-	t.Run("change namespace network to nw2", func(t *testing.T) {
-		createOrUpdateNamespace(t, s.controller, systemNS, "nw2")
-		tracker.WaitOrdered(systemNS)
-		expectNetwork(t, s.controller, "nw2")
-	})
-
-	t.Run("manually change namespace network to nw3, and update meshNetworks", func(t *testing.T) {
-		s.controller.setNetworkFromNamespace(&corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: systemNS,
-				Labels: map[string]string{
-					label.TopologyNetwork.Name: "nw3",
+	passthroughMode := k8sv1.TLSModePassthrough
+	ipType := k8sv1.IPAddressType
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).CreateOrUpdate(&k8sv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "eastwest-hbone",
+			Namespace: "istio-system",
+			Labels:    map[string]string{label.TopologyNetwork.Name: "nw2"},
+		},
+		Spec: k8sv1.GatewaySpec{
+			GatewayClassName: "istio",
+			Addresses:        []k8sv1.GatewaySpecAddress{{Type: &ipType, Value: "1.2.3.4"}},
+			Listeners: []k8sv1.Listener{
+				{
+					Name: "mtls",
+					TLS: &k8sv1.ListenerTLSConfig{
+						Mode: &passthroughMode,
+						Options: map[k8sv1.AnnotationKey]k8sv1.AnnotationValue{
+							constants.ListenerModeOption: constants.ListenerModeAutoPassthrough,
+						},
+					},
+					Port: 15443,
+				},
+				{
+					Name:     "hbone",
+					Protocol: "HBONE",
+					Port:     15008,
 				},
 			},
-		})
-		createOrUpdateNamespace(t, s.controller, systemNS, "nw3")
-		tracker.WaitOrdered(systemNS)
-		addMeshNetworksFromRegistryGateway(t, s.controller, s.controller.meshNetworksWatcher)
-		expectNetwork(t, s.controller, "nw3")
-	})
-}
-
-func createOrUpdateNamespace(t *testing.T, c *FakeController, name, network string) {
-	namespace := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				label.TopologyNetwork.Name: network,
-			},
 		},
+	})
+
+	assert.EventuallyEqual(t, func() int { return len(c.NetworkGateways()) }, 2,
+		retry.Timeout(30*time.Second), retry.BackoffDelay(5*time.Millisecond))
+
+	var mtls, hbone int
+	for _, gw := range c.NetworkGateways() {
+		switch {
+		case gw.Port == 15443 && gw.HBONEPort == 0:
+			mtls++
+		case gw.HBONEPort == 15008 && gw.Port == 0:
+			hbone++
+		default:
+			t.Fatalf("unexpected gateway %+v: an HBONE listener must set HBONEPort only", gw)
+		}
 	}
-	clienttest.Wrap(t, c.namespaces).CreateOrUpdate(namespace)
+	assert.Equal(t, mtls, 1)
+	assert.Equal(t, hbone, 1)
 }

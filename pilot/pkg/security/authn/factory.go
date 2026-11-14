@@ -32,11 +32,7 @@ type PolicyApplier interface {
 
 	// JwtFilter returns the JWT HTTP filter to enforce the underlying authentication policy.
 	// It may return nil, if no JWT validation is needed.
-	JwtFilter(useExtendedJwt, clearRouteCache bool) *hcm.HttpFilter
-
-	// AuthNFilter returns the (authn) HTTP filter to enforce the underlying authentication policy.
-	// It may return nil, if no authentication is needed.
-	AuthNFilter(forSidecar bool) *hcm.HttpFilter
+	JwtFilter(clearRouteCache bool) *hcm.HttpFilter
 
 	// PortLevelSetting returns port level mTLS settings.
 	PortLevelSetting() map[uint32]model.MutualTLSMode
@@ -52,17 +48,20 @@ type MtlsPolicy interface {
 
 // NewPolicyApplier returns the appropriate (policy) applier, depends on the versions of the policy exists
 // for the given service innstance.
-func NewPolicyApplier(push *model.PushContext, namespace string, labels labels.Instance, isWaypoint bool) PolicyApplier {
+func NewPolicyApplier(push *model.PushContext, proxy *model.Proxy, svc *model.Service) PolicyApplier {
+	forWorkload := model.PolicyMatcherForProxy(proxy).WithService(svc)
 	return newPolicyApplier(
 		push.AuthnPolicies.GetRootNamespace(),
-		push.AuthnPolicies.GetJwtPoliciesForWorkload(namespace, labels, isWaypoint),
-		push.AuthnPolicies.GetPeerAuthenticationsForWorkload(namespace, labels, isWaypoint), push)
+		push.AuthnPolicies.GetJwtPoliciesForWorkload(forWorkload),
+		push.AuthnPolicies.GetPeerAuthenticationsForWorkload(forWorkload), push)
 }
 
 // NewMtlsPolicy returns a checker used to detect proxy mtls mode.
-func NewMtlsPolicy(push *model.PushContext, namespace string, labels labels.Instance, isWaypoint bool) MtlsPolicy {
+func NewMtlsPolicy(push *model.PushContext, authnPolicies model.PeerAuthnPolicies, namespace string, labels labels.Instance, isWaypoint bool) MtlsPolicy {
 	return newPolicyApplier(
-		push.AuthnPolicies.GetRootNamespace(),
+		authnPolicies.GetRootNamespace(),
 		nil,
-		push.AuthnPolicies.GetPeerAuthenticationsForWorkload(namespace, labels, isWaypoint), push)
+		authnPolicies.GetPeerAuthenticationsForWorkload(model.PolicyMatcherFor(namespace, labels, isWaypoint)),
+		push,
+	)
 }

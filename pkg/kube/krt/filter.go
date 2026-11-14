@@ -18,84 +18,175 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/smallset"
 )
 
 type filter struct {
-	key       string
-	name      string
-	namespace string
+	keys    smallset.Set[string]
+	generic func(any) bool
+	index   *indexFilter
+	// extra holds the rarely used options. Almost every filter leaves these unset, so they are allocated on demand.
+	extra *filterExtra
+}
 
+type filterExtra struct {
 	// selectsNonEmpty is like selects, but it treats an empty selector as not matching
 	selectsNonEmpty map[string]string
 	selects         map[string]string
 	labels          map[string]string
-	generic         func(any) bool
+	suppressChange  func(o, n any) bool
 }
 
-func (f filter) String() string {
+func (f *filter) ensureExtra() *filterExtra {
+	if f.extra == nil {
+		f.extra = &filterExtra{}
+	}
+	return f.extra
+}
+
+type indexFilter struct {
+	filterUID collectionUID
+	lookup    indexLookup
+}
+
+// indexLookup is an Index plus the key being looked up, with the types erased.
+type indexLookup interface {
+	listFiltered(any) any
+	matches(any) bool
+	key() string
+	extractKeys(any) []string
+}
+
+type typedIndexLookup[K comparable, I any] struct {
+	idx Index[K, I]
+	k   K
+}
+
+func (l *typedIndexLookup[K, I]) listFiltered(filter any) any {
+	return l.idx.LookupFiltered(l.k, filter.(func(I) bool))
+}
+
+func (l *typedIndexLookup[K, I]) matches(a any) bool {
+	return l.idx.objectHasKey(a.(I), l.k)
+}
+
+// key is computed on demand: it is only needed to build the reverse index, and formatting it allocates.
+func (l *typedIndexLookup[K, I]) key() string {
+	return toString(l.k)
+}
+
+func (l *typedIndexLookup[K, I]) extractKeys(o any) []string {
+	return slices.Map(l.idx.extractKeys(o.(I)), func(e K) string {
+		return toString(e)
+	})
+}
+
+type objectKeyExtractor = func(o any) []string
+
+func getKeyExtractor(o any) []string {
+	return []string{GetKey(o)}
+}
+
+// reverseIndexKey
+func (f *filter) reverseIndexKey() ([]string, indexedDependencyType, objectKeyExtractor, collectionUID, bool) {
+	if f.keys.Len() > 0 {
+		if f.index != nil {
+			panic("cannot filter by index and key")
+		}
+		return f.keys.List(), getKeyType, getKeyExtractor, 0, true
+	}
+	if f.index != nil {
+		return []string{f.index.lookup.key()}, indexType, f.index.lookup.extractKeys, f.index.filterUID, true
+	}
+	return nil, unknownIndexType, nil, 0, false
+}
+
+func (f *filter) String() string {
 	attrs := []string{}
-	if f.key != "" {
-		attrs = append(attrs, "key="+f.key)
+	if !f.keys.IsNil() {
+		attrs = append(attrs, "keys="+f.keys.String())
 	}
-	if f.name != "" {
-		attrs = append(attrs, "name="+f.name)
-	}
-	if f.namespace != "" {
-		attrs = append(attrs, "namespace="+f.namespace)
-	}
-	if f.selectsNonEmpty != nil {
-		attrs = append(attrs, fmt.Sprintf("selectsNonEmpty=%v", f.selectsNonEmpty))
-	}
-	if f.selects != nil {
-		attrs = append(attrs, fmt.Sprintf("selects=%v", f.selects))
-	}
-	if f.labels != nil {
-		attrs = append(attrs, fmt.Sprintf("labels=%v", f.labels))
+	if x := f.extra; x != nil {
+		if x.selectsNonEmpty != nil {
+			attrs = append(attrs, fmt.Sprintf("selectsNonEmpty=%v", x.selectsNonEmpty))
+		}
+		if x.selects != nil {
+			attrs = append(attrs, fmt.Sprintf("selects=%v", x.selects))
+		}
+		if x.labels != nil {
+			attrs = append(attrs, fmt.Sprintf("labels=%v", x.labels))
+		}
 	}
 	if f.generic != nil {
 		attrs = append(attrs, "generic")
+	}
+	if f.extra != nil && f.extra.suppressChange != nil {
+		attrs = append(attrs, "suppressChange")
 	}
 	res := strings.Join(attrs, ",")
 	return fmt.Sprintf("{%s}", res)
 }
 
-func FilterName(name, namespace string) FetchOption {
+// FilterObjectName selects a Kubernetes object by name.
+func FilterObjectName(name types.NamespacedName) FetchOption {
 	return func(h *dependency) {
-		h.filter.name = name
-		h.filter.namespace = namespace
+		// Translate to a key lookup
+		h.filter.keys = smallset.New(keyFunc(name.Name, name.Namespace))
 	}
 }
 
 func FilterKey(k string) FetchOption {
 	return func(h *dependency) {
-		h.filter.key = k
+		h.filter.keys = smallset.New(k)
 	}
 }
 
-func FilterNamespace(namespace string) FetchOption {
+func FilterKeys(k ...string) FetchOption {
 	return func(h *dependency) {
-		h.filter.namespace = namespace
+		h.filter.keys = smallset.New(k...)
 	}
 }
 
 // FilterSelects only includes objects that select this label. If the selector is empty, it is a match.
 func FilterSelects(lbls map[string]string) FetchOption {
 	return func(h *dependency) {
-		h.filter.selects = lbls
+		if lbls == nil {
+			lbls = make(map[string]string)
+		}
+		h.filter.ensureExtra().selects = lbls
 	}
 }
 
-// FilterSelectsNonEmpty only includes objects that select this label. If the selector is empty, it is not a match.
+// FilterIndex selects only objects matching a key in an index.
+func FilterIndex[K comparable, I any](idx Index[K, I], k K) FetchOption {
+	return func(h *dependency) {
+		// Index is used to pre-filter on the List, and also to match in Matches. Provide type-erased methods for both
+		h.filter.index = &indexFilter{
+			filterUID: idx.id(),
+			lookup:    &typedIndexLookup[K, I]{idx: idx, k: k},
+		}
+	}
+}
+
+// FilterSelectsNonEmpty only includes objects that select this label. If the selector is empty, it is NOT a match.
 func FilterSelectsNonEmpty(lbls map[string]string) FetchOption {
 	return func(h *dependency) {
-		h.filter.selectsNonEmpty = lbls
+		// Need to distinguish empty vs unset. A user may pass in 'lbls' as nil, this doesn't mean they do not want it to filter at all.
+		if lbls == nil {
+			lbls = make(map[string]string)
+		}
+		h.filter.ensureExtra().selectsNonEmpty = lbls
 	}
 }
 
+// FilterLabel only includes objects that match the provided labels. If the selector is empty, it IS a match.
 func FilterLabel(lbls map[string]string) FetchOption {
 	return func(h *dependency) {
-		h.filter.labels = lbls
+		h.filter.ensureExtra().labels = lbls
 	}
 }
 
@@ -105,42 +196,83 @@ func FilterGeneric(f func(any) bool) FetchOption {
 	}
 }
 
-func (f filter) Matches(object any) bool {
-	if f.key != "" && f.key != string(GetKey[any](object)) {
-		if log.DebugEnabled() {
-			log.Debugf("no match key: %q vs %q", f.key, string(GetKey[any](object)))
+// withUnsafeSuppressChange skips incoming update events when fn returns true.
+// This only applies to dependency change handling for Fetch calls; it does not affect the initial list result.
+// This is dangerous to use; if you use any parts of the object *outside* the comparison function, you will get stale data.
+// Recommended to use with PartialFetch
+func withUnsafeSuppressChange[T any](fn func(T, T) bool) FetchOption {
+	return func(h *dependency) {
+		h.filter.ensureExtra().suppressChange = func(o, n any) bool {
+			return fn(o.(T), n.(T))
 		}
+	}
+}
+
+func (f *filter) SuppressChange(ev Event[any]) bool {
+	if f.extra == nil || f.extra.suppressChange == nil || ev.Old == nil || ev.New == nil {
 		return false
 	}
-	if f.name != "" && f.name != getName(object) {
-		if log.DebugEnabled() {
-			log.Debugf("no match name: %q vs %q", f.name, getName(object))
+	return f.extra.suppressChange(*ev.Old, *ev.New)
+}
+
+func (f *filter) needsMatching(forList bool) bool {
+	if !forList {
+		if !f.keys.IsNil() || f.index != nil {
+			return true
 		}
-		return false
 	}
-	if f.namespace != "" && f.namespace != getNamespace(object) {
-		if log.DebugEnabled() {
-			log.Debugf("no match namespace: %q vs %q", f.namespace, getNamespace(object))
-		}
-		return false
+	if x := f.extra; x != nil && (x.selects != nil || x.selectsNonEmpty != nil || x.labels != nil) {
+		return true
 	}
-	if f.selects != nil && !labels.Instance(getLabelSelector(object)).SubsetOf(f.selects) {
-		if log.DebugEnabled() {
-			log.Debugf("no match selects: %q vs %q", f.selects, getLabelSelector(object))
+	return f.generic != nil
+}
+
+func (f *filter) Matches(object any, forList bool) bool {
+	// Check each of our defined filters to see if the object matches
+	// This function is called very often and is important to keep fast
+	// Cheaper checks should come earlier to avoid additional work and short circuit early
+
+	// If we are listing, we already did this. Do not redundantly check.
+	if !forList {
+		// First, lookup directly by key. This is cheap
+		// an empty set will match none
+		if !f.keys.IsNil() && !f.keys.Contains(GetKey[any](object)) {
+			if log.DebugEnabled() {
+				log.Debugf("no match key: %q vs %q", f.keys, GetKey[any](object))
+			}
+			return false
 		}
-		return false
+		// Index is also cheap, and often used to filter namespaces out. Make sure we do this early
+		if f.index != nil {
+			if !f.index.lookup.matches(object) {
+				if log.DebugEnabled() {
+					log.Debugf("no match index")
+				}
+				return false
+			}
+		}
 	}
-	if f.selectsNonEmpty != nil && !labels.Instance(getLabelSelector(object)).Match(f.selectsNonEmpty) {
-		if log.DebugEnabled() {
-			log.Debugf("no match selectsNonEmpty: %q vs %q", f.selectsNonEmpty, getLabelSelector(object))
+
+	// Rest is expensive
+	if x := f.extra; x != nil {
+		if x.selects != nil && !labels.Instance(getLabelSelector(object)).SubsetOf(x.selects) {
+			if log.DebugEnabled() {
+				log.Debugf("no match selects: %q vs %q", x.selects, getLabelSelector(object))
+			}
+			return false
 		}
-		return false
-	}
-	if f.labels != nil && !labels.Instance(f.labels).SubsetOf(getLabels(object)) {
-		if log.DebugEnabled() {
-			log.Debugf("no match labels: %q vs %q", f.labels, getLabels(object))
+		if x.selectsNonEmpty != nil && !labels.Instance(getLabelSelector(object)).Match(x.selectsNonEmpty) {
+			if log.DebugEnabled() {
+				log.Debugf("no match selectsNonEmpty: %q vs %q", x.selectsNonEmpty, getLabelSelector(object))
+			}
+			return false
 		}
-		return false
+		if x.labels != nil && !labels.Instance(x.labels).SubsetOf(getLabels(object)) {
+			if log.DebugEnabled() {
+				log.Debugf("no match labels: %q vs %q", x.labels, getLabels(object))
+			}
+			return false
+		}
 	}
 	if f.generic != nil && !f.generic(object) {
 		if log.DebugEnabled() {

@@ -17,7 +17,9 @@ package xds
 import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/util/sets"
@@ -30,40 +32,43 @@ import (
 // in the pod the agent will capture all DNS requests and attempt to resolve locally before
 // forwarding to upstream dns servers.
 type NdsGenerator struct {
-	Server *DiscoveryServer
+	ConfigGenerator core.ConfigGenerator
 }
 
 var _ model.XdsResourceGenerator = &NdsGenerator{}
 
 // Map of all configs that do not impact NDS
-var skippedNdsConfigs = sets.New[kind.Kind](
-	kind.Gateway,
-	kind.VirtualService,
-	kind.DestinationRule,
-	kind.Secret,
-	kind.Telemetry,
-	kind.EnvoyFilter,
-	kind.WorkloadEntry,
-	kind.WorkloadGroup,
-	kind.AuthorizationPolicy,
-	kind.RequestAuthentication,
-	kind.PeerAuthentication,
-	kind.WasmPlugin,
-	kind.ProxyConfig,
-	kind.MeshConfig,
-)
+var skippedNdsConfigs = func() sets.Set[kind.Kind] {
+	s := sets.New(
+		kind.Gateway,
+		kind.VirtualService,
+		kind.DestinationRule,
+		kind.Secret,
+		kind.ConfigMap,
+		kind.Telemetry,
+		kind.EnvoyFilter,
+		kind.WorkloadEntry,
+		kind.WorkloadGroup,
+		kind.AuthorizationPolicy,
+		kind.RequestAuthentication,
+		kind.PeerAuthentication,
+		kind.WasmPlugin,
+		kind.TrafficExtension,
+		kind.ProxyConfig,
+		kind.MeshConfig,
+		kind.Endpoints,
+	)
+	if features.ScopedAddressPushes {
+		// The DNS name table is derived from services; ambient Address changes that matter
+		// to it arrive as ServiceEntry updates.
+		s.Insert(kind.Address)
+	}
+	return s
+}()
 
-func ndsNeedsPush(req *model.PushRequest) bool {
-	if req == nil {
-		return true
-	}
-	if !req.Full {
-		// NDS generally handles full push. We only allow partial pushes, when headless endpoints change.
-		return headlessEndpointsUpdated(req)
-	}
-	// If none set, we will always push
-	if len(req.ConfigsUpdated) == 0 {
-		return true
+func ndsNeedsPush(req *model.PushRequest, proxy *model.Proxy) bool {
+	if res, ok := xdsNeedsPush(req, proxy); ok {
+		return res
 	}
 	for config := range req.ConfigsUpdated {
 		if _, f := skippedNdsConfigs[config.Kind]; !f {
@@ -73,15 +78,11 @@ func ndsNeedsPush(req *model.PushRequest) bool {
 	return false
 }
 
-func headlessEndpointsUpdated(req *model.PushRequest) bool {
-	return req.Reason.Has(model.HeadlessEndpointUpdate)
-}
-
 func (n NdsGenerator) Generate(proxy *model.Proxy, _ *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
-	if !ndsNeedsPush(req) {
+	if !ndsNeedsPush(req, proxy) {
 		return nil, model.DefaultXdsLogDetails, nil
 	}
-	nt := n.Server.ConfigGenerator.BuildNameTable(proxy, req.Push)
+	nt := n.ConfigGenerator.BuildNameTable(proxy, req.Push)
 	if nt == nil {
 		return nil, model.DefaultXdsLogDetails, nil
 	}

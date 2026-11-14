@@ -28,7 +28,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/scopes"
 	"istio.io/istio/pkg/test/util/assert"
@@ -57,7 +57,7 @@ func TestGatewayHostnames(t *testing.T) {
 		}
 	})
 
-	meshNetworks := mesh.NewFixedNetworksWatcher(nil)
+	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
 	xdsUpdater := xdsfake.NewFakeXDS()
 	env := &model.Environment{NetworksWatcher: meshNetworks, ServiceDiscovery: memory.NewServiceDiscovery()}
 	if err := env.InitNetworksManager(xdsUpdater); err != nil {
@@ -74,11 +74,11 @@ func TestGatewayHostnames(t *testing.T) {
 				Port: 15443,
 			}}},
 		}})
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 		gateways = env.NetworkManager.AllGateways()
 		// A and AAAA
 		if len(gateways) != 2 {
-			t.Fatalf("expected 2 IPs")
+			t.Fatal("expected 2 IPs")
 		}
 		if gateways[0].Network != "nw0" || gateways[1].Network != "nw0" {
 			t.Fatalf("unexpected network: %v", gateways)
@@ -89,7 +89,7 @@ func TestGatewayHostnames(t *testing.T) {
 		// after the update, we should see the next gateway. Since TTL is low we don't know the exact IP, but we know it should change from
 		// the original
 		assert.EventuallyEqual(t, env.NetworkManager.AllGateways, gateways)
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 	})
 
 	workingDNSServer.setFailure(true)
@@ -102,7 +102,7 @@ func TestGatewayHostnames(t *testing.T) {
 			t.Fatalf("unexpected network: %v", currentGateways)
 		}
 		if !env.NetworkManager.IsMultiNetworkEnabled() {
-			t.Fatalf("multi network is not enabled")
+			t.Fatal("multi network is not enabled")
 		}
 	})
 
@@ -112,7 +112,7 @@ func TestGatewayHostnames(t *testing.T) {
 		retry.UntilOrFail(t, func() bool {
 			return !reflect.DeepEqual(env.NetworkManager.AllGateways(), gateways)
 		}, retry.Timeout(10*model.MinGatewayTTL), retry.Delay(time.Millisecond*10))
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 	})
 
 	workingDNSServer.setHosts(make(sets.String))
@@ -120,9 +120,9 @@ func TestGatewayHostnames(t *testing.T) {
 		assert.EventuallyEqual(t, func() int {
 			return len(env.NetworkManager.AllGateways())
 		}, 0, retry.Timeout(10*model.MinGatewayTTL))
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 		if env.NetworkManager.IsMultiNetworkEnabled() {
-			t.Fatalf("multi network should not be enabled when there are no gateways")
+			t.Fatal("multi network should not be enabled when there are no gateways")
 		}
 	})
 
@@ -132,14 +132,14 @@ func TestGatewayHostnames(t *testing.T) {
 			return len(env.NetworkManager.AllGateways()) != 0 &&
 				!reflect.DeepEqual(env.NetworkManager.AllGateways(), gateways)
 		}, retry.Timeout(10*model.MinGatewayTTL), retry.Delay(time.Millisecond*10))
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 	})
 
 	t.Run("forget", func(t *testing.T) {
 		meshNetworks.SetNetworks(nil)
-		xdsUpdater.WaitOrFail(t, "xds full")
+		xdsUpdater.WaitOrFail(t, "xds forced")
 		if len(env.NetworkManager.AllGateways()) > 0 {
-			t.Fatalf("expected no gateways")
+			t.Fatal("expected no gateways")
 		}
 	})
 }

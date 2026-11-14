@@ -36,13 +36,15 @@ func TestWatcher(t *testing.T) {
 	key := []byte("key")
 	cert := []byte("cert")
 	ca := []byte("caBundle")
+	crl := []byte("crl")
 	// 2. set key cert bundle
 	watcher.SetAndNotify(key, cert, ca)
+	watcher.SetAndNotifyCACRL(crl)
 	select {
 	case <-watch1:
 		keyCertBundle := watcher.GetKeyCertBundle()
 		if !bytes.Equal(keyCertBundle.KeyPem, key) || !bytes.Equal(keyCertBundle.CertPem, cert) ||
-			!bytes.Equal(keyCertBundle.CABundle, ca) {
+			!bytes.Equal(keyCertBundle.CABundle, ca) || !bytes.Equal(keyCertBundle.CRL, crl) {
 			t.Errorf("got wrong keyCertBundle %v", keyCertBundle)
 		}
 	default:
@@ -55,12 +57,14 @@ func TestWatcher(t *testing.T) {
 	key = []byte("key2")
 	cert = []byte("cert2")
 	ca = []byte("caBundle2")
+	crl = []byte("crl2")
 	watcher.SetAndNotify(key, cert, ca)
+	watcher.SetAndNotifyCACRL(crl)
 	select {
 	case <-watch1:
 		keyCertBundle := watcher.GetKeyCertBundle()
 		if !bytes.Equal(keyCertBundle.KeyPem, key) || !bytes.Equal(keyCertBundle.CertPem, cert) ||
-			!bytes.Equal(keyCertBundle.CABundle, ca) {
+			!bytes.Equal(keyCertBundle.CABundle, ca) || !bytes.Equal(keyCertBundle.CRL, crl) {
 			t.Errorf("got wrong keyCertBundle %v", keyCertBundle)
 		}
 	default:
@@ -75,6 +79,23 @@ func TestWatcher(t *testing.T) {
 		}
 	default:
 		t.Errorf("watcher2 watched non keyCertBundle")
+	}
+}
+
+// TestSetAndNotifyCACRLClear verifies that an empty CRL clears a previously set
+// CRL, so that emptying ca-crl.pem removes the revocation from the propagated
+// istio-ca-crl ConfigMap.
+func TestSetAndNotifyCACRLClear(t *testing.T) {
+	watcher := NewWatcher()
+
+	watcher.SetAndNotifyCACRL([]byte("crl"))
+	if got := watcher.GetCRL(); !bytes.Equal(got, []byte("crl")) {
+		t.Errorf("expected CRL to be set, got %q", got)
+	}
+
+	watcher.SetAndNotifyCACRL([]byte{})
+	if got := watcher.GetCRL(); len(got) != 0 {
+		t.Errorf("expected CRL to be cleared, got %q", got)
 	}
 }
 

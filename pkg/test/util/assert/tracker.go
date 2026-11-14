@@ -25,14 +25,21 @@ import (
 )
 
 type Tracker[T comparable] struct {
-	t      test.Failer
-	mu     sync.Mutex
-	events []T
+	t         test.Failer
+	mu        sync.Mutex
+	events    []T
+	retryOpts []retry.Option
 }
 
-// NewTracker builds a tracker which records events that occur
-func NewTracker[T comparable](t test.Failer) *Tracker[T] {
-	return &Tracker[T]{t: t}
+// NewTracker builds a tracker which records events that occur.
+// Optional retry.Option values override the default retry behavior (1s timeout, 1ms backoff)
+// used by WaitOrdered, WaitUnordered, and WaitCompare.
+func NewTracker[T comparable](t test.Failer, opts ...retry.Option) *Tracker[T] {
+	retryOpts := []retry.Option{retry.Timeout(time.Second), retry.BackoffDelay(time.Millisecond)}
+	if len(opts) > 0 {
+		retryOpts = opts
+	}
+	return &Tracker[T]{t: t, retryOpts: retryOpts}
 }
 
 // Record that an event occurred.
@@ -55,7 +62,7 @@ func (t *Tracker[T]) Empty() {
 // WaitOrdered waits for an event to happen, in order
 func (t *Tracker[T]) WaitOrdered(events ...T) {
 	t.t.Helper()
-	for _, event := range events {
+	for i, event := range events {
 		var err error
 		retry.UntilSuccessOrFail(t.t, func() error {
 			t.mu.Lock()
@@ -65,19 +72,25 @@ func (t *Tracker[T]) WaitOrdered(events ...T) {
 			}
 			if t.events[0] != event {
 				// Exit early instead of continuing to retry
-				err = fmt.Errorf("got events %v, want %v", t.events, event)
+				err = fmt.Errorf("got events %v, want %v (%d)", t.events, event, i)
 				return nil
 			}
 			// clear the event
 			t.events[0] = ptr.Empty[T]()
 			t.events = t.events[1:]
 			return nil
-		}, retry.Timeout(time.Second), retry.BackoffDelay(time.Millisecond))
+		}, t.retryOpts...)
 		if err != nil {
 			t.t.Fatal(err)
 		}
 	}
 	t.Empty()
+}
+
+func (t *Tracker[T]) Events() []T {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.events
 }
 
 // WaitUnordered waits for an event to happen, in any order
@@ -109,7 +122,7 @@ func (t *Tracker[T]) WaitUnordered(events ...T) {
 			return fmt.Errorf("still waiting for %v", want)
 		}
 		return nil
-	}, retry.Timeout(time.Second), retry.BackoffDelay(time.Millisecond))
+	}, t.retryOpts...)
 	if err != nil {
 		t.t.Fatal(err)
 	}
@@ -136,7 +149,7 @@ func (t *Tracker[T]) WaitCompare(f func(T) bool) {
 		t.events[0] = ptr.Empty[T]()
 		t.events = t.events[1:]
 		return nil
-	}, retry.Timeout(time.Second), retry.BackoffDelay(time.Millisecond))
+	}, t.retryOpts...)
 	if err != nil {
 		t.t.Fatal(err)
 	}

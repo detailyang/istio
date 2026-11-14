@@ -15,9 +15,7 @@
 package model
 
 import (
-	"crypto/md5"
 	"fmt"
-	"strings"
 	"time"
 
 	"istio.io/api/security/v1beta1"
@@ -25,6 +23,9 @@ import (
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/hash"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // MutualTLSMode is the mutual TLS mode specified by authentication policy.
@@ -100,6 +101,15 @@ type AuthenticationPolicies struct {
 	aggregateVersion string
 }
 
+type PeerAuthnPolicies interface {
+	GetPeerAuthenticationsForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config
+	GetNamespaceMutualTLSMode(namespace string) MutualTLSMode
+	GetPeerAuthentications() map[string][]config.Config
+	GetGlobalMutualTLSMode() MutualTLSMode
+	GetRootNamespace() string
+	GetVersion() string
+}
+
 // initAuthenticationPolicies creates a new AuthenticationPolicies struct and populates with the
 // authentication policies in the mesh environment.
 func initAuthenticationPolicies(env *Environment) *AuthenticationPolicies {
@@ -129,10 +139,13 @@ func (policy *AuthenticationPolicies) addPeerAuthentication(configs []config.Con
 	foundNamespaceMTLS := make(map[string]v1beta1.PeerAuthentication_MutualTLS_Mode)
 	// Track which namespace/mesh level policy seen so far to make sure the oldest one is used.
 	seenNamespaceOrMeshConfig := make(map[string]time.Time)
-	versions := []string{}
 
+	var versionSum uint64
+	hash := hash.New()
 	for _, config := range configs {
-		versions = append(versions, config.UID+"."+config.ResourceVersion)
+		hash.WriteString(config.UID + "." + config.ResourceVersion)
+		versionSum += hash.Sum64()
+		hash.Reset()
 		// Mesh & namespace level policy are those that have empty selector.
 		spec := config.Spec.(*v1beta1.PeerAuthentication)
 		if spec.Selector == nil || len(spec.Selector.MatchLabels) == 0 {
@@ -166,9 +179,8 @@ func (policy *AuthenticationPolicies) addPeerAuthentication(configs []config.Con
 		policy.peerAuthentications[config.Namespace] = append(policy.peerAuthentications[config.Namespace], config)
 	}
 
-	// nolint: gosec
-	// Not security sensitive code
-	policy.aggregateVersion = fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(versions, ";"))))
+	hash.WriteString(fmt.Sprintf("%016x", versionSum))
+	policy.aggregateVersion = hash.Sum()
 
 	// Process found namespace-level policy.
 	policy.namespaceMutualTLSMode = make(map[string]MutualTLSMode, len(foundNamespaceMTLS))
@@ -198,29 +210,13 @@ func (policy *AuthenticationPolicies) GetNamespaceMutualTLSMode(namespace string
 }
 
 // GetJwtPoliciesForWorkload returns a list of JWT policies matching to labels.
-func (policy *AuthenticationPolicies) GetJwtPoliciesForWorkload(namespace string,
-	workloadLabels labels.Instance,
-	isWaypoint bool,
-) []*config.Config {
-	return getConfigsForWorkload(policy.requestAuthentications, WorkloadSelectionOpts{
-		RootNamespace:  policy.rootNamespace,
-		Namespace:      namespace,
-		WorkloadLabels: workloadLabels,
-		IsWaypoint:     isWaypoint,
-	})
+func (policy *AuthenticationPolicies) GetJwtPoliciesForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config {
+	return getConfigsForWorkload(policy.rootNamespace, policy.requestAuthentications, policyMatcher)
 }
 
 // GetPeerAuthenticationsForWorkload returns a list of peer authentication policies matching to labels.
-func (policy *AuthenticationPolicies) GetPeerAuthenticationsForWorkload(namespace string,
-	workloadLabels labels.Instance,
-	isWaypoint bool,
-) []*config.Config {
-	return getConfigsForWorkload(policy.peerAuthentications, WorkloadSelectionOpts{
-		RootNamespace:  policy.rootNamespace,
-		Namespace:      namespace,
-		WorkloadLabels: workloadLabels,
-		IsWaypoint:     isWaypoint,
-	})
+func (policy *AuthenticationPolicies) GetPeerAuthenticationsForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config {
+	return getConfigsForWorkload(policy.rootNamespace, policy.peerAuthentications, policyMatcher)
 }
 
 // GetRootNamespace return root namespace that is tracked by the policy object.
@@ -242,20 +238,56 @@ func GetAmbientPolicyConfigName(key ConfigKey) string {
 	}
 }
 
-func getConfigsForWorkload(configsByNamespace map[string][]config.Config, selectionOpts WorkloadSelectionOpts) []*config.Config {
-	workloadLabels := selectionOpts.WorkloadLabels
-	namespace := selectionOpts.Namespace
-	rootNamespace := selectionOpts.RootNamespace
-	configs := make([]*config.Config, 0)
-	var lookupInNamespaces []string
-	if namespace != rootNamespace {
-		// Only check the root namespace if the (workload) namespace is not already the root namespace
-		// to avoid double inclusion.
-		lookupInNamespaces = []string{namespace, rootNamespace}
-	} else {
-		lookupInNamespaces = []string{namespace}
+func (policy *AuthenticationPolicies) GetPeerAuthentications() map[string][]config.Config {
+	return policy.peerAuthentications
+}
+
+func (policy *AuthenticationPolicies) GetGlobalMutualTLSMode() MutualTLSMode {
+	return policy.globalMutualTLSMode
+}
+
+// FilterPeerAuthenticationNamespaces creates a new AuthenticationPolicies containing only
+// PeerAuthentication policies from the specified namespaces.
+func (policy *AuthenticationPolicies) FilterPeerAuthenticationNamespaces(namespaces sets.Set[string]) PeerAuthnPolicies {
+	filtered := &AuthenticationPolicies{
+		peerAuthentications:    make(map[string][]config.Config, len(namespaces)+1),
+		namespaceMutualTLSMode: make(map[string]MutualTLSMode, len(namespaces)+1),
+		globalMutualTLSMode:    policy.globalMutualTLSMode,
+		rootNamespace:          policy.rootNamespace,
+		aggregateVersion:       policy.aggregateVersion,
 	}
-	for _, ns := range lookupInNamespaces {
+
+	var versionSum uint64
+	h := hash.New()
+	for ns := range namespaces {
+		if configs, ok := policy.peerAuthentications[ns]; ok {
+			filtered.peerAuthentications[ns] = configs
+			for _, cfg := range configs {
+				h.WriteString(cfg.UID + "." + cfg.ResourceVersion)
+				versionSum += h.Sum64()
+				h.Reset()
+			}
+		}
+		if mode, ok := policy.namespaceMutualTLSMode[ns]; ok {
+			filtered.namespaceMutualTLSMode[ns] = mode
+		}
+	}
+
+	h.WriteString(fmt.Sprintf("%016x", versionSum))
+	filtered.aggregateVersion = h.Sum()
+
+	return filtered
+}
+
+func getConfigsForWorkload(rootNamespace string, configsByNamespace map[string][]config.Config, selectionOpts WorkloadPolicyMatcher) []*config.Config {
+	workloadLabels := selectionOpts.WorkloadLabels
+	namespace := selectionOpts.WorkloadNamespace
+	configs := make([]*config.Config, 0)
+	lookupInNamespaces := []string{namespace, rootNamespace}
+	for _, svc := range selectionOpts.Services {
+		lookupInNamespaces = append(lookupInNamespaces, svc.Namespace)
+	}
+	for _, ns := range slices.FilterDuplicates(lookupInNamespaces) {
 		if nsConfig, ok := configsByNamespace[ns]; ok {
 			for idx := range nsConfig {
 				cfg := &nsConfig[idx]
@@ -264,27 +296,21 @@ func getConfigsForWorkload(configsByNamespace map[string][]config.Config, select
 					log.Warnf("Seeing config %s with namespace %s in map entry for %s. Ignored", cfg.Name, cfg.Namespace, ns)
 					continue
 				}
-				var selector labels.Instance // NOTE: nil/empty selector matches all workloads
 				switch cfg.GroupVersionKind {
 				case gvk.RequestAuthentication:
 					ra := cfg.Spec.(*v1beta1.RequestAuthentication)
-					switch getPolicyMatcher(cfg.GroupVersionKind, cfg.Name, selectionOpts, ra) {
-					case policyMatchSelector:
-						selector = ra.GetSelector().GetMatchLabels()
-					case policyMatchDirect:
+					should := selectionOpts.WithRootNamespace(rootNamespace).ShouldAttachPolicy(cfg.GroupVersionKind, cfg.NamespacedName(), ra)
+					if should {
 						configs = append(configs, cfg)
-						continue
-					case policyMatchIgnore:
-						continue
 					}
 				case gvk.PeerAuthentication:
-					selector = cfg.Spec.(*v1beta1.PeerAuthentication).GetSelector().GetMatchLabels()
+					selector := labels.Instance(cfg.Spec.(*v1beta1.PeerAuthentication).GetSelector().GetMatchLabels())
+					if selector.SubsetOf(workloadLabels) {
+						configs = append(configs, cfg)
+					}
 				default:
 					log.Warnf("Not support authentication type %q", cfg.GroupVersionKind)
 					continue
-				}
-				if selector.SubsetOf(workloadLabels) {
-					configs = append(configs, cfg)
 				}
 			}
 		}

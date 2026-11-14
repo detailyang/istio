@@ -17,29 +17,37 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"istio.io/api/annotation"
 	"istio.io/api/label"
-	"istio.io/istio/cni/pkg/ambient"
 	"istio.io/istio/cni/pkg/constants"
+	"istio.io/istio/cni/pkg/util"
+	"istio.io/istio/pkg/file"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
 var (
-	injectAnnotationKey = annotation.SidecarInject.Name
-	sidecarStatusKey    = annotation.SidecarStatus.Name
+	sidecarStatusKey = annotation.SidecarStatus.Name
 
 	podRetrievalMaxRetries = 30
 	podRetrievalInterval   = 1 * time.Second
@@ -50,49 +58,32 @@ const (
 	ISTIOPROXY = "istio-proxy"
 )
 
-// Kubernetes a K8s specific struct to hold config
-type Kubernetes struct {
-	K8sAPIRoot           string   `json:"k8s_api_root"`
-	Kubeconfig           string   `json:"kubeconfig"`
-	InterceptRuleMgrType string   `json:"intercept_type"`
-	NodeName             string   `json:"node_name"`
-	ExcludeNamespaces    []string `json:"exclude_namespaces"`
-	CNIBinDir            string   `json:"cni_bin_dir"`
-}
-
 // Config is whatever you expect your configuration json to be. This is whatever
 // is passed in on stdin. Your plugin may wish to expose its functionality via
 // runtime args, see CONVENTIONS.md in the CNI spec.
 type Config struct {
-	types.NetConf           // You may wish to not nest this type
-	RuntimeConfig *struct { // SampleConfig map[string]interface{} `json:"sample"`
-	} `json:"runtimeConfig"`
-
-	// This is the previous result, when called in the context of a chained
-	// plugin. Because this plugin supports multiple versions, we'll have to
-	// parse this in two passes. If your plugin is not chained, this can be
-	// removed (though you may wish to error if a non-chainable plugin is
-	// chained.
-	// If you need to modify the result before returning it, you will need
-	// to actually convert it to a concrete versioned struct.
-	RawPrevResult *map[string]any `json:"prevResult"`
-	PrevResult    *cniv1.Result   `json:"-"`
+	types.NetConf
 
 	// Add plugin-specific flags here
-	LogLevel       string     `json:"log_level"`
-	LogUDSAddress  string     `json:"log_uds_address"`
-	AmbientEnabled bool       `json:"ambient_enabled"`
-	Kubernetes     Kubernetes `json:"kubernetes"`
+	PluginLogLevel              string                    `json:"plugin_log_level"`
+	CNIAgentRunDir              string                    `json:"cni_agent_run_dir"`
+	AmbientEnabled              bool                      `json:"ambient_enabled"`
+	EnablementSelectors         []util.EnablementSelector `json:"enablement_selectors"`
+	ExcludeNamespaces           []string                  `json:"exclude_namespaces"`
+	PodNamespace                string                    `json:"pod_namespace"`
+	NativeNftables              bool                      `json:"native_nftables"`
+	EnableAmbientDetectionRetry bool                      `json:"enable_ambient_detection_retry"`
 }
 
 // K8sArgs is the valid CNI_ARGS used for Kubernetes
-// The field names need to match exact keys in kubelet args for unmarshalling
+// The field names need to match exact keys in containerd args for unmarshalling
+// https://github.com/containerd/containerd/blob/ced9b18c231a28990617bc0a4b8ce2e81ee2ffa1/pkg/cri/server/sandbox_run.go#L526-L532
 type K8sArgs struct {
 	types.CommonArgs
-	IP                         net.IP
 	K8S_POD_NAME               types.UnmarshallableString // nolint: revive, stylecheck
 	K8S_POD_NAMESPACE          types.UnmarshallableString // nolint: revive, stylecheck
 	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString // nolint: revive, stylecheck
+	K8S_POD_UID                types.UnmarshallableString // nolint: revive, stylecheck
 }
 
 // parseConfig parses the supplied configuration (and prevResult) from stdin.
@@ -103,6 +94,7 @@ func parseConfig(stdin []byte) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse network configuration: %v", err)
 	}
 
+	log.Debugf("istio-cni: Config is: %+v", conf)
 	// Parse previous result. Remove this if your plugin is not chained.
 	if conf.RawPrevResult != nil {
 		resultBytes, err := json.Marshal(conf.RawPrevResult)
@@ -124,26 +116,28 @@ func parseConfig(stdin []byte) (*Config, error) {
 	return &conf, nil
 }
 
-func getLogLevel(logLevel string) log.Level {
-	switch logLevel {
-	case "debug":
-		return log.DebugLevel
-	case "warn":
-		return log.WarnLevel
-	case "error":
-		return log.ErrorLevel
-	case "info":
-		return log.InfoLevel
-	}
-	return log.InfoLevel
-}
-
-func GetLoggingOptions(udsAddress string) *log.Options {
+// Logging with CNI plugins is special - we *cannot* log to stdout, as the CNI spec uses stdin/stdout to pass context between invoked plugins.
+// So, we log to a rolling logfile, and also forward logs via UDS to the node agent (if available)
+func GetLoggingOptions(cfg *Config) *log.Options {
 	loggingOptions := log.DefaultOptions()
 	loggingOptions.OutputPaths = []string{"stderr"}
 	loggingOptions.JSONEncoding = true
-	if udsAddress != "" {
-		loggingOptions.WithTeeToUDS(udsAddress, constants.UDSLogPath)
+	if cfg != nil {
+
+		udsAddr := filepath.Join(cfg.CNIAgentRunDir, constants.LogUDSSocketName)
+		// Tee all logs to UDS. Stdout will go to kubelet (hard to access, UDS will be read by the CNI DaemonSet and exposed
+		// by normal `kubectl logs`
+		if file.Exists(udsAddr) {
+			loggingOptions.WithTeeToUDS(udsAddr, constants.UDSLogPath)
+		}
+
+		// Also tee to a rolling log on the node's local filesystem, in case the UDS server is down.
+		loggingOptions.WithTeeToRollingLocal(filepath.Join(cfg.CNIAgentRunDir, constants.LocalRollingLogName), constants.RollingLogMaxSizeMB)
+
+		// Override plugin log level based on their config. Note we use "all" (OverrideScopeName) since there is no scoping in the plugin.
+		if cfg.PluginLogLevel != "" {
+			loggingOptions.SetDefaultOutputLevel(log.OverrideScopeName, log.StringToLevel(cfg.PluginLogLevel))
+		}
 	}
 	return loggingOptions
 }
@@ -160,7 +154,7 @@ func CmdAdd(args *skel.CmdArgs) (err error) {
 				// present both.
 				msg = fmt.Sprintf("%s: %v", msg, err)
 			}
-			err = fmt.Errorf(msg)
+			err = errors.New(msg)
 		}
 		if err != nil {
 			log.Errorf("istio-cni cmdAdd error: %v", err)
@@ -172,14 +166,47 @@ func CmdAdd(args *skel.CmdArgs) (err error) {
 		log.Errorf("istio-cni cmdAdd failed to parse config %v %v", string(args.StdinData), err)
 		return err
 	}
-	if err := doRun(args, conf); err != nil {
+
+	// Preemptively check if the pod is a CNI pod.
+	// It is possible that the kubeconfig is not available if it hasn't been written yet
+	// by the CNI pod or it is invalid which cause the CNI pod to be unable to start if
+	// on the creation of a new K8s client. We preemptively check if the pod is a CNI pod
+	// to avoid a deadlock on the kubeconfig when the k8s client is unnecessary to process
+	// the CNI add event for the CNI pod itself. This applies to both ambient and sidecar
+	// mode, since newK8sClient below runs unconditionally and would otherwise deadlock the
+	// CNI pod when its kubeconfig is not yet present (for example after a node reboot).
+	k8sArgs := K8sArgs{}
+	if err := types.LoadArgs(args.Args, &k8sArgs); err != nil {
+		return fmt.Errorf("failed to load args: %v", err)
+	}
+	if isCNIPod(conf, &k8sArgs) {
+		// This is our own agent pod, so the kube client is not needed to process the
+		// event. Skip it rather than block on a kubeconfig that may not exist yet.
+		log.Infof("%v looks like our own agent pod, skipping", k8sArgs.K8S_POD_NAME)
+		return pluginResponse(conf)
+	}
+
+	// Create a kube client
+	client, err := newK8sClient(*conf)
+	if err != nil {
+		return fmt.Errorf("failed to createNewK8sClient: %v", err)
+	}
+
+	// Actually do the add
+	mgr := IptablesInterceptRuleMgr()
+	if conf.NativeNftables {
+		mgr = NftablesInterceptRuleMgr()
+	}
+	if err := doAddRun(args, conf, client, mgr); err != nil {
 		return err
 	}
 	return pluginResponse(conf)
 }
 
-func doRun(args *skel.CmdArgs, conf *Config) error {
-	setupLogging(conf)
+func doAddRun(args *skel.CmdArgs, conf *Config, kClient kubernetes.Interface, rulesMgr InterceptRuleMgr) error {
+	if err := log.Configure(GetLoggingOptions(conf)); err != nil {
+		log.Error("Failed to configure istio-cni logging")
+	}
 
 	var loggedPrevResult any
 	if conf.PrevResult == nil {
@@ -196,11 +223,6 @@ func doRun(args *skel.CmdArgs, conf *Config) error {
 		return err
 	}
 
-	interceptRuleMgrType := defInterceptRuleMgrType
-	if conf.Kubernetes.InterceptRuleMgrType != "" {
-		interceptRuleMgrType = conf.Kubernetes.InterceptRuleMgrType
-	}
-
 	// Check if the workload is running under Kubernetes.
 	podNamespace := string(k8sArgs.K8S_POD_NAMESPACE)
 	podName := string(k8sArgs.K8S_POD_NAME)
@@ -210,57 +232,90 @@ func doRun(args *skel.CmdArgs, conf *Config) error {
 		return nil
 	}
 
-	for _, excludeNs := range conf.Kubernetes.ExcludeNamespaces {
-		if podNamespace == excludeNs {
-			log.Infof("pod namespace excluded")
-			return nil
-		}
+	if slices.Contains(conf.ExcludeNamespaces, podNamespace) {
+		log.Infof("pod namespace %s excluded", podNamespace)
+		return nil
 	}
 
-	client, err := newKubeClient(*conf)
-	if err != nil {
-		return err
-	}
-
+	// Begin ambient plugin logic
+	// For ambient pods, this is all the logic we need to run
 	if conf.AmbientEnabled {
-		ambientConf, err := ambient.ReadAmbientConfig()
+		log.Debugf("istio-cni ambient cmdAdd podName: %s - checking if ambient enabled", podName)
+		podIsAmbient, err := isAmbientPod(kClient, podName, podNamespace, conf.EnablementSelectors, conf.EnableAmbientDetectionRetry)
 		if err != nil {
-			log.Errorf("istio-cni cmdAdd failed to read ambient config %v", err)
-			return err
+			log.Errorf("istio-cni cmdAdd failed to check if pod is ambient: %s", err)
+			// Conditionally return the error based on whether istio owned CNI is configured
+			// to support gradual rollout of feature in critical code path
+			if conf.EnableAmbientDetectionRetry {
+				return err
+			}
 		}
 
-		log.Debugf("ambientConf.ZTunnelReady: %v", ambientConf.ZTunnelReady)
-		added := false
-		podIPs, err := getPodIPs(args.IfName, conf.PrevResult)
-		if err != nil {
-			log.Errorf("istio-cni cmdAdd failed to get pod IPs: %s", err)
-			return err
-		}
-		log.Infof("istio-cni ambient cmdAdd podName: %s podIPs: %+v", podName, podIPs)
-		added, err = checkAmbient(client, *ambientConf, podName, podNamespace, args.IfName, args.Netns, podIPs)
-		if err != nil {
-			log.Errorf("istio-cni cmdAdd failed to check ambient: %s", err)
-			return err
+		var prevResIps []*cniv1.IPConfig
+		if conf.PrevResult != nil {
+			prevResult := conf.PrevResult.(*cniv1.Result)
+			prevResIps = prevResult.IPs
 		}
 
-		if added {
+		// Only send event if this pod "would be" an ambient-watched pod - otherwise skip
+		if podIsAmbient {
+			cniEventAddr := filepath.Join(conf.CNIAgentRunDir, constants.CNIEventSocketName)
+			cniClient := newCNIClient(cniEventAddr, constants.CNIAddEventPath)
+			if err = PushCNIEvent(cniClient, args, prevResIps, podName, podNamespace); err != nil {
+				// return a more informative error in the pod event log if CNI plugin fails
+				wrapErr := fmt.Errorf("istio-cni cmdAdd failed to contact node Istio CNI agent: %s", err)
+				return wrapErr
+			}
 			return nil
 		}
-		// Otherwise, continue. We may need to add sidecar redirection
+		log.Debugf("istio-cni ambient cmdAdd podName: %s - not ambient enabled, ignoring", podName)
 	}
+	// End ambient plugin logic
 
 	pi := &PodInfo{}
 	var k8sErr error
 	for attempt := 1; attempt <= podRetrievalMaxRetries; attempt++ {
-		pi, k8sErr = getKubePodInfo(client, podName, podNamespace)
+		pi, k8sErr = getK8sPodInfo(kClient, podName, podNamespace)
 		if k8sErr == nil {
 			break
 		}
-		log.Debugf("Failed to get %s/%s pod info: %v", podNamespace, podName, k8sErr)
+		log.Debugf("Failed to get pod info: %v", k8sErr)
+
+		// Failsafe - if we get here, we could be in a state where
+		// 1. We are being upgraded - `istio-cni` node agent pod is gone
+		// 2. This plugin was left in place to stall pod spawns until the
+		// replacement arrives.
+		// 3. This plugin can't contact the K8S API server (creds expired/invalid)
+		// 4. The pod this plugin would be blocking by returning this error
+		// *is* our replacement `istio-cni` pod (which would refresh our creds)
+		//
+		// So, if we can't contact the K8S API server at all, fall back to checking the
+		// K8S_POD/K8S_NAMESPACE values from the CNI layer, and let this pod through
+		// if it looks like it might be our `istio-cni` node agent.
+		//
+		// We could do this check unconditionally above, but it seems smarter to only
+		// fall back to this (lightly) relaxed check when we know we are in a degraded state.
+		//
+		// Is this fail open? Not really, the K8S args come from the cluster's CNI and are as-authoritative
+		// as the hard query we would otherwise make against the API.
+		//
+		// TODO NRI could probably give us more identifying information here OOB from k8s.
+		if isCNIPod(conf, &k8sArgs) {
+			log.Infof("in a degraded state and %v looks like our own agent pod, skipping", k8sArgs.K8S_POD_NAME)
+			return nil
+		}
+		if attempt == 1 {
+			// Only warn once: this loop retries up to podRetrievalMaxRetries times and the
+			// verdict does not change between attempts.
+			log.Warnf("in a degraded state and %s is not a CNI pod, podNamespace: %s, conf pod namespace: %s",
+				k8sArgs.K8S_POD_NAME, k8sArgs.K8S_POD_NAMESPACE, conf.PodNamespace)
+		}
+
 		time.Sleep(podRetrievalInterval)
 	}
+
 	if k8sErr != nil {
-		log.Errorf("Failed to get %s/%s pod info: %v", podNamespace, podName, k8sErr)
+		log.Errorf("Failed to get pod info: %v", k8sErr)
 		return k8sErr
 	}
 
@@ -272,7 +327,7 @@ func doRun(args *skel.CmdArgs, conf *Config) error {
 
 	if val, ok := pi.ProxyEnvironments["DISABLE_ENVOY"]; ok {
 		if val, err := strconv.ParseBool(val); err == nil && val {
-			log.Infof("excluded due to DISABLE_ENVOY on istio-proxy", podNamespace, podName)
+			log.Infof("excluded due to DISABLE_ENVOY on istio-proxy")
 			return nil
 		}
 	}
@@ -287,11 +342,7 @@ func doRun(args *skel.CmdArgs, conf *Config) error {
 		return nil
 	}
 
-	val := pi.Annotations[injectAnnotationKey]
-	if lbl, labelPresent := pi.Labels[label.SidecarInject.Name]; labelPresent {
-		// The label is the new API; if both are present we prefer the label
-		val = lbl
-	}
+	val := pi.Labels[label.SidecarInject.Name]
 	if val != "" {
 		log.Debugf("contains inject annotation: %s", val)
 		if injectEnabled, err := strconv.ParseBool(val); err == nil {
@@ -315,29 +366,11 @@ func doRun(args *skel.CmdArgs, conf *Config) error {
 		return err
 	}
 
-	// Get the constructor for the configured type of InterceptRuleMgr
-	interceptMgrCtor := GetInterceptRuleMgrCtor(interceptRuleMgrType)
-	if interceptMgrCtor == nil {
-		log.Errorf("Pod redirect failed due to unavailable InterceptRuleMgr of type %s", interceptRuleMgrType)
-		return fmt.Errorf("redirect failed to find InterceptRuleMgr")
-	}
-
-	rulesMgr := interceptMgrCtor()
 	if err := rulesMgr.Program(podName, args.Netns, redirect); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-func setupLogging(conf *Config) {
-	if conf.LogUDSAddress != "" {
-		// reconfigure log output with tee to UDS if UDS log is enabled.
-		if err := log.Configure(GetLoggingOptions(conf.LogUDSAddress)); err != nil {
-			log.Error("Failed to configure istio-cni with UDS log")
-		}
-	}
-	log.FindScope("default").SetOutputLevel(getLogLevel(conf.LogLevel))
 }
 
 func pluginResponse(conf *Config) error {
@@ -346,11 +379,11 @@ func pluginResponse(conf *Config) error {
 		result = &cniv1.Result{
 			CNIVersion: cniv1.ImplementedSpecVersion,
 		}
-	} else {
-		// Pass through the result for the next plugin
-		result = conf.PrevResult
+		return types.PrintResult(result, conf.CNIVersion)
 	}
-	return types.PrintResult(result, conf.CNIVersion)
+
+	// Pass through the result for the next plugin
+	return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 }
 
 func CmdCheck(args *skel.CmdArgs) (err error) {
@@ -361,24 +394,46 @@ func CmdDelete(args *skel.CmdArgs) (err error) {
 	return nil
 }
 
-func getPodIPs(iface string, prevResult *cniv1.Result) ([]net.IPNet, error) {
-	if prevResult == nil || len(prevResult.IPs) == 0 {
-		return nil, fmt.Errorf("no ip addresses supplied")
+func isAmbientPod(client kubernetes.Interface, podName, podNamespace string, selectors []util.EnablementSelector, enableRetry bool) (bool, error) {
+	compiledSelectors, err := util.NewCompiledEnablementSelectors(selectors)
+	if err != nil {
+		return false, fmt.Errorf("failed to instantiate ambient enablement selector: %v", err)
 	}
 
-	ips := make([]net.IPNet, 0, len(prevResult.IPs))
-
-	for _, ipConfig := range prevResult.IPs {
-		if ipConfig.Interface == nil {
-			ips = append(ips, ipConfig.Address)
-			continue
-		}
-		idx := *ipConfig.Interface
-		if idx >= 0 && idx < len(prevResult.Interfaces) && prevResult.Interfaces[idx].Name != iface {
-			continue
-		}
-		ips = append(ips, ipConfig.Address)
+	maxRetries := 1
+	if enableRetry {
+		maxRetries = podRetrievalMaxRetries
 	}
 
-	return ips, nil
+	var pod *v1.Pod
+	var ns *v1.Namespace
+	var podErr, nsErr error
+
+	err = backoff.Retry(func() error {
+		// attempt to get pod and namespace
+		pod, podErr = client.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
+		ns, nsErr = client.CoreV1().Namespaces().Get(context.Background(), podNamespace, metav1.GetOptions{})
+		if podErr != nil || nsErr != nil {
+			errMsg := fmt.Sprintf("failed to get pod or namespace info, retrying: podErr=%v, nsErr=%v", podErr, nsErr)
+			log.Debug(errMsg)
+			// reset pod and ns to force re-get to avoid stale resources
+			pod, ns = nil, nil
+			return errors.New(errMsg)
+		}
+		return nil
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(podRetrievalInterval), uint64(maxRetries)))
+	if err != nil {
+		return false, fmt.Errorf("failed to get pod or namespace info: podErr=%v, nsErr=%v", podErr, nsErr)
+	}
+
+	return compiledSelectors.Matches(pod, ns.Labels), nil
+}
+
+// isCNIPod reports whether the CNI args look like our own istio-cni node agent pod.
+// It deliberately does not log: it is called both on the normal path for every ADD,
+// where a false result is unremarkable, and from the degraded failsafe, where a false
+// result is worth a warning. The caller has the context to pick the right level.
+func isCNIPod(conf *Config, k8sArgs *K8sArgs) bool {
+	return strings.HasPrefix(string(k8sArgs.K8S_POD_NAME), "istio-cni-node-") &&
+		string(k8sArgs.K8S_POD_NAMESPACE) == conf.PodNamespace
 }

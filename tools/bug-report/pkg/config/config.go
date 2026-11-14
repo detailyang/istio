@@ -141,6 +141,9 @@ type BugReportConfig struct {
 	// FullSecrets controls whether secret contents are included.
 	FullSecrets bool `json:"fullSecrets,omitempty"`
 
+	// ProxyAdminPort is envoy proxy admin port
+	ProxyAdminPort int `json:"proxyAdminPort,omitempty"`
+
 	// CommandTimeout is the maximum amount of time running the command
 	// before giving up, even if not all logs are captured. Upon timeout,
 	// the command creates an archive with only the logs captured so far.
@@ -176,6 +179,21 @@ type BugReportConfig struct {
 
 	// RequestConcurrency controls the request concurrency limit to the API server.
 	RequestConcurrency int `json:"requestConcurrency,omitempty"`
+
+	// TailLines limits the number of log lines fetched per container.
+	// 0 means unlimited.
+	TailLines int64 `json:"tailLines,omitempty"`
+
+	// SkipClusterDump skips fetching cluster-wide resources (K8s resources, CRs, node info, secrets).
+	SkipClusterDump bool `json:"skipClusterDump,omitempty"`
+	// SkipAnalyze skips running istioctl analyze.
+	SkipAnalyze bool `json:"skipAnalyze,omitempty"`
+	// SkipProxyDebug skips fetching envoy admin debug info from proxy pods.
+	SkipProxyDebug bool `json:"skipProxyDebug,omitempty"`
+	// SkipNetstat skips running netstat in proxy containers.
+	SkipNetstat bool `json:"skipNetstat,omitempty"`
+	// SkipCoredumps skips collecting coredumps from proxy containers.
+	SkipCoredumps bool `json:"skipCoredumps,omitempty"`
 }
 
 func (b *BugReportConfig) String() string {
@@ -232,7 +250,11 @@ func parseToIncludeTypeMap(s string) (map[string]string, error) {
 func (s *SelectionSpec) UnmarshalJSON(b []byte) error {
 	ft := []ResourceType{Namespace, Deployment, Pod, Label, Annotation, Container}
 	str := strings.TrimPrefix(strings.TrimSuffix(string(b), `"`), `"`)
-	for i, f := range strings.Split(str, "/") {
+	parts := strings.Split(str, "/")
+	if len(parts) > len(ft) {
+		return fmt.Errorf("bad selection spec %q: expected at most %d slash-separated fields", str, len(ft))
+	}
+	for i, f := range parts {
 		var err error
 		switch ft[i] {
 		case Namespace:

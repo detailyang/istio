@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 //  Copyright Istio Authors
 //
@@ -35,6 +34,7 @@ var (
 func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
+		Label(label.Full).
 		// Needed as it requires an environmental variable
 		Label(label.CustomSetup).
 		Setup(istio.Setup(&inst, setupConfig)).

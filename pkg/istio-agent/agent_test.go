@@ -30,7 +30,6 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -41,6 +40,7 @@ import (
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	testutil "istio.io/istio/pilot/test/util"
+	xdsfake "istio.io/istio/pilot/test/xds"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/bootstrap"
 	"istio.io/istio/pkg/bootstrap/platform"
@@ -59,16 +59,54 @@ import (
 	"istio.io/istio/pkg/version"
 	"istio.io/istio/security/pkg/credentialfetcher/plugin"
 	"istio.io/istio/security/pkg/nodeagent/cache"
-	camock "istio.io/istio/security/pkg/nodeagent/caclient/providers/mock"
 	"istio.io/istio/security/pkg/nodeagent/cafile"
 	"istio.io/istio/security/pkg/nodeagent/sds"
 	"istio.io/istio/security/pkg/nodeagent/test/mock"
 	pkiutil "istio.io/istio/security/pkg/pki/util"
-	"istio.io/istio/security/pkg/stsservice"
-	stsmock "istio.io/istio/security/pkg/stsservice/mock"
-	stsserver "istio.io/istio/security/pkg/stsservice/server"
 	"istio.io/istio/tests/util/leak"
 )
+
+func TestServiceNode(t *testing.T) {
+	cases := []struct {
+		in  *Proxy
+		out string
+	}{
+		{
+			in: &Proxy{
+				Type:        model.SidecarProxy,
+				IPAddresses: []string{"10.1.1.0"},
+				ID:          "v0.default",
+				DNSDomain:   "default.svc.cluster.local",
+			},
+			out: "sidecar~10.1.1.0~v0.default~default.svc.cluster.local",
+		},
+		{
+			in: &Proxy{
+				Type:        model.Router,
+				ID:          "random",
+				IPAddresses: []string{"10.3.3.3"},
+				DNSDomain:   "local",
+			},
+			out: "router~10.3.3.3~random~local",
+		},
+		{
+			in: &Proxy{
+				Type:        model.SidecarProxy,
+				ID:          "random",
+				IPAddresses: []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6"},
+				DNSDomain:   "local",
+			},
+			out: "sidecar~10.3.3.3~random~local",
+		},
+	}
+
+	for _, node := range cases {
+		out := node.in.ServiceNode()
+		if out != node.out {
+			t.Errorf("%#v.ServiceNode() => Got %s, want %s", node.in, out, node.out)
+		}
+	}
+}
 
 func TestAgent(t *testing.T) {
 	test.SetForTest(t, &version.Info.Version, "version")
@@ -299,11 +337,11 @@ func TestAgent(t *testing.T) {
 		})
 	})
 	t.Run("Unhealthy SDS socket", func(t *testing.T) {
-		dir := filepath.Dir(security.WorkloadIdentitySocketPath)
+		dir := filepath.Dir(security.GetIstioSDSServerSocketPath())
 		os.MkdirAll(dir, 0o755)
 
 		// starting an unresponsive listener on the socket
-		l, err := net.Listen("unix", security.WorkloadIdentitySocketPath)
+		l, err := net.Listen("unix", security.GetIstioSDSServerSocketPath())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,11 +356,11 @@ func TestAgent(t *testing.T) {
 
 	t.Run("Unhealthy SDS socket - required", func(t *testing.T) {
 		// starting an unresponsive listener on the socket
-		a := NewAgent(nil, &AgentOptions{UseExternalWorkloadSDS: true}, nil, envoy.ProxyConfig{})
+		a := NewAgent(nil, &AgentOptions{WorkloadIdentitySocketFile: "non-default-sockfile"}, nil, envoy.ProxyConfig{})
 		ctx, done := context.WithCancel(context.Background())
 		_, err := a.Run(ctx)
 		if err == nil {
-			t.Fatalf("expected to return an error if SDS socket not provided")
+			t.Fatal("expected to return an error if SDS socket not provided, and not default")
 		}
 		t.Cleanup(done)
 		t.Cleanup(func() {
@@ -438,42 +476,15 @@ func TestAgent(t *testing.T) {
 		go sds[security.WorkloadKeyCertResourceName].DrainResponses()
 		expectFileUnchanged(t, filepath.Join(dir, "cert-chain.pem"), filepath.Join(dir, "key.pem"))
 	})
-	t.Run("Token exchange", func(t *testing.T) {
-		// This is used in environments where the CA expects a different token type than K8s jwt, and
-		// exchanges it for another form using TokenExchanger
-		Setup(t, func(a AgentTest) AgentTest {
-			a.CaAuthenticator.Set("some-token", "")
-			a.Security.TokenExchanger = camock.NewMockTokenExchangeServer(map[string]string{"fake": "some-token"})
-			return a
-		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
-	})
-	t.Run("Token exchange with credential fetcher", func(t *testing.T) {
-		// This is used with platform credentials, where the platform provides some underlying
-		// identity (typically for VMs, not Kubernetes), which is exchanged with TokenExchanger
-		// before sending to the CA.
-		dir := mktemp()
-		a := Setup(t, func(a AgentTest) AgentTest {
-			a.CaAuthenticator.Set("some-token", "")
-			a.XdsAuthenticator.Set("", fakeSpiffeID)
-			a.Security.TokenExchanger = camock.NewMockTokenExchangeServer(map[string]string{"platform-cred": "some-token"})
-			a.Security.CredFetcher = plugin.CreateMockPlugin("platform-cred")
-			a.Security.OutputKeyCertToDir = dir
-			a.Security.ProvCert = dir
-			a.AgentConfig.XDSRootCerts = filepath.Join(certDir, "root-cert.pem")
-			return a
-		})
 
-		a.Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
-	})
-	t.Run("Token exchange with credential fetcher downtime", func(t *testing.T) {
+	t.Run("credential fetcher downtime", func(t *testing.T) {
 		// This ensures our pre-warming is resilient to temporary downtime of the CA
 		dir := mktemp()
 		a := Setup(t, func(a AgentTest) AgentTest {
 			// Make CA deny all requests to simulate downtime
 			a.CaAuthenticator.Set("", "")
 			a.XdsAuthenticator.Set("", fakeSpiffeID)
-			a.Security.TokenExchanger = camock.NewMockTokenExchangeServer(map[string]string{"platform-cred": "some-token"})
-			a.Security.CredFetcher = plugin.CreateMockPlugin("platform-cred")
+			a.Security.CredFetcher = plugin.CreateMockPlugin("some-token")
 			a.Security.OutputKeyCertToDir = dir
 			a.Security.ProvCert = dir
 			a.AgentConfig.XDSRootCerts = filepath.Join(certDir, "root-cert.pem")
@@ -515,7 +526,8 @@ func TestAgent(t *testing.T) {
 			a.ProxyConfig.ProxyAdminPort = 15000
 			a.AgentConfig.EnvoyPrometheusPort = 15090
 			a.AgentConfig.EnvoyStatusPort = 15021
-			a.AgentConfig.ProxyXDSDebugViaAgent = false // uses a fixed port
+			a.AgentConfig.EnvoySecureMetricsPort = 15091
+			a.AgentConfig.EnvoySecureMergedMetricsPort = 15092
 			return a
 		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
 		envoyReady(t, "first agent", 15000)
@@ -525,35 +537,11 @@ func TestAgent(t *testing.T) {
 			a.ProxyConfig.ProxyAdminPort = 25000
 			a.AgentConfig.EnvoyPrometheusPort = 25090
 			a.AgentConfig.EnvoyStatusPort = 25021
-			a.AgentConfig.ProxyXDSDebugViaAgent = false // uses a fixed port
+			a.AgentConfig.EnvoySecureMetricsPort = 25091
+			a.AgentConfig.EnvoySecureMergedMetricsPort = 25092
 			return a
 		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
 		envoyReady(t, "second agent", 25000)
-	})
-	t.Run("Envoy bootstrap discovery", func(t *testing.T) {
-		Setup(t, func(a AgentTest) AgentTest {
-			a.envoyEnable = true
-			a.ProxyConfig.StatusPort = 15020
-			a.ProxyConfig.ProxyAdminPort = 15000
-			a.AgentConfig.EnvoyPrometheusPort = 15090
-			a.AgentConfig.EnvoyStatusPort = 15021
-			a.AgentConfig.EnableDynamicBootstrap = true
-			return a
-		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
-		envoyReady(t, "bootstrap discovery", 15000)
-	})
-	t.Run("Envoy bootstrap retry", func(t *testing.T) {
-		Setup(t, func(a AgentTest) AgentTest {
-			a.envoyEnable = true
-			a.ProxyConfig.StatusPort = 15020
-			a.ProxyConfig.ProxyAdminPort = 15000
-			a.AgentConfig.EnvoyPrometheusPort = 15090
-			a.AgentConfig.EnvoyStatusPort = 15021
-			a.AgentConfig.EnableDynamicBootstrap = true
-			a.bootstrapGenerator = &FakeBootstrapGenerator{}
-			return a
-		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
-		envoyReady(t, "bootstrap discovery", 15000)
 	})
 	t.Run("gRPC XDS bootstrap", func(t *testing.T) {
 		bootstrapPath := path.Join(mktemp(), "grpc-bootstrap.json")
@@ -599,7 +587,7 @@ func TestAgent(t *testing.T) {
 			xdsc := xds.NewAdsTest(t, conn).WithMetadata(meta)
 			_ = xdsc.RequestResponseAck(t, nil)
 		}); err == nil {
-			t.Fatalf("connect success with wrong CA")
+			t.Fatal("connect success with wrong CA")
 		}
 
 		// change ROOT CA, XDS will success
@@ -607,24 +595,6 @@ func TestAgent(t *testing.T) {
 			t.Fatalf("failed to change root CA: %v", err)
 		}
 		a.Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
-	})
-	t.Run("GCP", func(t *testing.T) {
-		os.MkdirAll(filepath.Join(wd, "var/run/secrets/tokens"), 0o755)
-		os.WriteFile(filepath.Join(wd, "var/run/secrets/tokens/istio-token"), []byte("test-token"), 0o644)
-		a := Setup(t, func(a AgentTest) AgentTest {
-			a.envoyEnable = true
-			a.enableSTS = true
-			a.XdsAuthenticator.Set("Fake STS", "")
-			a.ProxyConfig.ProxyBootstrapTemplatePath = filepath.Join(env.IstioSrc, "./tools/packaging/common/gcp_envoy_bootstrap.json")
-			a.AgentConfig.Platform = &fakePlatform{meta: map[string]string{
-				"gcp_project": "my-sd-project",
-			}}
-			a.AgentConfig.XDSRootCerts = filepath.Join(env.IstioSrc, "./tests/testdata/certs/pilot/root-cert.pem")
-			return a
-		})
-		// We cannot actually check that envoy is ready, since it depends on RTDS and Istiod does not implement this.
-		// So instead just make sure it authenticated, which ensures the full STS flow properly functions
-		retry.UntilOrFail(t, func() bool { return a.XdsAuthenticator.Successes.Load() > 0 })
 	})
 }
 
@@ -639,7 +609,6 @@ type AgentTest struct {
 	bootstrapGenerator model.XdsResourceGenerator
 
 	envoyEnable bool
-	enableSTS   bool
 
 	agent *Agent
 }
@@ -651,6 +620,7 @@ func Setup(t *testing.T, opts ...func(a AgentTest) AgentTest) *AgentTest {
 		CaAuthenticator:  security.NewFakeAuthenticator("ca").Set("fake", ""),
 		ProxyConfig:      mesh.DefaultProxyConfig(),
 	}
+
 	// Run through opts one time just to get the authenticators.
 	for _, opt := range opts {
 		resp = opt(resp)
@@ -668,7 +638,7 @@ func Setup(t *testing.T, opts ...func(a AgentTest) AgentTest) *AgentTest {
 		ECCSigAlg:  string(pkiutil.EcdsaSigAlg),
 		CARootPath: cafile.CACertFilePath,
 	}
-	proxy := &model.Proxy{
+	proxy := &Proxy{
 		ID:          "pod1.fake-namespace",
 		DNSDomain:   "fake-namespace.svc.cluster.local",
 		Type:        model.SidecarProxy,
@@ -678,11 +648,15 @@ func Setup(t *testing.T, opts ...func(a AgentTest) AgentTest) *AgentTest {
 	resp.ProxyConfig.DiscoveryAddress = setupDiscovery(t, resp.XdsAuthenticator, ca.KeyCertBundle.GetRootCertPem(), resp.bootstrapGenerator)
 	rootCert := filepath.Join(env.IstioSrc, "./tests/testdata/certs/pilot/root-cert.pem")
 	resp.AgentConfig = AgentOptions{
-		ProxyXDSDebugViaAgent: true,
-		CARootCerts:           rootCert,
-		XDSRootCerts:          rootCert,
-		XdsUdsPath:            filepath.Join(d, "XDS"),
-		ServiceNode:           proxy.ServiceNode(),
+		CARootCerts:  rootCert,
+		XDSRootCerts: rootCert,
+		XdsUdsPath:   filepath.Join(d, "XDS"),
+		ServiceNode:  proxy.ServiceNode(),
+		SDSFactory: func(options *security.Options, workloadSecretCache security.SecretManager, pkpConf *meshconfig.PrivateKeyProvider) SDSService {
+			return sds.NewServer(options, workloadSecretCache, pkpConf)
+		},
+		// Set this, as we aren't loading defaults from env
+		WorkloadIdentitySocketFile: security.DefaultWorkloadIdentitySocketFile,
 	}
 
 	// Set-up envoy defaults
@@ -700,26 +674,6 @@ func Setup(t *testing.T, opts ...func(a AgentTest) AgentTest) *AgentTest {
 	for _, opt := range opts {
 		resp = opt(resp)
 	}
-	if resp.enableSTS {
-		tokenManager := stsmock.CreateFakeTokenManager()
-		tokenManager.SetRespStsParam(stsservice.StsResponseParameters{
-			AccessToken:     "Fake STS",
-			IssuedTokenType: "urn:ietf:params:oauth:token-type:access_token",
-			TokenType:       "Bearer",
-			ExpiresIn:       60,
-			Scope:           "example.com",
-		})
-		stsServer, err := stsserver.NewServer(stsserver.Config{
-			LocalHostAddr: "localhost",
-			LocalPort:     0,
-		}, tokenManager)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Security.STSPort = stsServer.Port
-		t.Cleanup(stsServer.Stop)
-	}
-
 	a := NewAgent(resp.ProxyConfig, &resp.AgentConfig, &resp.Security, envoy.ProxyConfig{TestOnly: !resp.envoyEnable})
 	t.Cleanup(a.Close)
 	ctx, done := context.WithCancel(context.Background())
@@ -753,7 +707,7 @@ func (a *AgentTest) Check(t *testing.T, expectedSDS ...string) map[string]*xds.A
 	sdsStreams := map[string]*xds.AdsTest{}
 	gotKeys := []string{}
 	for _, res := range xdstest.ExtractSecretResources(t, resp.Resources) {
-		sds := xds.NewSdsTest(t, setupDownstreamConnectionUDS(t, security.WorkloadIdentitySocketPath)).
+		sds := xds.NewSdsTest(t, setupDownstreamConnectionUDS(t, security.GetIstioSDSServerSocketPath())).
 			WithMetadata(meta).
 			WithTimeout(time.Second * 20) // CSR can be extremely slow with race detection enabled due to 2048 RSA
 		sds.RequestResponseAck(t, &discovery.DiscoveryRequest{ResourceNames: []string{res}})
@@ -851,7 +805,7 @@ func expectFileUnchanged(t *testing.T, files ...string) {
 		for i, f := range files {
 			now := testutil.ReadFile(t, f)
 			if !reflect.DeepEqual(initials[i], now) {
-				t.Fatalf("file is changed!")
+				t.Fatal("file is changed!")
 			}
 		}
 	}
@@ -875,8 +829,8 @@ func proxyConfigToMetadata(t *testing.T, proxyConfig *meshconfig.ProxyConfig) mo
 	t.Helper()
 	m := map[string]any{}
 	for k, v := range proxyConfig.ProxyMetadata {
-		if strings.HasPrefix(k, bootstrap.IstioMetaPrefix) {
-			m[strings.TrimPrefix(k, bootstrap.IstioMetaPrefix)] = v
+		if after, ok := strings.CutPrefix(k, bootstrap.IstioMetaPrefix); ok {
+			m[after] = v
 		}
 	}
 	b, err := json.Marshal(m)
@@ -953,8 +907,8 @@ func setupDiscovery(t *testing.T, auth *security.FakeAuthenticator, certPem []by
 	}
 	opt := tlsOptions(t, certPem)
 	// Set up a simple service to make sure we have mTLS requested
-	ds := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{ConfigString: `
-apiVersion: networking.istio.io/v1alpha3
+	ds := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{ConfigString: `
+apiVersion: networking.istio.io/v1
 kind: ServiceEntry
 metadata:
   name: app
@@ -962,12 +916,13 @@ metadata:
 spec:
   hosts:
   - app.com
+  location: MESH_INTERNAL
   ports:
   - number: 80
     name: http
     protocol: HTTP
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: plaintext
@@ -992,23 +947,130 @@ spec:
 	return net.JoinHostPort("localhost", fmt.Sprint(l.Addr().(*net.TCPAddr).Port))
 }
 
-type fakePlatform struct {
-	meta   map[string]string
-	labels map[string]string
+// serveHealthySocket starts a gRPC server on a unix socket at path, so that it passes
+// the agent's SDS socket health check.
+func serveHealthySocket(t *testing.T, path string) {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	go func() {
+		_ = s.Serve(l)
+	}()
+	t.Cleanup(s.Stop)
 }
 
-func (f *fakePlatform) Metadata() map[string]string {
-	return f.meta
-}
+func TestWaitForSocket(t *testing.T) {
+	t.Run("no timeout, no socket", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
 
-func (f *fakePlatform) Locality() *core.Locality {
-	return &core.Locality{}
-}
+		found, err := waitForSocket(context.Background(), path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			t.Fatal("expected no socket to be found")
+		}
+	})
 
-func (f *fakePlatform) Labels() map[string]string {
-	return f.labels
-}
+	t.Run("no timeout, healthy socket", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
+		serveHealthySocket(t, path)
 
-func (f *fakePlatform) IsKubernetes() bool {
-	return true
+		found, err := waitForSocket(context.Background(), path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatal("expected socket to be found")
+		}
+	})
+
+	t.Run("socket appears during wait", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
+		// Bind the socket only after the wait has started, emulating an external SDS
+		// provider that is slower to start than the agent.
+		time.AfterFunc(500*time.Millisecond, func() {
+			serveHealthySocket(t, path)
+		})
+
+		found, err := waitForSocket(context.Background(), path, 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatal("expected socket to be found after waiting")
+		}
+	})
+
+	t.Run("timeout expires", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
+
+		start := time.Now()
+		found, err := waitForSocket(context.Background(), path, 750*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			t.Fatal("expected no socket to be found")
+		}
+		// We should have actually waited, rather than returning immediately.
+		if elapsed := time.Since(start); elapsed < 750*time.Millisecond {
+			t.Fatalf("returned after %v, expected to wait at least 750ms", elapsed)
+		}
+	})
+
+	t.Run("unhealthy socket is only removed once the timeout expires", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
+		// An unresponsive listener, as an external provider may create the socket before it
+		// starts serving on it.
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = l.Close() }()
+
+		type result struct {
+			found bool
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			found, err := waitForSocket(context.Background(), path, 3*time.Second)
+			done <- result{found, err}
+		}()
+
+		// Partway through the wait the socket must still be in place, so that the provider is
+		// given the chance to start serving on the socket it already created.
+		time.Sleep(time.Second)
+		if !socketFileExists(path) {
+			t.Fatal("expected unhealthy socket to be left in place while waiting")
+		}
+
+		res := <-done
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.found {
+			t.Fatal("expected unhealthy socket to not be found")
+		}
+		if socketFileExists(path) {
+			t.Fatal("expected unhealthy socket to be removed by the final check")
+		}
+	})
+
+	t.Run("context cancelled during wait", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "socket")
+		ctx, cancel := context.WithCancelCause(context.Background())
+		time.AfterFunc(200*time.Millisecond, func() {
+			cancel(fmt.Errorf("application shutdown"))
+		})
+
+		_, err := waitForSocket(ctx, path, 30*time.Second)
+		if err == nil {
+			t.Fatal("expected an error when the agent is shut down while waiting")
+		}
+	})
 }

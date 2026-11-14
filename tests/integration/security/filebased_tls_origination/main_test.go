@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 //  Copyright Istio Authors
 //
@@ -18,11 +17,18 @@
 package filebasedtlsorigination
 
 import (
+	"context"
 	"log"
 	"os"
 	"path"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"istio.io/api/annotation"
+	ilabel "istio.io/api/label"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/env"
@@ -41,6 +47,7 @@ var (
 	inst            istio.Instance
 	apps            deployment.TwoNamespaceView
 	client          echo.Instances
+	secretClient    echo.Instances
 	server          echo.Instances
 	internalClient  echo.Instances
 	externalService echo.Instances
@@ -49,12 +56,17 @@ var (
 	customConfig    []echo.Config
 )
 
+const (
+	secretClientCredentialName = "secret-client-credential"
+	secretClientCACertName     = "secret-client-cacert"
+)
+
 func TestMain(m *testing.M) {
 	// nolint: staticcheck
 	framework.
 		NewSuite(m).
+		Label(label.Full).
 		Label(label.CustomSetup).
-		Label("CustomSetup").
 		Setup(istio.Setup(&inst, setupConfig, cert.CreateCustomEgressSecret)).
 		Setup(namespace.Setup(&appNS, namespace.Config{Prefix: "appns", Inject: true})).
 		Setup(namespace.Setup(&serviceNS, namespace.Config{Prefix: "serverns", Inject: true})).
@@ -118,6 +130,9 @@ func setupApps(ctx resource.Context, appNs namespace.Getter,
 ) error {
 	appNamespace := appNs.Get()
 	serviceNamespace := serviceNs.Get()
+	if err := createSecretClientCerts(ctx, appNamespace); err != nil {
+		return err
+	}
 	var customConfig []echo.Config
 	client := echo.Config{
 		Service:   "client",
@@ -128,9 +143,27 @@ func setupApps(ctx resource.Context, appNs namespace.Getter,
 			// Set up custom annotations to mount the certs. We will re-use the configmap created by "server"
 			// so that we don't need to manage it ourselves.
 			// The paths here match the destination rule above
-			Annotations: echo.NewAnnotations().
-				Set(echo.SidecarVolume, `{"custom-certs":{"configMap":{"name":"server-certs"}}}`).
-				Set(echo.SidecarVolumeMount, `{"custom-certs":{"mountPath":"/etc/certs/custom"}}`),
+			Annotations: map[string]string{
+				annotation.SidecarUserVolume.Name:      `{"custom-certs":{"configMap":{"name":"server-certs"}}}`,
+				annotation.SidecarUserVolumeMount.Name: `{"custom-certs":{"mountPath":"/etc/certs/custom"}}`,
+			},
+		}},
+		Cluster: ctx.Clusters().Default(),
+	}
+
+	secretClient := echo.Config{
+		Service:   "secret-client",
+		Namespace: appNamespace,
+		Ports:     []echo.Port{},
+		Subsets: []echo.SubsetConfig{{
+			Version: "v1",
+			Annotations: map[string]string{
+				annotation.SidecarUserVolume.Name: `{"client-secret":{"secret":{"secretName":"` +
+					secretClientCredentialName + `"}},"ca-secret":{"secret":{"secretName":"` + secretClientCACertName + `"}}}`,
+				annotation.SidecarUserVolumeMount.Name: `{"client-secret":{"mountPath":` +
+					`"/etc/secret-client/client_certs/client.example.com","readOnly":true},` +
+					`"ca-secret":{"mountPath":"/etc/secret-client/ca_certs/example.com","readOnly":true}}`,
+			},
 		}},
 		Cluster: ctx.Clusters().Default(),
 	}
@@ -168,8 +201,8 @@ func setupApps(ctx resource.Context, appNs namespace.Getter,
 		},
 		// Do not inject, as we are testing non-Istio TLS here
 		Subsets: []echo.SubsetConfig{{
-			Version:     "v1",
-			Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+			Version: "v1",
+			Labels:  map[string]string{ilabel.SidecarInject.Name: "false"},
 		}},
 		Cluster: ctx.Clusters().Default(),
 	}
@@ -214,12 +247,12 @@ func setupApps(ctx resource.Context, appNs namespace.Getter,
 			Hostname: "external-service.default.svc",
 		},
 		Subsets: []echo.SubsetConfig{{
-			Version:     "v1",
-			Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+			Version: "v1",
+			Labels:  map[string]string{ilabel.SidecarInject.Name: "false"},
 		}},
 		Cluster: ctx.Clusters().Default(),
 	}
-	customConfig = append(customConfig, client, server, internalClient, externalService)
+	customConfig = append(customConfig, client, secretClient, server, internalClient, externalService)
 	*customCfg = customConfig
 	return nil
 }
@@ -229,6 +262,8 @@ func createCustomInstances(apps *deployment.TwoNamespaceView) error {
 		switch {
 		case namespacedName.Name == "client":
 			client = apps.Ns1.All[index]
+		case namespacedName.Name == "secret-client":
+			secretClient = apps.Ns1.All[index]
 		case namespacedName.Name == "server":
 			server = apps.Ns1.All[index]
 		case namespacedName.Name == "internal-client":
@@ -250,4 +285,70 @@ func mustReadCert(f string) string {
 		log.Fatalf("failed to read %v: %v", f, err)
 	}
 	return string(b)
+}
+
+func createSecretClientCerts(ctx resource.Context, ns namespace.Instance) error {
+	clientCert, err := cert.ReadCustomCertFromFile("cert-chain.pem")
+	if err != nil {
+		return err
+	}
+	clientKey, err := cert.ReadCustomCertFromFile("key.pem")
+	if err != nil {
+		return err
+	}
+	rootCert, err := cert.ReadCustomCertFromFile("root-cert.pem")
+	if err != nil {
+		return err
+	}
+
+	return applySecretClientCerts(ctx, ns, clientCert, clientKey, rootCert)
+}
+
+func updateSecretClientCertsFromInline(ctx resource.Context, ns namespace.Instance, clientCert, clientKey, rootCert string) error {
+	return applySecretClientCerts(ctx, ns, []byte(clientCert), []byte(clientKey), []byte(rootCert))
+}
+
+func applySecretClientCerts(ctx resource.Context, ns namespace.Instance, clientCert, clientKey, rootCert []byte) error {
+	for _, c := range ctx.AllClusters() {
+		credential := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretClientCredentialName,
+				Namespace: ns.Name(),
+			},
+			Data: map[string][]byte{
+				"tls.crt": clientCert,
+				"tls.key": clientKey,
+			},
+		}
+		if _, err := c.Kube().CoreV1().Secrets(ns.Name()).Create(context.TODO(), credential, metav1.CreateOptions{}); err != nil {
+			if errors.IsAlreadyExists(err) {
+				if _, err := c.Kube().CoreV1().Secrets(ns.Name()).Update(context.TODO(), credential, metav1.UpdateOptions{}); err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+
+		caCert := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretClientCACertName,
+				Namespace: ns.Name(),
+			},
+			Data: map[string][]byte{
+				"cacert": rootCert,
+			},
+		}
+		if _, err := c.Kube().CoreV1().Secrets(ns.Name()).Create(context.TODO(), caCert, metav1.CreateOptions{}); err != nil {
+			if errors.IsAlreadyExists(err) {
+				if _, err := c.Kube().CoreV1().Secrets(ns.Name()).Update(context.TODO(), caCert, metav1.UpdateOptions{}); err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

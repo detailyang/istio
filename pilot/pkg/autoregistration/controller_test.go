@@ -17,7 +17,6 @@ package autoregistration
 import (
 	"fmt"
 	"math"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +25,7 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/go-multierror"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubetypes "k8s.io/apimachinery/pkg/types"
 
@@ -41,6 +41,7 @@ import (
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/keepalive"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/test"
@@ -49,7 +50,7 @@ import (
 )
 
 func init() {
-	features.WorkloadEntryCleanupGracePeriod = 50 * time.Millisecond
+	features.WorkloadEntryCleanupGracePeriod = 500 * time.Millisecond
 }
 
 var _ connection = &fakeConn{}
@@ -162,11 +163,12 @@ var (
 	}
 )
 
-func TestNonAutoregisteredWorkloads(t *testing.T) {
-	store := memory.NewController(memory.Make(collections.All))
+func TestNonAutoRegisteredWorkloads(t *testing.T) {
+	stop := test.NewStop(t)
+	store := memory.NewController(collections.All, false)
+	go store.Run(stop)
 	c := NewController(store, "", time.Duration(math.MaxInt64))
 	createOrFail(t, store, wgA)
-	stop := test.NewStop(t)
 	go c.Run(stop)
 
 	cases := map[string]*model.Proxy{
@@ -177,14 +179,27 @@ func TestNonAutoregisteredWorkloads(t *testing.T) {
 	}
 
 	for name, tc := range cases {
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			c.OnConnect(makeConn(tc, time.Now()))
 			items := store.List(gvk.WorkloadEntry, model.NamespaceAll)
 			if len(items) != 0 {
-				t.Fatalf("expected 0 WorkloadEntry")
+				t.Fatal("expected 0 WorkloadEntry")
 			}
 		})
+	}
+}
+
+// TestNewControllerZeroMaxConnAge ensures a zero (unset) maxConnAge is treated as "no limit",
+// consistent with gRPC's keepalive.ServerParameters.MaxConnectionAge, rather than as an
+// immediate cutoff that would cause connected WorkloadEntries to be treated as leaked.
+func TestNewControllerZeroMaxConnAge(t *testing.T) {
+	stop := test.NewStop(t)
+	store := memory.NewController(collections.All, false)
+	go store.Run(stop)
+	c := NewController(store, "pilot-1", 0)
+	go c.Run(stop)
+	if c.maxConnectionAge != time.Duration(math.MaxInt64) {
+		t.Fatalf("expected zero maxConnAge to result in no limit (MaxInt64), got %v", c.maxConnectionAge)
 	}
 }
 
@@ -209,15 +224,15 @@ func TestAutoregistrationLifecycle(t *testing.T) {
 
 	var p1conn1, p1conn2 *fakeConn
 	p := fakeProxy("1.2.3.4", wgA, "nw1", "sa-a")
-	p.Locality = n.Locality
+	p.XdsNode = n
 
 	var p2conn1 *fakeConn
 	p2 := fakeProxy("1.2.3.4", wgA, "nw2", "sa-a")
-	p2.Locality = n.Locality
+	p2.XdsNode = n
 
 	var p3conn1 *fakeConn
 	p3 := fakeProxy("1.2.3.5", wgA, "nw1", "sa-a")
-	p3.Locality = n.Locality
+	p3.XdsNode = n
 
 	t.Run("initial registration", func(t *testing.T) {
 		// simply make sure the entry exists after connecting
@@ -245,7 +260,8 @@ func TestAutoregistrationLifecycle(t *testing.T) {
 		})
 		t.Run("same instance: connect before disconnect ", func(t *testing.T) {
 			// reconnect, ensure entry is there with the same instance id
-			p1conn2 = makeConn(p, p1conn1.ConnectedAt().Add(10*time.Millisecond))
+			time.Sleep(10 * time.Millisecond)
+			p1conn2 = makeConn(p, time.Now())
 			c1.OnConnect(p1conn2)
 			// disconnect (associated with original connect, not the reconnect)
 			// make sure entry is still there with disconnect meta
@@ -352,9 +368,39 @@ func TestAutoregistrationLifecycle(t *testing.T) {
 	// TODO test garbage collection if pilot stops before disconnect meta is set (relies on heartbeat)
 }
 
+func TestAutoregistrationDisabled(t *testing.T) {
+	test.SetForTest(t, &features.WorkloadEntryAutoRegistration, false)
+	stop := test.NewStop(t)
+	store := memory.NewController(collections.All, false)
+	go store.Run(stop)
+	createOrFail(t, store, weB)
+
+	c := NewController(store, "pilot-x", keepalive.Infinity)
+	go c.Run(stop)
+
+	t.Run("health check still works", func(t *testing.T) {
+		proxy := fakeProxySuitableForHealthChecks(weB)
+
+		err := c.OnConnect(makeConn(proxy, time.Now()))
+		assert.NoError(t, err)
+		// report workload is healthy
+		c.QueueWorkloadEntryHealth(proxy, HealthEvent{
+			Healthy: true,
+		})
+		// ensure health condition has been updated
+		checkHealthOrFail(t, store, proxy, true)
+	})
+	t.Run("registration does nothing", func(t *testing.T) {
+		p := fakeProxy("1.2.3.4", wgA, "litNw", "sa-a")
+		assert.NoError(t, c.OnConnect(makeConn(p, time.Now())))
+		checkNoEntryOrFail(t, store, wgA, p)
+	})
+}
+
 func TestUpdateHealthCondition(t *testing.T) {
 	stop := test.NewStop(t)
 	ig, ig2, store := setup(t)
+	go store.Run(stop)
 	go ig.Run(stop)
 	go ig2.Run(stop)
 	p := fakeProxy("1.2.3.4", wgA, "litNw", "sa-a")
@@ -401,9 +447,8 @@ func TestWorkloadEntryFromGroup(t *testing.T) {
 		},
 	}
 	proxy := fakeProxy("10.0.0.1", group, "nw1", "sa")
-	proxy.Labels[model.LocalityLabel] = "rgn2/zone2/subzone2"
+	proxy.Labels[pm.LocalityLabel] = "rgn2/zone2/subzone2"
 	proxy.XdsNode = fakeNode("rgn2", "zone2", "subzone2")
-	proxy.Locality = proxy.XdsNode.Locality
 
 	wantLabels := map[string]string{
 		"app":   "a",   // from WorkloadEntry template
@@ -446,11 +491,72 @@ func TestWorkloadEntryFromGroup(t *testing.T) {
 	assert.Equal(t, got, &want)
 }
 
-func TestNonAutoregisteredWorkloads_UnsuitableForHealthChecks_WorkloadEntryNotFound(t *testing.T) {
-	store := memory.NewController(memory.Make(collections.All))
-	createOrFail(t, store, weB)
+func TestWorkloadEntryFromGroupHBONE(t *testing.T) {
+	// EnableHBONEListen() requires the sidecar HBONE listening feature, which only
+	// defaults on under ambient; force it so the labeling path is actually exercised.
+	test.SetForTest(t, &features.EnableSidecarHBONEListening, true)
 
+	baseGroup := func() config.Config {
+		return config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.WorkloadGroup,
+				Namespace:        "a",
+				Name:             "wg-a",
+			},
+			Spec: &v1alpha3.WorkloadGroup{
+				Template: &v1alpha3.WorkloadEntry{
+					Ports:          map[string]uint32{"http": 80},
+					Labels:         map[string]string{"app": "a"},
+					ServiceAccount: "sa-a",
+				},
+			},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		enableHBONE bool
+		tmplLabels  map[string]string
+		wantTunnel  string // expected value of the tunnel label ("" means absent)
+	}{
+		{
+			name:        "EnableHBONE sets tunnel label",
+			enableHBONE: true,
+			wantTunnel:  model.TunnelHTTP,
+		},
+		{
+			name:        "EnableHBONE false leaves label absent",
+			enableHBONE: false,
+			wantTunnel:  "",
+		},
+		{
+			name:        "explicit tunnel label not overwritten",
+			enableHBONE: true,
+			tmplLabels:  map[string]string{"app": "a", model.TunnelLabel: "other"},
+			wantTunnel:  "other",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			group := baseGroup()
+			if tc.tmplLabels != nil {
+				group.Spec.(*v1alpha3.WorkloadGroup).Template.Labels = tc.tmplLabels
+			}
+			proxy := fakeProxy("10.0.0.1", group, "nw1", "sa")
+			proxy.Metadata.EnableHBONE = model.StringBool(tc.enableHBONE)
+
+			got := workloadEntryFromGroup("test-we", proxy, &group)
+			assert.Equal(t, got.Labels[model.TunnelLabel], tc.wantTunnel)
+		})
+	}
+}
+
+func TestNonAutoregisteredWorkloads_UnsuitableForHealthChecks_WorkloadEntryNotFound(t *testing.T) {
 	stop := test.NewStop(t)
+	store := memory.NewController(collections.All, false)
+	go store.Run(stop)
+	createOrFail(t, store, weB)
 
 	c := NewController(store, "pilot-x", keepalive.Infinity)
 	go c.Run(stop)
@@ -493,10 +599,10 @@ func TestNonAutoregisteredWorkloads_UnsuitableForHealthChecks_ShouldNotBeTreated
 		t.Run(tc.name, func(t *testing.T) {
 			we := tc.we()
 
-			store := memory.NewController(memory.Make(collections.All))
-			createOrFail(t, store, we)
-
 			stop := test.NewStop(t)
+			store := memory.NewController(collections.All, false)
+			go store.Run(stop)
+			createOrFail(t, store, we)
 
 			c := NewController(store, "pilot-x", keepalive.Infinity)
 			go c.Run(stop)
@@ -524,10 +630,10 @@ func TestNonAutoregisteredWorkloads_SuitableForHealthChecks_ShouldBeTreatedAsCon
 			we := weB.DeepCopy()
 			we.Annotations["proxy.istio.io/health-checks-enabled"] = value
 
-			store := memory.NewController(memory.Make(collections.All))
-			createOrFail(t, store, we)
-
 			stop := test.NewStop(t)
+			store := memory.NewController(collections.All, false)
+			go store.Run(stop)
+			createOrFail(t, store, we)
 
 			c := NewController(store, "pilot-x", keepalive.Infinity)
 			go c.Run(stop)
@@ -557,10 +663,11 @@ func TestNonAutoregisteredWorkloads_SuitableForHealthChecks_ShouldSupportLifecyc
 	c1, c2, store := setup(t)
 	createOrFail(t, store, weB)
 
-	stop1, stop2 := test.NewStop(t), test.NewStop(t)
+	stop1, stop2, stop3 := test.NewStop(t), test.NewStop(t), test.NewStop(t)
 
-	go c1.Run(stop1)
-	go c2.Run(stop2)
+	go store.Run(stop1)
+	go c1.Run(stop2)
+	go c2.Run(stop3)
 
 	p := fakeProxySuitableForHealthChecks(weB)
 
@@ -664,6 +771,7 @@ func TestNonAutoregisteredWorkloads_SuitableForHealthChecks_ShouldUpdateHealthCo
 
 	stop := test.NewStop(t)
 
+	go store.Run(stop)
 	go c1.Run(stop)
 	go c2.Run(stop)
 
@@ -691,7 +799,7 @@ func TestNonAutoregisteredWorkloads_SuitableForHealthChecks_ShouldUpdateHealthCo
 }
 
 func setup(t *testing.T) (*Controller, *Controller, model.ConfigStoreController) {
-	store := memory.NewController(memory.Make(collections.All))
+	store := memory.NewController(collections.All, false)
 	c1 := NewController(store, "pilot-1", time.Duration(math.MaxInt64))
 	c2 := NewController(store, "pilot-2", time.Duration(math.MaxInt64))
 	createOrFail(t, store, wgA)
@@ -728,13 +836,13 @@ func checkEntry(
 	cfg := store.Get(gvk.WorkloadEntry, name, wg.Namespace)
 	if cfg == nil {
 		err = multierror.Append(fmt.Errorf("expected WorkloadEntry %s/%s to exist", wg.Namespace, name))
-		return
+		return err
 	}
 	tmpl := wg.Spec.(*v1alpha3.WorkloadGroup)
 	we := cfg.Spec.(*v1alpha3.WorkloadEntry)
 
 	// check workload entry specific fields
-	if !reflect.DeepEqual(we.Ports, tmpl.Template.Ports) {
+	if !apiequality.Semantic.DeepEqual(we.Ports, tmpl.Template.Ports) {
 		err = multierror.Append(err, fmt.Errorf("expected ports from WorkloadGroup"))
 	}
 	if we.Address != proxy.IPAddresses[0] {
@@ -772,7 +880,7 @@ func checkEntry(
 	}
 
 	// check all labels are copied to the WorkloadEntry
-	if !reflect.DeepEqual(cfg.Labels, we.Labels) {
+	if !apiequality.Semantic.DeepEqual(cfg.Labels, we.Labels) {
 		err = multierror.Append(err, fmt.Errorf("spec labels on WorkloadEntry should match meta labels"))
 	}
 	for k, v := range tmpl.Template.Labels {
@@ -789,7 +897,7 @@ func checkEntry(
 			err = multierror.Append(err, fmt.Errorf("labels missing on WorkloadEntry: %s=%s from proxy meta", k, v))
 		}
 	}
-	return
+	return err
 }
 
 func checkEntryOrFail(
@@ -814,8 +922,15 @@ func checkEntryOrFailAfter(
 	connectedTo string,
 	after time.Duration,
 ) {
+	// The sleep is required: some subtests use artificially advanced
+	// ConnectedAt timestamps (e.g. +10ms), so enough wall-clock time must
+	// pass for time.Now() in OnDisconnect to exceed those timestamps.
+	// The retry handles the case where the async queue hasn't processed the
+	// disconnect within the sleep window (common under stress -p 90).
 	time.Sleep(after)
-	checkEntryOrFail(t, store, wg, proxy, node, connectedTo)
+	retry.UntilSuccessOrFail(t, func() error {
+		return checkEntry(store, wg, proxy, node, connectedTo)
+	}, retry.Delay(time.Millisecond))
 }
 
 func checkNoEntryOrFail(
@@ -831,7 +946,7 @@ func checkNoEntryOrFail(
 
 	cfg := store.Get(gvk.WorkloadEntry, name, wg.Namespace)
 	if cfg != nil {
-		t.Fatalf("workload entry found when it was not expected")
+		t.Fatal("workload entry found when it was not expected")
 	}
 }
 
@@ -857,7 +972,7 @@ func checkEntryHealth(store model.ConfigStoreController, proxy *model.Proxy, hea
 	cfg := store.Get(gvk.WorkloadEntry, name, proxy.Metadata.Namespace)
 	if cfg == nil || cfg.Status == nil {
 		err = multierror.Append(fmt.Errorf("expected workloadEntry %s/%s to exist", name, proxy.Metadata.Namespace))
-		return
+		return err
 	}
 	stat := cfg.Status.(*v1alpha1.IstioStatus)
 	found := false
@@ -882,13 +997,13 @@ func checkEntryHealth(store model.ConfigStoreController, proxy *model.Proxy, hea
 				name, proxy.Metadata.Namespace))
 		}
 	}
-	return
+	return err
 }
 
 func checkHealthOrFail(t test.Failer, store model.ConfigStoreController, proxy *model.Proxy, healthy bool) {
 	retry.UntilSuccessOrFail(t, func() error {
 		return checkEntryHealth(store, proxy, healthy)
-	})
+	}, retry.Timeout(5*time.Second))
 }
 
 func checkEntryDisconnected(store model.ConfigStoreController, we config.Config) error {
@@ -916,10 +1031,10 @@ func checkNonAutoRegisteredEntryOrFail(t test.Failer, store model.ConfigStoreCon
 			t.Fatalf("expected WorkloadEntry to be updated by %s; got %s", connectedTo, v)
 		}
 		if _, ok := cfg.Annotations[annotation.IoIstioConnectedAt.Name]; !ok {
-			t.Fatalf("expected connection timestamp to be set")
+			t.Fatal("expected connection timestamp to be set")
 		}
 	} else if _, ok := cfg.Annotations[annotation.IoIstioDisconnectedAt.Name]; !ok {
-		t.Fatalf("expected disconnection timestamp to be set")
+		t.Fatal("expected disconnection timestamp to be set")
 	}
 }
 

@@ -17,11 +17,11 @@ package forwarder
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +29,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"golang.org/x/net/http2"
 
 	"istio.io/istio/pkg/hbone"
 	"istio.io/istio/pkg/test/echo"
@@ -73,13 +72,13 @@ func (c *httpProtocol) ForwardEcho(ctx context.Context, cfg *Config) (*proto.For
 }
 
 func newHTTP3TransportGetter(cfg *Config) (httpTransportGetter, func()) {
-	newConn := func() *http3.RoundTripper {
-		return &http3.RoundTripper{
+	newConn := func() *http3.Transport {
+		return &http3.Transport{
 			TLSClientConfig: cfg.tlsConfig,
-			QuicConfig:      &quic.Config{},
+			QUICConfig:      &quic.Config{},
 		}
 	}
-	closeFn := func(conn *http3.RoundTripper) func() {
+	closeFn := func(conn *http3.Transport) func() {
 		return func() {
 			_ = conn.Close()
 		}
@@ -103,28 +102,29 @@ func newHTTP3TransportGetter(cfg *Config) (httpTransportGetter, func()) {
 }
 
 func newHTTP2TransportGetter(cfg *Config) (httpTransportGetter, func()) {
-	newConn := func() *http2.Transport {
+	newConn := func() *http.Transport {
+		transport := &http.Transport{Protocols: new(http.Protocols)}
 		if cfg.scheme == scheme.HTTPS {
-			return &http2.Transport{
-				TLSClientConfig: cfg.tlsConfig,
-				DialTLS: func(network, addr string, tlsConfig *tls.Config) (net.Conn, error) {
-					return hbone.TLSDialWithDialer(newDialer(cfg), network, addr, tlsConfig)
-				},
+			transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return hbone.TLSDialWithDialer(newDialer(cfg), network, addr, hbone.H2ClientTLSConfig(cfg.tlsConfig, addr))
 			}
+			// net/http disables HTTP/2 by default when a custom TLS config or dialer is set.
+			transport.Protocols.SetHTTP2(true)
+			return transport
 		}
 
-		return &http2.Transport{
-			// Golang doesn't have first class support for h2c, so we provide some workarounds
-			// See https://www.mailgun.com/blog/http-2-cleartext-h2c-client-example-go/
-			// So http2.Transport doesn't complain the URL scheme isn't 'https'
-			AllowHTTP: true,
-			// Pretend we are dialing a TLS endpoint. (Note, we ignore the passed tls.Config)
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return newDialer(cfg).Dial(network, addr)
-			},
+		// Must be DialContext, not DialTLSContext: net/http only consults the latter for
+		// https:// URLs, so the h2c transport would silently bypass the configured dialer
+		// (HBONE, socks5, ...).
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return newDialer(cfg).DialContext(ctx, network, addr)
 		}
+		transport.Protocols.SetUnencryptedHTTP2(true)
+
+		return transport
 	}
-	closeFn := func(conn *http2.Transport) func() {
+
+	closeFn := func(conn *http.Transport) func() {
 		return conn.CloseIdleConnections
 	}
 	noCloseFn := func() {}
@@ -228,6 +228,13 @@ func (c *httpCall) makeRequest(ctx context.Context, cfg *Config, requestID int) 
 		Transport:     transport,
 	}
 
+	var localAddr string
+	httpReq = httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), &httptrace.ClientTrace{
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			localAddr, _, _ = net.SplitHostPort(connInfo.Conn.LocalAddr().String())
+		},
+	}))
+
 	// Make the request.
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
@@ -235,6 +242,7 @@ func (c *httpCall) makeRequest(ctx context.Context, cfg *Config, requestID int) 
 	}
 	cfg.previousResponse = httpResp
 
+	echo.SourceIPField.WriteForRequest(&outBuffer, requestID, localAddr)
 	echo.LatencyField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%v", time.Since(start)))
 	echo.ActiveRequestsField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%d", c.e.ActiveRequests()))
 

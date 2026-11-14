@@ -38,7 +38,7 @@ var activeConnectionCheckDelay = 1 * time.Second
 
 // NewAgent creates a new proxy agent for the proxy start-up and clean-up functions.
 func NewAgent(proxy Proxy, terminationDrainDuration, minDrainDuration time.Duration, localhost string,
-	adminPort, statusPort, prometheusPort int, exitOnZeroActiveConnections bool,
+	adminPort, statusPort, prometheusPort, secureMetricsPort, secureMergedMetricsPort int, exitOnZeroActiveConnections bool,
 ) *Agent {
 	knownIstioListeners := sets.New(
 		fmt.Sprintf("listener.0.0.0.0_%d.downstream_cx_active", statusPort),
@@ -46,6 +46,12 @@ func NewAgent(proxy Proxy, terminationDrainDuration, minDrainDuration time.Durat
 		"listener.admin.downstream_cx_active",
 		"listener.admin.main_thread.downstream_cx_active",
 	)
+	if secureMetricsPort != 0 {
+		knownIstioListeners.Insert(fmt.Sprintf("listener.0.0.0.0_%d.downstream_cx_active", secureMetricsPort))
+	}
+	if secureMergedMetricsPort != 0 {
+		knownIstioListeners.Insert(fmt.Sprintf("listener.0.0.0.0_%d.downstream_cx_active", secureMergedMetricsPort))
+	}
 	return &Agent{
 		proxy:                       proxy,
 		statusCh:                    make(chan exitStatus, 1), // context might stop drainage
@@ -169,6 +175,8 @@ func (a *Agent) terminate() {
 		log.Infof("Checking for active connections...")
 		ticker := time.NewTicker(activeConnectionCheckDelay)
 		defer ticker.Stop()
+
+		retryCount := 0
 	graceful_loop:
 		for range ticker.C {
 			ac, err := a.activeProxyConnections()
@@ -180,9 +188,15 @@ func (a *Agent) terminate() {
 			default:
 				if err != nil {
 					log.Errorf(err.Error())
-					a.abortCh <- errAbort
-					log.Infof("Graceful termination logic ended prematurely, error while obtaining downstream_cx_active stat")
-					break graceful_loop
+					retryCount++
+					// Max retry 5 times
+					if retryCount > 4 {
+						a.abortCh <- errAbort
+						log.Warnf("Graceful termination logic ended prematurely, error while obtaining downstream_cx_active stat (Max retry %d exceeded)", retryCount)
+						break graceful_loop
+					}
+					log.Warnf("Retrying (%d attempt) to obtain active connections...", retryCount)
+					continue graceful_loop
 				}
 				if ac == -1 {
 					log.Info("downstream_cx_active are not available. This either means there are no downstream connection established yet" +
@@ -196,6 +210,8 @@ func (a *Agent) terminate() {
 					break graceful_loop
 				}
 				log.Infof("There are still %d active connections", ac)
+				// reset retry count
+				retryCount = 0
 			}
 		}
 	} else {
@@ -222,7 +238,7 @@ func (a *Agent) terminate() {
 func (a *Agent) activeProxyConnections() (int, error) {
 	adminHost := net.JoinHostPort(a.localhost, strconv.Itoa(a.adminPort))
 	activeConnectionsURL := fmt.Sprintf("http://%s/stats?usedonly&filter=downstream_cx_active$", adminHost)
-	stats, err := http.DoHTTPGet(activeConnectionsURL)
+	stats, err := http.DoHTTPGetWithTimeout(activeConnectionsURL, 2*time.Second)
 	if err != nil {
 		return -1, fmt.Errorf("unable to get listener stats from Envoy : %v", err)
 	}
@@ -241,6 +257,15 @@ func (a *Agent) activeProxyConnections() (int, error) {
 		// Only consider listener stats. Listener stats also will have per worker stats, we can
 		// ignore them.
 		if !strings.HasPrefix(parts[0], "listener.") || strings.Contains(parts[0], "worker_") {
+			continue
+		}
+		// Skip Envoy internal listeners (envoy.bootstrap.internal_listener). These are
+		// in-process plumbing — e.g. ambient HBONE connect_originate / connect_terminate /
+		// main_internal — with no client-facing semantics. Their downstream_cx_active counts
+		// pipe connections from other filter chains and stays positive as long as the
+		// upstream HBONE pool holds any tunnel open, which would otherwise prevent
+		// EXIT_ON_ZERO_ACTIVE_CONNECTIONS from ever firing on ambient gateways and waypoints.
+		if strings.HasPrefix(parts[0], "listener.envoy_internal_") {
 			continue
 		}
 		// If the stat is for a known Istio listener skip it.
@@ -262,7 +287,6 @@ func (a *Agent) activeProxyConnections() (int, error) {
 
 // runWait runs the start-up command as a go routine and waits for it to finish
 func (a *Agent) runWait(abortCh <-chan error) {
-	log.Infof("starting")
 	err := a.proxy.Run(abortCh)
 	a.proxy.Cleanup()
 	a.statusCh <- exitStatus{err: err}

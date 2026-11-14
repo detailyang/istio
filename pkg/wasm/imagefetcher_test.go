@@ -21,8 +21,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
@@ -265,6 +267,76 @@ func TestImageFetcher_Fetch(t *testing.T) {
 			t.Errorf("ImageFetcher.binaryFetcher get unexpected error '%v', but want '%v'", actual, expErr)
 		}
 	})
+}
+
+func TestShouldRetryPlaintext(t *testing.T) {
+	downgradeErr := errors.New("http: server gave HTTP response to HTTPS client")
+	otherErr := errors.New("dial tcp: connection refused")
+
+	cases := []struct {
+		name     string
+		insecure bool
+		err      error
+		want     bool
+	}{
+		{name: "not allowlisted, downgrade signal: no retry", insecure: false, err: downgradeErr, want: false},
+		{name: "allowlisted, downgrade signal: retry", insecure: true, err: downgradeErr, want: true},
+		{name: "allowlisted, unrelated error: no retry", insecure: true, err: otherErr, want: false},
+		{name: "allowlisted, no error: no retry", insecure: true, err: nil, want: false},
+		{name: "not allowlisted, no error: no retry", insecure: false, err: nil, want: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldRetryPlaintext(c.insecure, c.err); got != c.want {
+				t.Errorf("shouldRetryPlaintext(%v, %v) = %v, want %v", c.insecure, c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// schemeAwareErrorTransport always fails, but the error text reveals which scheme the
+// request actually went out on - letting a test tell a plaintext retry apart from the
+// original HTTPS attempt without needing a real TLS handshake or a second registry.
+type schemeAwareErrorTransport struct{}
+
+func (schemeAwareErrorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "https" {
+		return nil, errors.New("http: server gave HTTP response to HTTPS client")
+	}
+	return nil, errors.New("plaintext attempt reached the wire")
+}
+
+func TestImageFetcher_PrepareFetch_HTTPSDowngrade(t *testing.T) {
+	cases := []struct {
+		name          string
+		insecure      bool
+		expectRetried bool
+	}{
+		{name: "not allowlisted: stays on HTTPS, no plaintext attempt", insecure: false, expectRetried: false},
+		{name: "allowlisted: plaintext retry attempted", insecure: true, expectRetried: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fetcher := &ImageFetcher{
+				fetchOpts:                  []remote.Option{remote.WithTransport(schemeAwareErrorTransport{}), remote.WithAuth(authn.Anonymous)},
+				allowInsecureHTTPDowngrade: c.insecure,
+			}
+
+			_, _, err := fetcher.PrepareFetch("example.com/some/image:latest")
+			if err == nil {
+				t.Fatal("expected an error since the transport never succeeds")
+			}
+
+			retried := strings.Contains(err.Error(), "plaintext attempt reached the wire")
+			if retried != c.expectRetried {
+				t.Errorf("got err %q (plaintext retry observed=%v), want retried=%v", err, retried, c.expectRetried)
+			}
+			if !c.insecure && !strings.Contains(err.Error(), "server gave HTTP response") {
+				t.Errorf("expected the original HTTPS error to surface unmodified, got: %v", err)
+			}
+		})
+	}
 }
 
 func TestExtractDockerImage(t *testing.T) {
@@ -628,4 +700,140 @@ func TestWasmKeyChain(t *testing.T) {
 func encode(user, pass string) string {
 	delimited := fmt.Sprintf("%s:%s", user, pass)
 	return base64.StdEncoding.EncodeToString([]byte(delimited))
+}
+
+func TestValidateAllRealms(t *testing.T) {
+	tests := []struct {
+		name      string
+		wwwAuth   string
+		expectErr bool
+	}{
+		{
+			name:      "valid https realm",
+			wwwAuth:   `Bearer realm="https://auth.example.com/token",service="registry.example.com"`,
+			expectErr: false,
+		},
+		{
+			name:      "valid http realm",
+			wwwAuth:   `Bearer realm="http://auth.example.com/token",service="registry.example.com"`,
+			expectErr: false,
+		},
+		{
+			name:      "cloud metadata SSRF",
+			wwwAuth:   `Bearer realm="http://169.254.169.254/latest/meta-data/",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "link-local IP",
+			wwwAuth:   `Bearer realm="http://169.254.1.1/foo",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "gcp metadata SSRF",
+			wwwAuth:   `Bearer realm="http://metadata.google.internal/computeMetadata/v1/",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "localhost SSRF",
+			wwwAuth:   `Bearer realm="http://localhost:8080/admin",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "loopback SSRF",
+			wwwAuth:   `Bearer realm="http://127.0.0.1/api",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "loopback range",
+			wwwAuth:   `Bearer realm="http://127.0.0.5/api",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "file scheme",
+			wwwAuth:   `Bearer realm="file:///etc/passwd",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "gopher scheme",
+			wwwAuth:   `Bearer realm="gopher://internal:9000/_GET",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "dict scheme",
+			wwwAuth:   `Bearer realm="dict://redis:6379/INFO",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "private IP 10.x",
+			wwwAuth:   `Bearer realm="http://10.0.0.1/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "private IP 192.168",
+			wwwAuth:   `Bearer realm="http://192.168.1.1/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "private IP 172.16-31",
+			wwwAuth:   `Bearer realm="http://172.16.0.1/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "ipv6 loopback",
+			wwwAuth:   `Bearer realm="http://[::1]/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "ipv6 link-local",
+			wwwAuth:   `Bearer realm="http://[fe80::1]/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "aws ipv6 metadata",
+			wwwAuth:   `Bearer realm="http://[fd00:ec2::254]/latest/meta-data/",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "ipv6 unique local",
+			wwwAuth:   `Bearer realm="http://[fc00::1]/token",service="evil.com"`,
+			expectErr: true,
+		},
+		{
+			name:      "no realm param",
+			wwwAuth:   `Bearer service="registry.example.com"`,
+			expectErr: false,
+		},
+		{
+			name:      "basic auth no realm",
+			wwwAuth:   `Basic charset="UTF-8"`,
+			expectErr: false,
+		},
+		// multiple realms in one header - safe first, malicious second
+		{
+			name:      "multiple challenges safe then malicious",
+			wwwAuth:   `Bearer realm="https://safe.com/token", Basic realm="http://169.254.169.254/"`,
+			expectErr: true,
+		},
+		// multiple realms - malicious first
+		{
+			name:      "multiple challenges malicious first",
+			wwwAuth:   `Basic realm="http://localhost/", Bearer realm="https://safe.com/token"`,
+			expectErr: true,
+		},
+		// both realms safe
+		{
+			name:      "multiple challenges both safe",
+			wwwAuth:   `Bearer realm="https://auth.example.com/", Basic realm="https://other.example.com/"`,
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAllRealms(tt.wwwAuth)
+			if (err != nil) != tt.expectErr {
+				t.Errorf("validateAllRealms() error = %v, expectErr %v", err, tt.expectErr)
+			}
+		})
+	}
 }

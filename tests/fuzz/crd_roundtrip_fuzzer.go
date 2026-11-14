@@ -34,9 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 
 	clientextensions "istio.io/client-go/pkg/apis/extensions/v1alpha1"
-	clientnetworkingalpha "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	clientnetworkingalpha "istio.io/client-go/pkg/apis/networking/v1"
 	clientnetworkingbeta "istio.io/client-go/pkg/apis/networking/v1beta1"
-	clientsecurity "istio.io/client-go/pkg/apis/security/v1beta1"
+	clientsecurity "istio.io/client-go/pkg/apis/security/v1"
 	clienttelemetry "istio.io/client-go/pkg/apis/telemetry/v1alpha1"
 	"istio.io/istio/pkg/config/schema/collections"
 )
@@ -54,7 +54,7 @@ func initRoundTrip() {
 	clienttelemetry.AddToScheme(scheme)
 }
 
-// FuzzRoundtrip tests whether the pilot CRDs
+// FuzzCRDRoundtrip tests whether the pilot CRDs
 // can be encoded and decoded.
 func FuzzCRDRoundtrip(data []byte) int {
 	initter.Do(initRoundTrip)
@@ -194,7 +194,7 @@ func checkForNil(e reflect.Value) error {
 				return err
 			}
 		}
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if e.IsNil() {
 			return fmt.Errorf("field is nil")
 		}

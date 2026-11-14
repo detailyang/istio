@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -44,7 +43,6 @@ func TestRequestAuthentication(t *testing.T) {
 	payload3 := strings.Split(jwt.TokenIssuer1WithNestedClaims2, ".")[1]
 	framework.NewTest(t).
 		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("security.authentication.jwt").
 		Run(func(t framework.TestContext) {
 			type testCase struct {
 				name          string
@@ -182,6 +180,137 @@ func TestRequestAuthentication(t *testing.T) {
 				},
 			}))
 
+			t.NewSubTest("required-multi-jwt").Run(newTest("testdata/requestauthn/required-multi-jwt.yaml.tmpl", []testCase{
+				{
+					name: "both-tokens-valid",
+					customizeCall: func(t framework.TestContext, from echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/both-tokens-valid"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenIssuer1).
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.And(
+							check.OK(),
+							check.ReachedTargetClusters(t))
+					},
+				},
+				{
+					name: "only-primary-token",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/only-primary-token"
+						opts.HTTP.Headers = headers.New().WithAuthz(jwt.TokenIssuer1).Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					name: "only-scope-token",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/only-scope-token"
+						opts.HTTP.Headers = headers.New().
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					name: "no-tokens",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/no-tokens"
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					name: "primary-valid-scope-expired",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/primary-valid-scope-expired"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenIssuer1).
+							With("x-scope-token", jwt.TokenExpired).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					name: "primary-expired-scope-valid",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/primary-expired-scope-valid"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenExpired).
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+			}))
+
+			t.NewSubTest("required-mixed-jwt").Run(newTest("testdata/requestauthn/required-mixed-jwt.yaml.tmpl", []testCase{
+				{
+					name: "both-tokens-valid",
+					customizeCall: func(t framework.TestContext, from echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/both-tokens-valid"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenIssuer1).
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.And(
+							check.OK(),
+							check.ReachedTargetClusters(t))
+					},
+				},
+				{
+					name: "only-primary-token",
+					customizeCall: func(t framework.TestContext, from echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/only-primary-token"
+						opts.HTTP.Headers = headers.New().WithAuthz(jwt.TokenIssuer1).Build()
+						opts.Check = check.And(
+							check.OK(),
+							check.ReachedTargetClusters(t))
+					},
+				},
+				{
+					name: "only-scope-token",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/only-scope-token"
+						opts.HTTP.Headers = headers.New().
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					name: "no-tokens",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/no-tokens"
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					// Required token is expired: Envoy rejects an expired token even when presence=REQUIRED.
+					name: "primary-expired-scope-optional-valid",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/primary-expired-scope-optional-valid"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenExpired).
+							With("x-scope-token", jwt.TokenIssuer2).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+				{
+					// Optional token is expired and present: allow_missing only covers absent tokens,
+					// not expired ones, so this must be rejected.
+					name: "primary-valid-scope-optional-expired",
+					customizeCall: func(_ framework.TestContext, _ echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/primary-valid-scope-optional-expired"
+						opts.HTTP.Headers = headers.New().
+							WithAuthz(jwt.TokenIssuer1).
+							With("x-scope-token", jwt.TokenExpired).
+							Build()
+						opts.Check = check.Status(http.StatusUnauthorized)
+					},
+				},
+			}))
+
 			t.NewSubTest("authn-authz").Run(newTest("testdata/requestauthn/authn-authz.yaml.tmpl", []testCase{
 				{
 					name: "valid-token",
@@ -253,6 +382,19 @@ func TestRequestAuthentication(t *testing.T) {
 								headers.Authorization: "Bearer " + jwt.TokenIssuer1,
 								"X-Test-Payload":      payload1,
 							}))
+					},
+				},
+			}))
+
+			t.NewSubTest("timeout").Run(newTest("testdata/requestauthn/timeout.yaml.tmpl", []testCase{
+				{
+					name: "valid-token-forward-remote-jwks",
+					customizeCall: func(t framework.TestContext, from echo.Instance, opts *echo.CallOptions) {
+						opts.HTTP.Path = "/valid-token-forward-remote-jwks"
+						opts.HTTP.Headers = headers.New().WithAuthz(jwt.TokenIssuer1).Build()
+						opts.Check = check.And(
+							check.NotOK(),
+							check.Status(http.StatusUnauthorized))
 					},
 				},
 			}))
@@ -399,15 +541,15 @@ func TestRequestAuthentication(t *testing.T) {
 // TestIngressRequestAuthentication tests beta authn policy for jwt on ingress.
 // The policy is also set at global namespace, with authorization on ingressgateway.
 func TestIngressRequestAuthentication(t *testing.T) {
-	framework.NewTest(t).
+	framework.NewFullTest(t).
 		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("security.authentication.ingressjwt").
 		Run(func(t framework.TestContext) {
 			config.New(t).
 				Source(config.File("testdata/requestauthn/global-jwt.yaml.tmpl").WithParams(param.Params{
 					param.Namespace.String(): istio.ClaimSystemNamespaceOrFail(t, t),
 					"Services":               apps.Ns1.All,
 					"GatewayIstioLabel":      i.Settings().IngressGatewayIstioLabel,
+					"JWTServer":              jwtServer,
 				})).
 				Source(config.File("testdata/requestauthn/ingress.yaml.tmpl").WithParams(param.Params{
 					param.Namespace.String(): apps.Ns1.Namespace,
@@ -462,6 +604,16 @@ func TestIngressRequestAuthentication(t *testing.T) {
 					name          string
 					customizeCall func(opts *echo.CallOptions, to echo.Target)
 				}{
+					{
+						name: "allow healthz",
+						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
+							opts.HTTP.Path = "/healthz"
+							opts.HTTP.Headers = headers.New().
+								WithHost(fmt.Sprintf("example.%s.com", to.ServiceName())).
+								Build()
+							opts.Check = check.OK()
+						},
+					},
 					{
 						name: "deny without token",
 						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
@@ -548,16 +700,6 @@ func TestIngressRequestAuthentication(t *testing.T) {
 							opts.Check = check.Status(http.StatusForbidden)
 						},
 					},
-					{
-						name: "allow healthz",
-						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
-							opts.HTTP.Path = "/healthz"
-							opts.HTTP.Headers = headers.New().
-								WithHost(fmt.Sprintf("example.%s.com", to.ServiceName())).
-								Build()
-							opts.Check = check.OK()
-						},
-					},
 				}
 
 				newTrafficTest(t, apps.Ns1.All.Instances()).
@@ -582,9 +724,8 @@ func TestIngressRequestAuthentication(t *testing.T) {
 
 // TestGatewayAPIRequestAuthentication tests beta authn policy for jwt on gateway API.
 func TestGatewayAPIRequestAuthentication(t *testing.T) {
-	framework.NewTest(t).
+	framework.NewFullTest(t).
 		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("security.authentication.ingressjwt").
 		Run(func(t framework.TestContext) {
 			crd.DeployGatewayAPIOrSkip(t)
 			config.New(t).
@@ -594,6 +735,7 @@ func TestGatewayAPIRequestAuthentication(t *testing.T) {
 				Source(config.File("testdata/requestauthn/gateway-jwt.yaml.tmpl").WithParams(param.Params{
 					param.Namespace.String(): apps.Ns1.Namespace,
 					"Services":               apps.Ns1.A.Append(apps.Ns1.B).Services(),
+					"JWTServer":              jwtServer,
 				})).
 				BuildAll(nil, apps.Ns1.A.Append(apps.Ns1.B).Services()).
 				Apply()
@@ -603,6 +745,16 @@ func TestGatewayAPIRequestAuthentication(t *testing.T) {
 					name          string
 					customizeCall func(opts *echo.CallOptions, to echo.Target)
 				}{
+					{
+						name: "allow healthz",
+						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
+							opts.HTTP.Path = "/healthz"
+							opts.HTTP.Headers = headers.New().
+								WithHost(fmt.Sprintf("example.%s.com", to.ServiceName())).
+								Build()
+							opts.Check = check.OK()
+						},
+					},
 					{
 						name: "deny without token",
 						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
@@ -698,16 +850,6 @@ func TestGatewayAPIRequestAuthentication(t *testing.T) {
 								WithAuthz(jwt.TokenIssuer1).
 								Build()
 							opts.Check = check.Status(http.StatusForbidden)
-						},
-					},
-					{
-						name: "allow healthz",
-						customizeCall: func(opts *echo.CallOptions, to echo.Target) {
-							opts.HTTP.Path = "/healthz"
-							opts.HTTP.Headers = headers.New().
-								WithHost(fmt.Sprintf("example.%s.com", to.ServiceName())).
-								Build()
-							opts.Check = check.OK()
 						},
 					},
 				}

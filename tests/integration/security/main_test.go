@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 //  Copyright Istio Authors
 //
@@ -27,6 +26,7 @@ import (
 	"istio.io/istio/pkg/test/framework/components/jwt"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
+	ingressutil "istio.io/istio/tests/integration/security/sds_ingress/util"
 )
 
 var (
@@ -51,9 +51,13 @@ func TestMain(m *testing.M) {
 		Setup(istio.Setup(&i, func(c resource.Context, cfg *istio.Config) {
 			cfg.ControlPlaneValues = `
 values:
-  pilot: 
-    env: 
+  global:
+    logging:
+      level: delta:debug
+  pilot:
+    env:
       PILOT_JWT_ENABLE_REMOTE_JWKS: true
+      PILOT_ENABLE_MULTIPLE_CUSTOM_AUTHZ_PROVIDERS: true
 meshConfig:
   defaultConfig:
     gatewayTopology:
@@ -78,5 +82,8 @@ meshConfig:
 				},
 				ExternalNamespace: namespace.Future(&externalNS),
 			})).
+		Setup(func(ctx resource.Context) error {
+			return ingressutil.SetInstances(apps.Ns1.All)
+		}).
 		Run()
 }

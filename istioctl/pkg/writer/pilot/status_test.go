@@ -17,257 +17,36 @@ package pilot
 import (
 	"bytes"
 	"encoding/json"
-	"os"
 	"testing"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	status "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
-	"github.com/google/uuid"
-	anypb "google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/test/util/assert"
 	istioversion "istio.io/istio/pkg/version"
-	"istio.io/istio/tests/util"
 )
-
-var preDefinedNonce = newNonce()
-
-func newNonce() string {
-	return uuid.New().String()
-}
-
-func TestStatusWriter_PrintAll(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   map[string][]xds.SyncStatus
-		want    string
-		wantErr bool
-	}{
-		{
-			name: "prints multiple istiod inputs to buffer in alphabetical order by pod name",
-			input: map[string][]xds.SyncStatus{
-				"istiod1": statusInput1(),
-				"istiod2": statusInput2(),
-				"istiod3": statusInput3(),
-				"istiod4": statusInput4(),
-			},
-			want: "testdata/multiStatusMultiPilot.txt",
-		},
-		{
-			name: "prints single istiod input to buffer in alphabetical order by pod name",
-			input: map[string][]xds.SyncStatus{
-				"istiod1": append(statusInput1(), statusInput2()...),
-			},
-			want: "testdata/multiStatusSinglePilot.txt",
-		},
-		{
-			name: "error if given non-syncstatus info",
-			input: map[string][]xds.SyncStatus{
-				"istiod1": {},
-			},
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := &bytes.Buffer{}
-			sw := StatusWriter{Writer: got}
-			input := map[string][]byte{}
-			for key, ss := range tt.input {
-				b, _ := json.Marshal(ss)
-				input[key] = b
-			}
-			if len(tt.input["istiod1"]) == 0 {
-				input = map[string][]byte{
-					"istiod1": []byte(`gobbledygook`),
-				}
-			}
-			err := sw.PrintAll(input)
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-			want, _ := os.ReadFile(tt.want)
-			if err := util.Compare(got.Bytes(), want); err != nil {
-				t.Errorf(err.Error())
-			}
-		})
-	}
-}
-
-func TestStatusWriter_PrintSingle(t *testing.T) {
-	tests := []struct {
-		name      string
-		input     map[string][]xds.SyncStatus
-		filterPod string
-		want      string
-		wantErr   bool
-	}{
-		{
-			name: "prints multiple istiod inputs to buffer filtering for pod",
-			input: map[string][]xds.SyncStatus{
-				"istiod1": statusInput1(),
-				"istiod2": statusInput2(),
-				"istiod4": statusInput4(),
-			},
-			filterPod: "proxy2",
-			want:      "testdata/singleStatus.txt",
-		},
-		{
-			name: "single istiod input to buffer filtering for pod",
-			input: map[string][]xds.SyncStatus{
-				"istiod2": append(statusInput1(), statusInput2()...),
-			},
-			filterPod: "proxy2",
-			want:      "testdata/singleStatus.txt",
-		},
-		{
-			name: "fallback to proxy version",
-			input: map[string][]xds.SyncStatus{
-				"istiod2": statusInputProxyVersion(),
-			},
-			filterPod: "proxy2",
-			want:      "testdata/singleStatusFallback.txt",
-		},
-		{
-			name: "error if given non-syncstatus info",
-			input: map[string][]xds.SyncStatus{
-				"istiod1": {},
-			},
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := &bytes.Buffer{}
-			sw := StatusWriter{Writer: got}
-			input := map[string][]byte{}
-			for key, ss := range tt.input {
-				b, _ := json.Marshal(ss)
-				input[key] = b
-			}
-			if len(tt.input["istiod1"]) == 0 && len(tt.input["istiod2"]) == 0 {
-				input = map[string][]byte{
-					"istiod1": []byte(`gobbledygook`),
-				}
-			}
-			err := sw.PrintSingle(input, tt.filterPod)
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-			want, _ := os.ReadFile(tt.want)
-			if err := util.Compare(got.Bytes(), want); err != nil {
-				t.Errorf(err.Error())
-			}
-		})
-	}
-}
-
-func statusInput1() []xds.SyncStatus {
-	return []xds.SyncStatus{
-		{
-			ClusterID:     "cluster1",
-			ProxyID:       "proxy1",
-			IstioVersion:  "1.1",
-			ClusterSent:   preDefinedNonce,
-			ClusterAcked:  newNonce(),
-			ListenerSent:  preDefinedNonce,
-			ListenerAcked: preDefinedNonce,
-			EndpointSent:  preDefinedNonce,
-			EndpointAcked: preDefinedNonce,
-		},
-	}
-}
-
-func statusInput2() []xds.SyncStatus {
-	return []xds.SyncStatus{
-		{
-			ClusterID:     "cluster2",
-			ProxyID:       "proxy2",
-			IstioVersion:  "1.1",
-			ClusterSent:   preDefinedNonce,
-			ClusterAcked:  newNonce(),
-			ListenerSent:  preDefinedNonce,
-			ListenerAcked: preDefinedNonce,
-			EndpointSent:  preDefinedNonce,
-			EndpointAcked: newNonce(),
-			RouteSent:     preDefinedNonce,
-			RouteAcked:    preDefinedNonce,
-		},
-	}
-}
-
-func statusInput3() []xds.SyncStatus {
-	return []xds.SyncStatus{
-		{
-			ClusterID:     "cluster3",
-			ProxyID:       "proxy3",
-			IstioVersion:  "1.1",
-			ClusterSent:   preDefinedNonce,
-			ClusterAcked:  "",
-			ListenerAcked: preDefinedNonce,
-			EndpointSent:  preDefinedNonce,
-			EndpointAcked: "",
-			RouteSent:     preDefinedNonce,
-			RouteAcked:    preDefinedNonce,
-		},
-	}
-}
-
-func statusInput4() []xds.SyncStatus {
-	return []xds.SyncStatus{
-		{
-			ClusterID:     "cluster4",
-			ProxyID:       "proxy4",
-			IstioVersion:  "1.1",
-			ProxyType:     model.Ztunnel,
-			ClusterSent:   "",
-			ClusterAcked:  "",
-			ListenerAcked: "",
-			EndpointSent:  "",
-			EndpointAcked: "",
-			RouteSent:     "",
-			RouteAcked:    "",
-		},
-	}
-}
-
-func statusInputProxyVersion() []xds.SyncStatus {
-	return []xds.SyncStatus{
-		{
-			ClusterID:     "cluster2",
-			ProxyID:       "proxy2",
-			ProxyVersion:  "1.1",
-			ClusterSent:   preDefinedNonce,
-			ClusterAcked:  newNonce(),
-			ListenerSent:  preDefinedNonce,
-			ListenerAcked: preDefinedNonce,
-			EndpointSent:  preDefinedNonce,
-			EndpointAcked: newNonce(),
-			RouteSent:     preDefinedNonce,
-			RouteAcked:    preDefinedNonce,
-		},
-	}
-}
 
 func TestXdsStatusWriter_PrintAll(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   map[string]*discovery.DiscoveryResponse
-		want    string
-		wantErr bool
+		name      string
+		namespace string
+		format    string
+		input     map[string]*discovery.DiscoveryResponse
+		wantFile  string
+		wantErr   bool
+		verbosity int
 	}{
 		{
-			name: "prints multiple istiod inputs to buffer in alphabetical order by pod name",
+			name:   "prints multiple istiod inputs to buffer in alphabetical order by pod name",
+			format: "table",
 			input: map[string]*discovery.DiscoveryResponse{
 				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
 					{
@@ -318,10 +97,12 @@ func TestXdsStatusWriter_PrintAll(t *testing.T) {
 					},
 				}),
 			},
-			want: "testdata/multiXdsStatusMultiPilot.txt",
+			wantFile:  "testdata/multiXdsStatusMultiPilot.txt",
+			verbosity: 0,
 		},
 		{
-			name: "prints single istiod input to buffer in alphabetical order by pod name",
+			name:   "prints single istiod input to buffer in alphabetical order by pod name",
+			format: "table",
 			input: map[string]*discovery.DiscoveryResponse{
 				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
 					{
@@ -346,13 +127,108 @@ func TestXdsStatusWriter_PrintAll(t *testing.T) {
 					},
 				}),
 			},
-			want: "testdata/multiXdsStatusSinglePilot.txt",
+			wantFile:  "testdata/multiXdsStatusSinglePilot.txt",
+			verbosity: 0,
+		},
+		{
+			name:   "prints all known xds types at max verbosity",
+			format: "table",
+			input: map[string]*discovery.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:        "proxy1",
+						clusterID:      "cluster1",
+						version:        "1.20",
+						cdsSyncStatus:  status.ConfigStatus_STALE,
+						ldsSyncStatus:  status.ConfigStatus_SYNCED,
+						rdsSyncStatus:  status.ConfigStatus_NOT_SENT,
+						edsSyncStatus:  status.ConfigStatus_SYNCED,
+						ecdsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+				}),
+			},
+			wantFile:  "testdata/multiXdsStatusMultiPilot_verbose.txt",
+			verbosity: 1,
+		},
+		{
+			name:   "prints output in JSON format",
+			format: "json",
+			input: map[string]*discovery.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:        "proxy1",
+						clusterID:      "cluster1",
+						version:        "1.20",
+						cdsSyncStatus:  status.ConfigStatus_STALE,
+						ldsSyncStatus:  status.ConfigStatus_SYNCED,
+						rdsSyncStatus:  status.ConfigStatus_NOT_SENT,
+						edsSyncStatus:  status.ConfigStatus_SYNCED,
+						ecdsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+				}),
+			},
+			wantFile:  "testdata/multiXdsStatusSinglePilot.json",
+			verbosity: 0,
+		},
+		{
+			name:   "prints output in YAML format",
+			format: "yaml",
+			input: map[string]*discovery.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:        "proxy1",
+						clusterID:      "cluster1",
+						version:        "1.20",
+						cdsSyncStatus:  status.ConfigStatus_STALE,
+						ldsSyncStatus:  status.ConfigStatus_SYNCED,
+						rdsSyncStatus:  status.ConfigStatus_NOT_SENT,
+						edsSyncStatus:  status.ConfigStatus_SYNCED,
+						ecdsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+				}),
+			},
+			wantFile:  "testdata/multiXdsStatusSinglePilot.yaml",
+			verbosity: 0,
+		},
+		{
+			name:      "prints output in YAML format for a single namespace",
+			format:    "yaml",
+			namespace: "foo",
+			input: map[string]*discovery.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:        "proxy1",
+						clusterID:      "cluster1",
+						version:        "1.20",
+						namespace:      "foo",
+						cdsSyncStatus:  status.ConfigStatus_STALE,
+						ldsSyncStatus:  status.ConfigStatus_SYNCED,
+						rdsSyncStatus:  status.ConfigStatus_NOT_SENT,
+						edsSyncStatus:  status.ConfigStatus_SYNCED,
+						ecdsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+					{
+						proxyID:        "proxy2",
+						clusterID:      "cluster1",
+						version:        "1.20",
+						namespace:      "bar",
+						cdsSyncStatus:  status.ConfigStatus_STALE,
+						ldsSyncStatus:  status.ConfigStatus_SYNCED,
+						rdsSyncStatus:  status.ConfigStatus_NOT_SENT,
+						edsSyncStatus:  status.ConfigStatus_SYNCED,
+						ecdsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+				},
+				),
+			},
+			wantFile:  "testdata/multiXdsStatusSingleNamespace.yaml",
+			verbosity: 0,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := &bytes.Buffer{}
-			sw := XdsStatusWriter{Writer: got}
+			sw := XdsStatusWriter{Writer: got, Verbosity: tt.verbosity, OutputFormat: tt.format, Namespace: tt.namespace}
 			input := map[string]*discovery.DiscoveryResponse{}
 			for key, ss := range tt.input {
 				input[key] = ss
@@ -364,10 +240,8 @@ func TestXdsStatusWriter_PrintAll(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 			}
-			want, _ := os.ReadFile(tt.want)
-			if err := util.Compare(got.Bytes(), want); err != nil {
-				t.Errorf(err.Error())
-			}
+
+			util.CompareContent(t, got.Bytes(), tt.wantFile)
 		})
 	}
 }
@@ -378,6 +252,7 @@ type clientConfigInput struct {
 	proxyID   string
 	clusterID string
 	version   string
+	namespace string
 
 	cdsSyncStatus  status.ConfigStatus
 	ldsSyncStatus  status.ConfigStatus
@@ -390,6 +265,7 @@ func newXdsClientConfig(config clientConfigInput) *status.ClientConfig {
 	meta := model.NodeMetadata{
 		ClusterID:    cluster.ID(config.clusterID),
 		IstioVersion: config.version,
+		Namespace:    config.namespace,
 	}
 	return &status.ClientConfig{
 		Node: &core.Node{

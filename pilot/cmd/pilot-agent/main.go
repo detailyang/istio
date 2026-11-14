@@ -17,8 +17,15 @@ package main
 import (
 	"os"
 
+	// Import automemlimit to automatically set GOMEMLIMIT to 90% of cgroup memory limit
+	_ "github.com/KimMachineGun/automemlimit"
+
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/cmd/pilot-agent/app"
+	istioagent "istio.io/istio/pkg/istio-agent"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/security/pkg/nodeagent/sds"
 )
 
 // TODO: get the config and bootstrap from istiod, by passing the env
@@ -27,7 +34,10 @@ import (
 // No CLI parameters.
 func main() {
 	log.EnableKlogWithCobra()
-	rootCmd := app.NewRootCommand()
+	rootCmd := app.NewRootCommand(
+		func(options *security.Options, workloadSecretCache security.SecretManager, pkpConf *meshconfig.PrivateKeyProvider) istioagent.SDSService {
+			return sds.NewServer(options, workloadSecretCache, pkpConf)
+		})
 	if err := rootCmd.Execute(); err != nil {
 		log.Error(err)
 		os.Exit(-1)

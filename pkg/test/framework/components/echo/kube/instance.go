@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -191,8 +192,8 @@ func (c *instance) NamespaceName() string {
 	return c.cfg.NamespaceName()
 }
 
-func (c *instance) ServiceAccountName() string {
-	return c.cfg.ServiceAccountName()
+func (c *instance) SpiffeIdentity() string {
+	return c.cfg.SpiffeIdentity()
 }
 
 func (c *instance) ClusterLocalFQDN() string {
@@ -290,12 +291,23 @@ func (c *instance) Restart() error {
 		return fmt.Errorf("restart failed to get initial workloads: %v", err)
 	}
 
+	// Collect original pod UIDs so we can verify new pods have come up.
+	// Pod names are not sufficient because StatefulSet pods keep their names across restarts,
+	// but UIDs always change when a pod is deleted and recreated.
+	origPodUIDs := make(map[string]struct{}, len(origWorkloads))
+	for _, w := range origWorkloads {
+		origPodUIDs[string(w.(*workload).pod.UID)] = struct{}{}
+	}
+
 	// Restart the deployment.
 	if err := c.deployment.Restart(); err != nil {
 		return err
 	}
 
-	// Wait until all pods are ready and match the original count.
+	// Wait until all pods are ready, match the original count, and are actually new pods.
+	// Without the UID check, there's a race where the workload manager's informer hasn't
+	// processed delete/add events yet, so WaitForReadyWorkloads returns stale old pods
+	// with the correct count, causing this loop to exit before new pods are actually up.
 	return retry.UntilSuccess(func() (err error) {
 		// Get the currently ready workloads.
 		workloads, err := c.workloadMgr.WaitForReadyWorkloads()
@@ -308,6 +320,15 @@ func (c *instance) Restart() error {
 		if len(workloads) != len(origWorkloads) {
 			return fmt.Errorf("failed restarting echo %s/%s: number of pods %d does not match original %d",
 				c.cfg.Namespace.Name(), c.cfg.Service, len(workloads), len(origWorkloads))
+		}
+
+		// Verify all workloads are actually new pods, not old ones lingering in the workload manager.
+		for _, w := range workloads {
+			uid := string(w.(*workload).pod.UID)
+			if _, ok := origPodUIDs[uid]; ok {
+				return fmt.Errorf("failed restarting echo %s/%s: old pod %s (UID %s) still present",
+					c.cfg.Namespace.Name(), c.cfg.Service, w.PodName(), uid)
+			}
 		}
 
 		return nil
@@ -329,15 +350,18 @@ func (c *instance) aggregateResponses(opts echo.CallOptions) (echo.CallResult, e
 	}
 	aggErr := istiomultierror.New()
 	for _, w := range workloads {
-		clusterName := w.(*workload).cluster.Name()
-		serviceName := fmt.Sprintf("%s (cluster=%s)", c.cfg.Service, clusterName)
-
-		out, err := common.ForwardEcho(serviceName, c, opts, w.(*workload).Client)
-		if err != nil {
-			aggErr = multierror.Append(aggErr, err)
-			continue
+		w := w.(*workload)
+		for _, ipf := range ipFamilies(w, opts) {
+			serviceName := fmt.Sprintf("%s (cluster=%s)", c.cfg.Service, w.cluster.Name())
+			opts = opts.DeepCopy()
+			opts.ForceIPFamily = ipf
+			out, err := common.ForwardEcho(serviceName, c, opts, w.Client)
+			if err != nil {
+				aggErr = multierror.Append(aggErr, err)
+				continue
+			}
+			resps = append(resps, out.Responses...)
 		}
-		resps = append(resps, out.Responses...)
 	}
 	if aggErr.ErrorOrNil() != nil {
 		return echo.CallResult{}, aggErr
@@ -348,4 +372,30 @@ func (c *instance) aggregateResponses(opts echo.CallOptions) (echo.CallResult, e
 		Opts:      opts,
 		Responses: resps,
 	}, nil
+}
+
+func ipFamilies(w echo.Workload, opts echo.CallOptions) []string {
+	if opts.ForceIPFamily != "" {
+		return []string{opts.ForceIPFamily}
+	}
+	if !opts.DualStack {
+		return []string{""}
+	}
+	var v4 bool
+	var v6 bool
+	for _, a := range w.Addresses() {
+		ip, err := netip.ParseAddr(a)
+		if err == nil {
+			return []string{""}
+		}
+		if ip.Is4() {
+			v4 = true
+		} else if ip.Is6() {
+			v6 = true
+		}
+	}
+	if v4 && v6 {
+		return []string{"tcp4", "tcp6"}
+	}
+	return []string{""}
 }

@@ -15,6 +15,8 @@
 package model
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
@@ -22,6 +24,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
 )
 
@@ -215,10 +218,10 @@ func TestRequestPrincipal(t *testing.T) {
 `,
 		},
 	}
-	rpg := requestPrincipalGenerator{useExtendedJwt: true}
+	rpg := requestPrincipalGenerator{}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
-			got, err := rpg.principal("", tc.in, false, false)
+			got, err := rpg.extendedPrincipal("", []string{tc.in}, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -341,6 +344,48 @@ func TestGenerator(t *testing.T) {
               regex: .*/ns/foo/.*`),
 		},
 		{
+			name:  "srcTrustDomainGenerator-exact",
+			g:     srcTrustDomainGenerator{},
+			value: "cluster.local",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            prefix: spiffe://cluster.local/`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "*",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            prefix: spiffe://`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-prefix-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "cluster.*",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            safeRegex:
+              regex: spiffe://cluster\.[^/]*/.*`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-suffix-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "*local",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            safeRegex:
+              regex: spiffe://[^/]*local/.*`),
+		},
+		{
 			name:  "srcPrincipalGenerator-http",
 			g:     srcPrincipalGenerator{},
 			key:   "source.principal",
@@ -364,48 +409,6 @@ func TestGenerator(t *testing.T) {
             exact: spiffe://foo`),
 		},
 		{
-			name:  "requestPrincipalGenerator",
-			g:     requestPrincipalGenerator{},
-			key:   "request.auth.principal",
-			value: "foo",
-			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: request.auth.principal
-          value:
-            stringMatch:
-              exact: foo`),
-		},
-		{
-			name:  "requestAudiencesGenerator",
-			g:     requestAudiencesGenerator{},
-			key:   "request.auth.audiences",
-			value: "foo",
-			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: request.auth.audiences
-          value:
-            stringMatch:
-              exact: foo`),
-		},
-		{
-			name:  "requestPresenterGenerator",
-			g:     requestPresenterGenerator{},
-			key:   "request.auth.presenter",
-			value: "foo",
-			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: request.auth.presenter
-          value:
-            stringMatch:
-              exact: foo`),
-		},
-		{
 			name:  "requestHeaderGenerator",
 			g:     requestHeaderGenerator{},
 			key:   "request.headers[x-foo]",
@@ -417,39 +420,121 @@ func TestGenerator(t *testing.T) {
             exact: foo`),
 		},
 		{
-			name:  "requestClaimGenerator",
-			g:     requestClaimGenerator{},
-			key:   "request.auth.claims[bar]",
-			value: "foo",
+			name:  "requestHeaderGenerator-method",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:method]",
+			value: "POST",
 			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: request.auth.claims
-          - key: bar
-          value:
-            listMatch:
-              oneOf:
-                stringMatch:
-                  exact: foo`),
+        header:
+          name: :method
+          stringMatch:
+            exact: POST
+            ignoreCase: true`),
 		},
 		{
-			name:  "requestNestedClaimsGenerator",
-			g:     requestClaimGenerator{},
-			key:   "request.auth.claims[bar][baz]",
-			value: "foo",
+			name:  "requestHeaderGenerator-method-uppercase-key",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:METHOD]",
+			value: "POST",
 			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: request.auth.claims
-          - key: bar
-          - key: baz
-          value:
-            listMatch:
-              oneOf:
-                stringMatch:
-                  exact: foo`),
+        header:
+          name: :METHOD
+          stringMatch:
+            exact: POST
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-authority",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:authority]",
+			value: "admin.example.com",
+			want: yamlPrincipal(t, `
+        header:
+          name: :authority
+          stringMatch:
+            exact: admin.example.com
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-authority-uppercase-key",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:AUTHORITY]",
+			value: "admin.example.com",
+			want: yamlPrincipal(t, `
+        header:
+          name: :AUTHORITY
+          stringMatch:
+            exact: admin.example.com
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-authority-prefix",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:authority]",
+			value: "admin.*",
+			want: yamlPrincipal(t, `
+        header:
+          name: :authority
+          stringMatch:
+            prefix: admin.
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-authority-suffix",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:authority]",
+			value: "*.example.com",
+			want: yamlPrincipal(t, `
+        header:
+          name: :authority
+          stringMatch:
+            suffix: .example.com
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-authority-present",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[:authority]",
+			value: "*",
+			want: yamlPrincipal(t, `
+        header:
+          name: :authority
+          presentMatch: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-host",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[host]",
+			value: "admin.example.com",
+			want: yamlPrincipal(t, `
+        header:
+          name: host
+          stringMatch:
+            exact: admin.example.com
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-host-mixed-case-key",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[Host]",
+			value: "admin.example.com",
+			want: yamlPrincipal(t, `
+        header:
+          name: Host
+          stringMatch:
+            exact: admin.example.com
+            ignoreCase: true`),
+		},
+		{
+			name:  "requestHeaderGenerator-other-header-case-sensitive",
+			g:     requestHeaderGenerator{},
+			key:   "request.headers[x-tenant]",
+			value: "Admin",
+			want: yamlPrincipal(t, `
+        header:
+          name: x-tenant
+          stringMatch:
+            exact: Admin`),
 		},
 		{
 			name:  "hostGenerator",
@@ -472,6 +557,17 @@ func TestGenerator(t *testing.T) {
             exact: /abc`),
 		},
 		{
+			name:  "pathGenerator-template",
+			g:     pathGenerator{},
+			value: "/abc/{*}",
+			want: yamlPermission(t, `
+         uriTemplate:
+           name: uri-template
+           typedConfig:
+            '@type': type.googleapis.com/envoy.extensions.path.match.uri_template.v3.UriTemplateMatchConfig
+            pathTemplate: /abc/*`),
+		},
+		{
 			name:  "methodGenerator",
 			g:     methodGenerator{},
 			value: "GET",
@@ -479,7 +575,8 @@ func TestGenerator(t *testing.T) {
          header:
           name: :method
           stringMatch:
-            exact: GET`),
+            exact: GET
+            ignoreCase: true`),
 		},
 	}
 
@@ -502,7 +599,7 @@ func TestGenerator(t *testing.T) {
 				_, err1 := tc.g.principal(tc.key, tc.value, tc.forTCP, false)
 				_, err2 := tc.g.permission(tc.key, tc.value, tc.forTCP)
 				if err1 == nil || err2 == nil {
-					t.Fatalf("wanted error")
+					t.Fatal("wanted error")
 				}
 				return
 			}
@@ -517,6 +614,126 @@ func TestGenerator(t *testing.T) {
 				}
 				t.Errorf("got:\n %v\n but want:\n %v", gotYaml, tc.want)
 			}
+		})
+	}
+}
+
+func TestServiceAccount(t *testing.T) {
+	cases := []struct {
+		Name     string
+		Input    string
+		Identity string
+		Match    bool
+	}{
+		{
+			Name:     "standard",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "suffix attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa/k/v",
+			Match:    true,
+		},
+		{
+			Name:     "prefix attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/k/v/ns/my-ns/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "middle attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/k/v/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "all attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/k1/v1/ns/my-ns/k2/v2/sa/my-sa/k3/v3",
+			Match:    true,
+		},
+		{
+			Name:     "sa suffix string",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa-suffix",
+			Match:    false,
+		},
+		{
+			Name:     "ns suffix string",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns-suffix/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "not spiffe",
+			Input:    "my-ns/my-sa",
+			Identity: "cluster.local/ns/my-ns/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "invalid spiffe",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://ns/my-ns/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "missing sa",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns",
+			Match:    false,
+		},
+		{
+			Name:     "missing ns",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:  "weird keys",
+			Input: "my-ns/my-sa",
+			// This test case matches when it shouldn't ideally.
+			// Spiffe is a set of k/v pairs. Here we are accidentally matching
+			// on previous value + next key when we shouldn't.
+			// The chance of an identity being formatted like this is exceptionally low though
+			Identity: "spiffe://cluster.local/" + strings.Join([]string{
+				"k", "ns",
+				"my-ns", "something",
+				"bar", "sa",
+				"my-sa", "baz",
+			}, "/"),
+			Match: true,
+		},
+		{
+			Name:     "regex metachars - exact match with dots",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/my.ns/sa/my.sa",
+			Match:    true,
+		},
+		{
+			Name:     "regex metachars - dot should not match arbitrary char in ns",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/myXns/sa/my.sa",
+			Match:    false,
+		},
+		{
+			Name:     "regex metachars - dot should not match arbitrary char in sa",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/my.ns/sa/myXsa",
+			Match:    false,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			r := serviceAccountRegex("", tt.Input)
+			// Parse as regex. Envoy does a full string match, so handle that
+			rgx, err := regexp.Compile("^" + r + "$")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, rgx.MatchString(tt.Identity), tt.Match)
 		})
 	}
 }
@@ -537,4 +754,55 @@ func yamlPrincipal(t *testing.T, yaml string) *rbacpb.Principal {
 		t.Fatalf("failed to parse yaml: %s", err)
 	}
 	return p
+}
+
+func TestServiceAccountRegex(t *testing.T) {
+	assert.Equal(t, serviceAccountRegex("", "my-ns/my-sa"), `spiffe://.+/ns/my-ns/(.+/|)sa/my-sa(/.+)?`)
+	assert.Equal(t, serviceAccountRegex("my-ns", "my-sa"), `spiffe://.+/ns/my-ns/(.+/|)sa/my-sa(/.+)?`)
+	// Regex metacharacters in namespace and SA name should be escaped
+	assert.Equal(t, serviceAccountRegex("", "my.ns/my.sa"), `spiffe://.+/ns/my\.ns/(.+/|)sa/my\.sa(/.+)?`)
+	assert.Equal(t, serviceAccountRegex("ns+foo", "sa(bar)"), `spiffe://.+/ns/ns\+foo/(.+/|)sa/sa\(bar\)(/.+)?`)
+}
+
+func TestNamespaceMatcherRegex_Match(t *testing.T) {
+	testCases := []struct {
+		name    string
+		v       string
+		match   string
+		noMatch string
+	}{
+		{
+			name:    "exact-match-with-dot",
+			v:       "ns.prod",
+			match:   "spiffe://cluster.local/ns/ns.prod/sa/admin",
+			noMatch: "spiffe://cluster.local/ns/nsXprod/sa/admin",
+		},
+		{
+			name:    "wildcard-match-with-dot",
+			v:       "ns.*.prod",
+			match:   "spiffe://cluster.local/ns/ns.any.prod/sa/admin",
+			noMatch: "spiffe://cluster.local/ns/nsXanyXprod/sa/admin",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := srcNamespaceGenerator{}
+			p, err := g.principal("", tc.v, false, true)
+			if err != nil {
+				t.Fatalf("failed to generate principal: %v", err)
+			}
+			regexStr := p.GetAuthenticated().GetPrincipalName().GetSafeRegex().GetRegex()
+			re, err := regexp.Compile(regexStr)
+			if err != nil {
+				t.Fatalf("failed to compile regex %q: %v", regexStr, err)
+			}
+			if !re.MatchString(tc.match) {
+				t.Errorf("expected %q to match %q", regexStr, tc.match)
+			}
+			if re.MatchString(tc.noMatch) {
+				t.Errorf("expected %q NOT to match %q", regexStr, tc.noMatch)
+			}
+		})
+	}
 }

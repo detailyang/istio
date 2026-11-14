@@ -30,10 +30,14 @@ import (
 )
 
 func webhook(revision string) *v1.MutatingWebhookConfiguration {
+	return webhookWithName(defaultTagWebhookName, revision)
+}
+
+func webhookWithName(name, revision string) *v1.MutatingWebhookConfiguration {
 	return &v1.MutatingWebhookConfiguration{
 		TypeMeta: metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: defaultTagWebhookName,
+			Name: name,
 			Labels: map[string]string{
 				label.IoIstioRev.Name: revision,
 			},
@@ -59,14 +63,14 @@ func expectRevisionChan(t test.Failer, revisionChan chan string, expected string
 			t.Fatalf("expected revision %q to be produced on chan, got %q", expected, rev)
 		}
 	case <-time.After(time.Second * 5):
-		t.Fatalf("timed out waiting for value on default revision chan")
+		t.Fatal("timed out waiting for value on default revision chan")
 	}
 }
 
 func TestNoDefaultRevision(t *testing.T) {
 	stop := make(chan struct{})
 	client := kube.NewFakeClient()
-	w := NewDefaultWatcher(client, "default")
+	w := NewDefaultWatcher(client, "default", "")
 	client.RunAndWait(stop)
 	go w.Run(stop)
 	// if have no default tag for some reason, should return ""
@@ -77,7 +81,7 @@ func TestNoDefaultRevision(t *testing.T) {
 func TestDefaultRevisionChanges(t *testing.T) {
 	stop := test.NewStop(t)
 	client := kube.NewFakeClient()
-	w := NewDefaultWatcher(client, "default").(*defaultWatcher)
+	w := NewDefaultWatcher(client, "default", "").(*defaultWatcher)
 	client.RunAndWait(stop)
 	go w.Run(stop)
 	whc := clienttest.Wrap(t, w.webhooks)
@@ -98,7 +102,7 @@ func TestDefaultRevisionChanges(t *testing.T) {
 func TestHandlers(t *testing.T) {
 	stop := test.NewStop(t)
 	client := kube.NewFakeClient()
-	w := NewDefaultWatcher(client, "default").(*defaultWatcher)
+	w := NewDefaultWatcher(client, "default", "").(*defaultWatcher)
 	client.RunAndWait(stop)
 	go w.Run(stop)
 	whc := clienttest.Wrap(t, w.webhooks)
@@ -112,4 +116,49 @@ func TestHandlers(t *testing.T) {
 	w.AddHandler(handler)
 	whc.CreateOrUpdate(webhook("green"))
 	expectRevisionChan(t, newDefaultChan, "green")
+}
+
+func TestDefaultRevisionWithCustomNamespace(t *testing.T) {
+	stop := test.NewStop(t)
+	client := kube.NewFakeClient()
+	// Pass a custom namespace so the watcher looks for "istio-revision-tag-default-custom-istio-ns"
+	w := NewDefaultWatcher(client, "default", "custom-istio-ns").(*defaultWatcher)
+	client.RunAndWait(stop)
+	go w.Run(stop)
+	whc := clienttest.Wrap(t, w.webhooks)
+	expectRevision(t, w, "")
+
+	// The canonical name webhook should NOT be matched when a custom namespace is specified
+	whc.CreateOrUpdate(webhookWithName(defaultTagWebhookName, "wrong-revision"))
+	expectRevision(t, w, "")
+
+	// The namespace-suffixed webhook should be matched
+	customName := defaultTagWebhookName + "-custom-istio-ns"
+	whc.CreateOrUpdate(webhookWithName(customName, "rev-1"))
+	expectRevision(t, w, "rev-1")
+
+	// change revision
+	whc.CreateOrUpdate(webhookWithName(customName, "rev-2"))
+	expectRevision(t, w, "rev-2")
+
+	// remove webhook
+	whc.Delete(customName, "")
+	expectRevision(t, w, "")
+}
+
+func TestDefaultRevisionWithIstioSystemNamespace(t *testing.T) {
+	stop := test.NewStop(t)
+	client := kube.NewFakeClient()
+	// Passing "istio-system" should use the canonical name, not a suffixed one
+	w := NewDefaultWatcher(client, "default", "istio-system").(*defaultWatcher)
+	client.RunAndWait(stop)
+	go w.Run(stop)
+	whc := clienttest.Wrap(t, w.webhooks)
+	expectRevision(t, w, "")
+
+	whc.CreateOrUpdate(webhook("rev-1"))
+	expectRevision(t, w, "rev-1")
+
+	whc.Delete(defaultTagWebhookName, "")
+	expectRevision(t, w, "")
 }

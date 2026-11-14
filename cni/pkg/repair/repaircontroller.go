@@ -24,24 +24,27 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/cni/pkg/config"
+	"istio.io/istio/cni/pkg/plugin"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 )
 
 type Controller struct {
-	client kube.Client
-	pods   kclient.Client[*corev1.Pod]
-	queue  controllers.Queue
-	cfg    config.RepairConfig
-	events kclient.EventRecorder
+	client       kube.Client
+	pods         kclient.Client[*corev1.Pod]
+	queue        controllers.Queue
+	cfg          config.RepairConfig
+	events       kclient.EventRecorder
+	repairedPods map[types.NamespacedName]types.UID
 }
 
 func NewRepairController(client kube.Client, cfg config.RepairConfig) (*Controller, error) {
 	c := &Controller{
-		cfg:    cfg,
-		client: client,
-		events: kclient.NewEventRecorder(client, "cni-repair"),
+		cfg:          cfg,
+		client:       client,
+		events:       kclient.NewEventRecorder(client, "cni-repair"),
+		repairedPods: map[types.NamespacedName]types.UID{},
 	}
 	fieldSelectors := []string{}
 	if cfg.FieldSelectors != "" {
@@ -56,9 +59,7 @@ func NewRepairController(client kube.Client, cfg config.RepairConfig) (*Controll
 	c.queue = controllers.NewQueue("repair pods",
 		controllers.WithReconciler(c.Reconcile),
 		controllers.WithMaxAttempts(5))
-	c.pods.AddEventHandler(controllers.FilteredObjectHandler(c.queue.AddObject, func(o controllers.Object) bool {
-		return c.matchesFilter(o.(*corev1.Pod))
-	}))
+	c.pods.AddEventHandler(controllers.ObjectHandler(c.queue.AddObject))
 
 	return c, nil
 }
@@ -72,6 +73,7 @@ func (c *Controller) Run(stop <-chan struct{}) {
 func (c *Controller) Reconcile(key types.NamespacedName) error {
 	pod := c.pods.Get(key.Name, key.Namespace)
 	if pod == nil {
+		delete(c.repairedPods, key) // Ensure we do not leak
 		// Pod deleted, nothing to do
 		return nil
 	}
@@ -79,12 +81,46 @@ func (c *Controller) Reconcile(key types.NamespacedName) error {
 }
 
 func (c *Controller) ReconcilePod(pod *corev1.Pod) (err error) {
+	if !c.matchesFilter(pod) {
+		return err // Skip, pod doesn't need repair
+	}
 	repairLog.Debugf("Reconciling pod %s", pod.Name)
 
-	if c.cfg.DeletePods {
+	if c.cfg.RepairPods {
+		return c.repairPod(pod)
+	} else if c.cfg.DeletePods {
 		return c.deleteBrokenPod(pod)
 	} else if c.cfg.LabelPods {
 		return c.labelBrokenPod(pod)
+	}
+	return nil
+}
+
+// redirectRunningPod dynamically enters the provided pod, that is already running, and programs it's networking configuration.
+func redirectRunningPod(pod *corev1.Pod, netns string) error {
+	pi := plugin.ExtractPodInfo(pod)
+	redirect, err := plugin.NewRedirect(pi)
+	if err != nil {
+		return fmt.Errorf("setup redirect: %v", err)
+	}
+	rulesMgr := plugin.IptablesInterceptRuleMgr()
+	if err := rulesMgr.Program(pod.Name, netns, redirect); err != nil {
+		return fmt.Errorf("program redirection: %v", err)
+	}
+	return nil
+}
+
+// redirectRunningPodNFT dynamically enters the provided pod, that is already running,
+// and programs it's networking configuration using nftables rules.
+func redirectRunningPodNFT(pod *corev1.Pod, netns string) error {
+	pi := plugin.ExtractPodInfo(pod)
+	redirect, err := plugin.NewRedirect(pi)
+	if err != nil {
+		return fmt.Errorf("setup redirect: %v", err)
+	}
+	rulesMgr := plugin.NftablesInterceptRuleMgr()
+	if err := rulesMgr.Program(pod.Name, netns, redirect); err != nil {
+		return fmt.Errorf("program redirection: %v", err)
 	}
 	return nil
 }
@@ -96,11 +132,6 @@ const (
 
 func (c *Controller) deleteBrokenPod(pod *corev1.Pod) error {
 	m := podsRepaired.With(typeLabel.Value(deleteType))
-	// Added for safety, to make sure no healthy pods get labeled. Could occur if pod changes since we enqueued
-	if !c.matchesFilter(pod) {
-		m.With(resultLabel.Value(resultSkip)).Increment()
-		return nil
-	}
 	repairLog.Infof("Pod detected as broken, deleting: %s/%s", pod.Namespace, pod.Name)
 
 	// Make sure we are deleting what we think we are...
@@ -124,10 +155,6 @@ func (c *Controller) deleteBrokenPod(pod *corev1.Pod) error {
 func (c *Controller) labelBrokenPod(pod *corev1.Pod) error {
 	// Added for safety, to make sure no healthy pods get labeled.
 	m := podsRepaired.With(typeLabel.Value(labelType))
-	if !c.matchesFilter(pod) {
-		m.With(resultLabel.Value(resultSkip)).Increment()
-		return nil
-	}
 	repairLog.Infof("Pod detected as broken, adding label: %s/%s", pod.Namespace, pod.Name)
 
 	labels := pod.GetLabels()
@@ -140,8 +167,9 @@ func (c *Controller) labelBrokenPod(pod *corev1.Pod) error {
 	repairLog.Infof("Labeling pod %s/%s with label %s=%s", pod.Namespace, pod.Name, c.cfg.LabelKey, c.cfg.LabelValue)
 
 	patchBytes := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, c.cfg.LabelKey, c.cfg.LabelValue)
+	// Both "pods" and "pods/status" can mutate the metadata. However, pods/status is lower privilege, so we use that instead.
 	_, err := c.client.Kube().CoreV1().Pods(pod.Namespace).Patch(context.Background(), pod.Name, types.MergePatchType,
-		[]byte(patchBytes), metav1.PatchOptions{})
+		[]byte(patchBytes), metav1.PatchOptions{}, "status")
 	if err != nil {
 		repairLog.Errorf("Failed to update pod: %s", err)
 		c.events.Write(pod, corev1.EventTypeWarning, ReasonLabelBrokenPod, "pod detected as broken, but failed to label: %v", err)

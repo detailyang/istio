@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -25,6 +24,7 @@ import (
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
+	"istio.io/istio/pkg/test/framework/components/echo/check"
 	"istio.io/istio/pkg/test/framework/components/echo/deployment"
 	"istio.io/istio/pkg/test/framework/components/echo/match"
 	"istio.io/istio/pkg/test/framework/components/istio"
@@ -63,13 +63,21 @@ func GetZipkinInstance() zipkin.Instance {
 	return zipkinInst
 }
 
+func GetServerInstances() echo.Instances {
+	return server
+}
+
+func GetClientInstances() echo.Instances {
+	return client
+}
+
 func TestSetup(ctx resource.Context) (err error) {
 	appNsInst, err = namespace.New(ctx, namespace.Config{
 		Prefix: "echo",
 		Inject: true,
 	})
 	if err != nil {
-		return
+		return err
 	}
 	builder := deployment.New(ctx)
 	for _, c := range ctx.Clusters() {
@@ -115,23 +123,29 @@ func TestSetup(ctx resource.Context) (err error) {
 	client = servicePrefix("client").GetMatches(echos)
 	server = match.ServiceName(echo.NamespacedName{Name: "server", Namespace: appNsInst}).GetMatches(echos)
 	ingInst = ist.IngressFor(ctx.Clusters().Default())
-	addr, _ := ingInst.HTTPAddress()
-	zipkinInst, err = zipkin.New(ctx, zipkin.Config{Cluster: ctx.Clusters().Default(), IngressAddr: addr})
+	addrs, _ := ingInst.HTTPAddresses()
+	zipkinInst, err = zipkin.New(ctx, zipkin.Config{Cluster: ctx.Clusters().Default(), IngressAddr: addrs[0]})
 	if err != nil {
-		return
+		return err
 	}
-
 	return nil
+}
+
+// isNonGatewayRoot returns true if this span is a root (no parent) and is not from a gateway.
+// Used to skip egress/ingress gateway roots when finding the client's trace to compare.
+func isNonGatewayRoot(s *zipkin.Span) bool {
+	if s.ParentSpanID != "" {
+		return false
+	}
+	return !strings.Contains(s.ServiceName, "egressgateway") && !strings.Contains(s.ServiceName, "ingressgateway")
 }
 
 func VerifyEchoTraces(t framework.TestContext, namespace, clName string, traces []zipkin.Trace) bool {
 	t.Helper()
 	wtr := WantTraceRoot(namespace, clName)
 	for _, trace := range traces {
-		// compare each candidate trace with the wanted trace
 		for _, s := range trace.Spans {
-			// find the root span of candidate trace and do recursive comparison
-			if s.ParentSpanID == "" && CompareTrace(t, s, wtr) {
+			if isNonGatewayRoot(&s) && CompareTrace(t, s, wtr) {
 				return true
 			}
 		}
@@ -144,6 +158,34 @@ func VerifyOtelEchoTraces(t framework.TestContext, namespace, clName string, tra
 	t.Helper()
 	wtr := WantOtelTraceRoot(namespace, clName)
 	for _, trace := range traces {
+		for _, s := range trace.Spans {
+			if isNonGatewayRoot(&s) && CompareTrace(t, s, wtr) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func WantOtelTraceRoot(namespace, clName string) (root zipkin.Span) {
+	serverSpan := zipkin.Span{
+		Name:        fmt.Sprintf("server.%s.svc.cluster.local:80/*", namespace),
+		ServiceName: fmt.Sprintf("server.%s", namespace),
+	}
+
+	root = zipkin.Span{
+		Name:        fmt.Sprintf("server.%s.svc.cluster.local:80/*", namespace),
+		ServiceName: fmt.Sprintf("client-%s.%s", clName, namespace),
+		ChildSpans:  []*zipkin.Span{&serverSpan},
+	}
+	return root
+}
+
+func VerifyOtelIngressTraces(t framework.TestContext, namespace, path string, traces []zipkin.Trace) bool {
+	t.Helper()
+	wtr := WantOtelIngressTraceRoot(namespace, path)
+	for _, trace := range traces {
 		// compare each candidate trace with the wanted trace
 		for _, s := range trace.Spans {
 			// find the root span of candidate trace and do recursive comparison
@@ -156,21 +198,27 @@ func VerifyOtelEchoTraces(t framework.TestContext, namespace, clName string, tra
 	return false
 }
 
-func WantOtelTraceRoot(namespace, clName string) (root zipkin.Span) {
-	serverSpan := zipkin.Span{
-		Name:        "ingress",
-		ServiceName: fmt.Sprintf("server.%s", namespace),
+func WantOtelIngressTraceRoot(namespace, path string) (root zipkin.Span) {
+	ingressServiceFQDN := fmt.Sprintf("%s.%s", ingInst.ServiceName(), ingInst.Namespace())
+	return zipkin.Span{
+		ServiceName: ingressServiceFQDN,
+		Name:        fmt.Sprintf("server.%s.svc.cluster.local:80%s", namespace, path),
+		ChildSpans: []*zipkin.Span{
+			{
+				Name:        fmt.Sprintf("router outbound|80||server.%s.svc.cluster.local; egress", namespace),
+				ServiceName: ingressServiceFQDN,
+				ChildSpans: []*zipkin.Span{
+					{
+						Name:        fmt.Sprintf("server.%s.svc.cluster.local:80%s", namespace, path),
+						ServiceName: fmt.Sprintf("server.%s", namespace),
+					},
+				},
+			},
+		},
 	}
-
-	root = zipkin.Span{
-		Name:        fmt.Sprintf("egress server.%s.svc.cluster.local", namespace),
-		ServiceName: fmt.Sprintf("client-%s.%s", clName, namespace),
-		ChildSpans:  []*zipkin.Span{&serverSpan},
-	}
-	return
 }
 
-// compareTrace recursively compares the two given spans
+// CompareTrace recursively compares the two given spans
 func CompareTrace(t framework.TestContext, got, want zipkin.Span) bool {
 	t.Helper()
 	if got.Name != want.Name || got.ServiceName != want.ServiceName {
@@ -206,7 +254,7 @@ func WantTraceRoot(namespace, clName string) (root zipkin.Span) {
 		ServiceName: fmt.Sprintf("client-%s.%s", clName, namespace),
 		ChildSpans:  []*zipkin.Span{&serverSpan},
 	}
-	return
+	return root
 }
 
 // SendTraffic makes a client call to the "server" service on the http port.
@@ -233,6 +281,31 @@ func SendTraffic(t framework.TestContext, headers map[string][]string, cl cluste
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// SendIngressTraffic makes a call to the "server" service from ingress.
+func SendIngressTraffic(t framework.TestContext, path string, headers map[string][]string, cl cluster.Cluster) error {
+	t.Helper()
+	t.Logf("Sending from %s ingress...", cl.Name())
+	ing := GetIngressInstance()
+	_, err := ing.Call(echo.CallOptions{
+		Port: echo.Port{
+			Protocol: protocol.HTTP,
+		},
+		Count: 10,
+		HTTP: echo.HTTP{
+			Path:    path,
+			Headers: headers,
+		},
+		Check: check.OK(),
+		Retry: echo.Retry{
+			NoRetry: true,
+		},
+	})
+	if err != nil {
+		return err
 	}
 	return nil
 }

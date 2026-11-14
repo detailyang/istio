@@ -36,9 +36,17 @@ func TestMessage_String(t *testing.T) {
 func TestMessageWithResource_String(t *testing.T) {
 	g := NewWithT(t)
 	mt := NewMessageType(Error, "IST-0042", "Cheese type not found: %q")
-	m := NewMessage(mt, &resource.Instance{Origin: testOrigin{name: "toppings/cheese", ref: testReference{"path/to/file"}}}, "Feta")
+	m := NewMessage(mt, &resource.Instance{Origin: testOrigin{name: "toppings/cheese", ref: testReference{"path/to/file"}, cluster: "default"}}, "Feta")
 
 	g.Expect(m.String()).To(Equal(`Error [IST-0042] (toppings/cheese path/to/file) Cheese type not found: "Feta"`))
+}
+
+func TestMessageWithPrintCluster_String(t *testing.T) {
+	g := NewWithT(t)
+	mt := NewMessageType(Error, "IST-0042", "Cheese type not found: %q")
+	m := NewMessage(mt, &resource.Instance{Origin: testOrigin{name: "toppings/cheese", ref: testReference{"path/to/file"}, cluster: "default"}}, "Feta")
+	m.PrintCluster = true
+	g.Expect(m.String()).To(Equal(`Error [IST-0042] [cluster-default] (toppings/cheese path/to/file) Cheese type not found: "Feta"`))
 }
 
 func TestMessage_Unstructured(t *testing.T) {
@@ -51,7 +59,7 @@ func TestMessage_Unstructured(t *testing.T) {
 
 	m = NewMessage(mt, &resource.Instance{Origin: testOrigin{name: "toppings/cheese"}}, "Feta")
 
-	g.Expect(m.Unstructured(true)).To((HaveKey("origin")))
+	g.Expect(m.Unstructured(true)).To(HaveKey("origin"))
 	g.Expect(m.Unstructured(false)).To(Not(HaveKey("origin")))
 }
 

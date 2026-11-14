@@ -16,39 +16,122 @@ package hbone
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
-
-	"istio.io/istio/pkg/h2c"
+	"github.com/cbeuw/connutil"
 )
 
+func NewDoubleHBONEServer(tlsConfig *tls.Config) *http.Server {
+	return newServer(func(t *tls.Config) func(http.ResponseWriter, *http.Request) bool {
+		return func(w http.ResponseWriter, r *http.Request) bool {
+			return handleDoubleConnect(w, r, t)
+		}
+	}(tlsConfig))
+}
+
 func NewServer() *http.Server {
-	// Need to set this to allow timeout on the read header
-	h1 := &http.Transport{
-		ExpectContinueTimeout: 3 * time.Second,
-	}
-	h2, _ := http2.ConfigureTransports(h1)
-	h2.ReadIdleTimeout = 10 * time.Minute // TODO: much larger to support long-lived connections
-	h2.AllowHTTP = true
-	h2Server := &http2.Server{}
+	return newServer(handleConnect)
+}
+
+func newServer(handleFunc func(http.ResponseWriter, *http.Request) bool) *http.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			if handleConnect(w, r) {
+			if handleFunc(w, r) {
 				return
 			}
 		} else {
-			log.Errorf("non-CONNECT: %v", r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
-	hs := &http.Server{
-		Handler: h2c.NewHandler(handler, h2Server),
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	// HTTP2 (over TLS) is needed by the inner server in double HBONE, which is served over TLS.
+	// Without it the server does not advertise "h2" in ALPN and HTTP/2 clients are rejected.
+	protocols.SetHTTP2(true)
+	return &http.Server{
+		Handler:   handler,
+		Protocols: protocols,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: 10 * time.Minute, // TODO: much larger to support long-lived connections
+		},
 	}
-	return hs
+}
+
+func handleDoubleConnect(w http.ResponseWriter, r *http.Request, tlsConfig *tls.Config) bool {
+	t0 := time.Now()
+	log.WithLabels("host", r.Host, "source", r.RemoteAddr).Info("Received Double CONNECT")
+	// Send headers back immediately so we can start getting the body
+	w.(http.Flusher).Flush()
+
+	// TODO: Remove this check; this is Istio specific context
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		log.Errorf("invalid host header: %v", r.Host)
+		w.WriteHeader(http.StatusBadRequest)
+		return true
+	}
+	if net.ParseIP(host) != nil {
+		// If the host header is an IP address, this is invalid; we only support hostnames in double hbone
+		// TODO: Evaluate if we still need this constraint later
+		log.Errorf("invalid host header: %v. Must be a hostname", r.Host)
+		w.WriteHeader(http.StatusBadRequest)
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	innerServer := newServer(handleConnect)
+	serve := innerServer.Serve
+	if tlsConfig != nil {
+		innerServer.TLSConfig = tlsConfig
+		serve = func(l net.Listener) error { return innerServer.ServeTLS(l, "", "") }
+	} else {
+		log.Info("Using plaintext for inner HBONE server")
+	}
+
+	dialer, listener := connutil.DialerListener(128)
+	go func() {
+		if err := serve(listener); err != nil {
+			log.Errorf("failed to start intermediate http server: %v", err)
+		}
+	}()
+
+	defer func() {
+		if err := innerServer.Shutdown(ctx); err != nil {
+			log.Errorf("failed to shutdown inner server: %v", err)
+		}
+	}()
+	log.Info("Started inner HBONE server and piping data to it")
+
+	clientConn, err := dialer.Dial("", "")
+	if err != nil {
+		log.Errorf("failed to dial inner server: %v", err)
+		return true
+	}
+
+	w.WriteHeader(http.StatusOK)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		// downstream (hbone client) <-- upstream (single hbone server)
+		copyBuffered(w, clientConn, log.WithLabels("name", "pipe to outer client"))
+		err := r.Body.Close()
+		if err != nil {
+			log.Infof("connection to hbone client is not closed: %v", err)
+		}
+		wg.Done()
+	}()
+
+	// downstream (hbone client) --> upstream (app)
+	copyBuffered(clientConn, r.Body, log.WithLabels("name", "body to inner server"))
+	wg.Wait()
+	log.Infof("connection closed in %v", time.Since(t0))
+	return false
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) bool {
@@ -67,7 +150,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) bool {
 	}
 	log.Infof("Connected to %v", r.Host)
 	w.WriteHeader(http.StatusOK)
-
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
@@ -79,6 +161,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) bool {
 		}
 		wg.Done()
 	}()
+
 	// downstream (hbone client) --> upstream (app)
 	copyBuffered(dst, r.Body, log.WithLabels("name", "body to dst"))
 	wg.Wait()

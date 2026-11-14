@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"time"
 
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
@@ -70,6 +71,14 @@ type TLS struct {
 
 	Alpn       []string
 	ServerName string
+
+	// MinVersion sets the minimum TLS version. Valid values: "1.0", "1.1", "1.2", "1.3".
+	// Defaults to "1.2".
+	MinVersion string
+
+	// CurvePreferences specifies the TLS curve preferences.
+	// Valid values: "P-256", "P-384", "P-521", "X25519", "X25519MLKEM768"
+	CurvePreferences []string
 }
 
 type HBONE struct {
@@ -151,6 +160,12 @@ type CallOptions struct {
 	// Headless/StatefulSet deployments.
 	NewConnectionPerRequest bool
 
+	// ForceIPFamily will force a specific IP family to be used for DNS resolution only.
+	// Valid values: "tcp4", "tcp6".
+	ForceIPFamily string
+	// If DualStack is true, an IPv4 and IPv6 request will be sent if the source workload supports dual stack.
+	DualStack bool
+
 	// ForceDNSLookup if true, the forwarder will force a DNS lookup for each individual request. This is
 	// useful for any situation where DNS is used for load balancing (e.g. headless). This is ignored if
 	// NewConnectionPerRequest is false or if the deployment is Headless or StatefulSet.
@@ -170,6 +185,9 @@ type CallOptions struct {
 
 	// HBONE settings.
 	HBONE HBONE
+
+	// DoubleHBONE settings
+	DoubleHBONE HBONE
 
 	// Message to be sent.
 	Message string
@@ -199,11 +217,13 @@ func (o CallOptions) GetHost() string {
 		return o.To.Config().DefaultHostHeader
 	}
 
-	// Next, if the Address was manually specified use it as the Host.
+	// Next, if the Address was manually specified use it as the Host. If it is an IP, leave it so Go can handle the logic to decide
+	// how to format it (whether to add brackets, port, etc)
 	if len(o.Address) > 0 {
-		return o.Address
+		if _, err := netip.ParseAddr(o.Address); err != nil {
+			return o.Address
+		}
 	}
-
 	// Finally, use the target's FQDN.
 	if o.To != nil {
 		return o.To.Config().ClusterLocalFQDN()
@@ -217,6 +237,10 @@ func (o CallOptions) DeepCopy() CallOptions {
 	if o.TLS.Alpn != nil {
 		clone.TLS.Alpn = make([]string, len(o.TLS.Alpn))
 		copy(clone.TLS.Alpn, o.TLS.Alpn)
+	}
+	if o.TLS.CurvePreferences != nil {
+		clone.TLS.CurvePreferences = make([]string, len(o.TLS.CurvePreferences))
+		copy(clone.TLS.CurvePreferences, o.TLS.CurvePreferences)
 	}
 	return clone
 }
@@ -475,3 +499,8 @@ func (o *CallOptions) fillRetryOptions() {
 	// Now append user-provided options to override the defaults.
 	o.Retry.Options = append(retryOpts, o.Retry.Options...)
 }
+
+const (
+	ForceIPFamilyV4 = "tcp4"
+	ForceIPFamilyV6 = "tcp6"
+)

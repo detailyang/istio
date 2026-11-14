@@ -19,14 +19,17 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/hashicorp/go-multierror"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"istio.io/api/annotation"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/config/validation"
+	"istio.io/istio/pkg/config/validation/agent"
+	netutil "istio.io/istio/pkg/util/net"
 	"istio.io/istio/pkg/util/protomarshal"
 )
 
@@ -36,7 +39,6 @@ type annotationValidationFunc func(value string) error
 var (
 	AnnotationValidation = map[string]annotationValidationFunc{
 		annotation.SidecarInterceptionMode.Name:                   validateInterceptionMode,
-		annotation.SidecarEnableCoreDump.Name:                     validateBool,
 		annotation.SidecarStatusPort.Name:                         validateStatusPort,
 		annotation.SidecarStatusReadinessInitialDelaySeconds.Name: validateUInt32,
 		annotation.SidecarStatusReadinessPeriodSeconds.Name:       validateUInt32,
@@ -45,9 +47,17 @@ var (
 		annotation.SidecarTrafficExcludeOutboundIPRanges.Name:     ValidateExcludeIPRanges,
 		annotation.SidecarTrafficIncludeInboundPorts.Name:         ValidateIncludeInboundPorts,
 		annotation.SidecarTrafficExcludeInboundPorts.Name:         ValidateExcludeInboundPorts,
+		annotation.SidecarTrafficIncludeOutboundPorts.Name:        ValidateIncludeOutboundPorts,
 		annotation.SidecarTrafficExcludeOutboundPorts.Name:        ValidateExcludeOutboundPorts,
+		annotation.SidecarTrafficExcludeInterfaces.Name:           ValidateExcludeInterfaces,
+		annotation.SidecarTrafficKubevirtInterfaces.Name:          ValidateExcludeInterfaces,
+		annotation.IoIstioRerouteVirtualInterfaces.Name:           ValidateExcludeInterfaces,
 		annotation.PrometheusMergeMetrics.Name:                    validateBool,
 		annotation.ProxyConfig.Name:                               validateProxyConfig,
+		annotation.SidecarProxyCPU.Name:                           validateResourceQuantity,
+		annotation.SidecarProxyMemory.Name:                        validateResourceQuantity,
+		annotation.SidecarProxyCPULimit.Name:                      validateResourceQuantity,
+		annotation.SidecarProxyMemoryLimit.Name:                   validateResourceQuantity,
 	}
 )
 
@@ -56,7 +66,8 @@ func validateProxyConfig(value string) error {
 	if err := protomarshal.ApplyYAML(value, config); err != nil {
 		return fmt.Errorf("failed to convert to apply proxy config: %v", err)
 	}
-	return validation.ValidateMeshConfigProxyConfig(config)
+	v := agent.ValidateMeshConfigProxyConfig(config)
+	return v.Err
 }
 
 func validateAnnotations(annotations map[string]string) (err error) {
@@ -67,7 +78,7 @@ func validateAnnotations(annotations map[string]string) (err error) {
 			}
 		}
 	}
-	return
+	return err
 }
 
 func validatePortList(parameterName, ports string) error {
@@ -120,6 +131,14 @@ func ValidateExcludeInboundPorts(ports string) error {
 	return validatePortList("excludeInboundPorts", ports)
 }
 
+// ValidateIncludeOutboundPorts validates the includeOutboundPorts parameter
+func ValidateIncludeOutboundPorts(ports string) error {
+	if ports != "*" {
+		return validatePortList("includeOutboundPorts", ports)
+	}
+	return nil
+}
+
 // ValidateExcludeOutboundPorts validates the excludeOutboundPorts parameter
 func ValidateExcludeOutboundPorts(ports string) error {
 	return validatePortList("excludeOutboundPorts", ports)
@@ -142,6 +161,17 @@ func validateUInt32(value string) error {
 // validateBool validates that the given annotation value is a boolean.
 func validateBool(value string) error {
 	_, err := strconv.ParseBool(value)
+	return err
+}
+
+// validateResourceQuantity validates Kubernetes resource quantity - rejects control chars, validates format
+func validateResourceQuantity(value string) error {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("value contains control characters")
+		}
+	}
+	_, err := resource.ParseQuantity(value)
 	return err
 }
 
@@ -181,4 +211,9 @@ func parsePorts(portsString string) ([]int, error) {
 		}
 	}
 	return ports, nil
+}
+
+// ValidateExcludeInterfaces validates the excludeInterfaces parameter
+func ValidateExcludeInterfaces(interfaces string) error {
+	return netutil.ValidateInterfaceNames(interfaces)
 }

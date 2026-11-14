@@ -15,20 +15,34 @@
 package match_test
 
 import (
-	"strconv"
 	"testing"
 
+	"istio.io/api/label"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework/components/cluster"
+	"istio.io/istio/pkg/test/framework/components/cluster/kube"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/match"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
+func init() {
+	allClusters[cls1.Name()] = cls1
+}
+
 var (
+	allClusters = make(cluster.Map)
 	// 2 clusters on 2 networks
-	cls1 = &cluster.FakeCluster{Topology: cluster.Topology{ClusterName: "cls1", Network: "n1", Index: 0, ClusterKind: cluster.Fake}}
+	cls1 = &kube.Cluster{Topology: cluster.Topology{
+		ClusterName:        "cls1",
+		Network:            "n1",
+		PrimaryClusterName: "cls1",
+		ConfigClusterName:  "cls1",
+		Index:              0,
+		AllClusters:        allClusters,
+	}}
 
 	// simple pod
 	a1 = &fakeInstance{Cluster: cls1, Namespace: namespace.Static("echo"), Service: "a"}
@@ -40,14 +54,33 @@ var (
 	headless1 = &fakeInstance{Cluster: cls1, Namespace: namespace.Static("echo"), Service: "headless", Headless: true}
 	// naked pod (uninjected)
 	naked1 = &fakeInstance{Cluster: cls1, Namespace: namespace.Static("echo"), Service: "naked", Subsets: []echo.SubsetConfig{{
-		Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+		Labels: map[string]string{label.SidecarInject.Name: "false"},
 	}}}
 	// external svc
 	external1 = &fakeInstance{
 		Cluster: cls1, Namespace: namespace.Static("echo"), Service: "external", DefaultHostHeader: "external.com", Subsets: []echo.SubsetConfig{{
-			Annotations: map[echo.Annotation]*echo.AnnotationValue{echo.SidecarInject: {Value: strconv.FormatBool(false)}},
+			Labels: map[string]string{label.SidecarInject.Name: "false"},
 		}},
 	}
+	// no sidecar, but ztunnel still protects it - not naked.
+	captured1 = &fakeInstance{Cluster: cls1, Namespace: namespace.Static("ambient-echo"), Service: "captured", Subsets: []echo.SubsetConfig{{
+		Labels: map[string]string{label.SidecarInject.Name: "false"},
+	}}}
+	// same as captured1, plus a waypoint in front - also not naked.
+	waypoint1 = &fakeInstance{
+		Cluster: cls1, Namespace: namespace.Static("ambient-echo"), Service: "waypoint",
+		ServiceWaypointProxy: "shared", WorkloadWaypointProxy: "shared",
+		Subsets: []echo.SubsetConfig{{
+			Labels: map[string]string{label.SidecarInject.Name: "false"},
+		}},
+	}
+	// opts out of ztunnel too (dataplane-mode=none) - genuinely naked.
+	nakedAmbient1 = &fakeInstance{Cluster: cls1, Namespace: namespace.Static("ambient-echo"), Service: "naked-ambient", Subsets: []echo.SubsetConfig{{
+		Labels: map[string]string{
+			label.SidecarInject.Name:        "false",
+			label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone,
+		},
+	}}}
 )
 
 func TestRegularPod(t *testing.T) {
@@ -80,6 +113,9 @@ func TestNaked(t *testing.T) {
 		{app: headless1, expect: false},
 		{app: naked1, expect: true},
 		{app: external1, expect: true},
+		{app: captured1, expect: false},
+		{app: waypoint1, expect: false},
+		{app: nakedAmbient1, expect: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.app.Config().Service, func(t *testing.T) {
@@ -130,8 +166,8 @@ func (f fakeInstance) NamespaceName() string {
 	return f.Config().NamespaceName()
 }
 
-func (f fakeInstance) ServiceAccountName() string {
-	return f.Config().ServiceAccountName()
+func (f fakeInstance) SpiffeIdentity() string {
+	return f.Config().SpiffeIdentity()
 }
 
 func (f fakeInstance) ClusterLocalFQDN() string {

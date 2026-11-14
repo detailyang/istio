@@ -2,7 +2,7 @@ apiVersion: install.istio.io/v1alpha1
 kind: IstioOperator
 spec:
   profile: empty
-  hub: docker.io/istio
+  hub: registry.istio.io/release
   tag: 1.1.4
   meshConfig:
     rootNamespace: istio-control
@@ -23,6 +23,8 @@ spec:
       enabled: true
       namespace: istio-control
       k8s:
+        podDisruptionBudget:
+          maxUnavailable: 1
         resources:
           requests:
             cpu: 123m

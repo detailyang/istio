@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -20,6 +19,7 @@ package common
 import (
 	"fmt"
 
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
@@ -192,6 +192,9 @@ func (c TrafficTestCase) RunForApps(t framework.TestContext, apps echo.Instances
 				doTest(t, src, dsts)
 			})
 		} else if c.viaIngress {
+			if t.Settings().AmbientMultiNetwork {
+				t.Skip("https://github.com/istio/istio/issues/57878")
+			}
 			echoT.RunViaIngress(func(t framework.TestContext, from ingress.Instance, to echo.Target) {
 				doTest(t, from, echo.Services{to.Instances()})
 			})
@@ -262,13 +265,28 @@ func skipAmbient(t framework.TestContext, reason string) skip {
 	return skip{skip: t.Settings().Ambient, reason: reason}
 }
 
-func RunAllTrafficTests(t framework.TestContext, i istio.Instance, apps deployment.SingleNamespaceView) {
+func RunAllTrafficTests(t framework.TestContext, i istio.Instance, apps deployment.SingleNamespaceView, skipCases ...string) {
+	shouldSkip := func(name string) bool {
+		if slices.Contains(skipCases, name) {
+			t.NewSubTest(name).Run(func(t framework.TestContext) {
+				t.Skipf("test case %q excluded by caller", name)
+			})
+			return true
+		}
+		return false
+	}
 	RunCase := func(name string, f func(t TrafficContext)) {
+		if shouldSkip(name) {
+			return
+		}
 		t.NewSubTest(name).Run(func(t framework.TestContext) {
 			f(TrafficContext{TestContext: t, Apps: apps, Istio: i})
 		})
 	}
 	RunSkipAmbient := func(name string, f func(t TrafficContext), reason string) {
+		if shouldSkip(name) {
+			return
+		}
 		t.NewSubTest(name).Run(func(t framework.TestContext) {
 			if t.Settings().Ambient {
 				t.Skipf("ambient skipped: %v", reason)
@@ -295,8 +313,10 @@ func RunAllTrafficTests(t framework.TestContext, i istio.Instance, apps deployme
 	RunCase("use-client-protocol", useClientProtocolCases)
 	RunCase("destinationrule", destinationRuleCases)
 	RunCase("vm", VMTestCases(apps.VM))
-	RunCase("dns", DNSTestCases)
+	RunSkipAmbient("dns", DNSTestCases, "https://github.com/istio/istio/issues/48614")
 	RunCase("externalservice", TestExternalService)
+	RunCase("upstreamproxy", TestUpstreamProxyProtocol)
+	RunCase("service-entry-vips-resolution-none", testServiceEntryWithMultipleVIPsAndResolutionNone)
 }
 
 func ExpectString(got, expected, help string) error {

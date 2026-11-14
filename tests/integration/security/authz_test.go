@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -42,9 +41,6 @@ import (
 
 func TestAuthz_Principal(t *testing.T) {
 	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp").
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -113,12 +109,145 @@ func TestAuthz_Principal(t *testing.T) {
 		})
 }
 
+func TestAuthz_ServiceAccount(t *testing.T) {
+	framework.NewFullTest(t).
+		Run(func(t framework.TestContext) {
+			allowed := apps.Ns1.A
+			denied := apps.Ns2.A
+
+			from := allowed.Append(denied)
+			fromMatch := match.AnyServiceName(from.NamespacedNames())
+			toMatch := match.Not(fromMatch)
+			to := toMatch.GetServiceMatches(apps.Ns1.All)
+			fromAndTo := to.Instances().Append(from)
+
+			config.New(t).
+				Source(config.File("testdata/authz/mtls.yaml.tmpl")).
+				Source(config.File("testdata/authz/allow-serviceaccount.yaml.tmpl").WithParams(
+					param.Params{
+						"Allowed": allowed,
+					})).
+				BuildAll(nil, to).
+				Apply()
+
+			newTrafficTest(t, fromAndTo).
+				FromMatch(fromMatch).
+				ToMatch(toMatch).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					allow := allowValue(from.NamespacedName() == allowed.NamespacedName())
+
+					cases := []struct {
+						ports []echo.Port
+						path  string
+						allow allowValue
+					}{
+						{
+							ports: []echo.Port{ports.GRPC, ports.TCP},
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow",
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow?param=value",
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny",
+							allow: false,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny?param=value",
+							allow: false,
+						},
+					}
+
+					for _, c := range cases {
+						newAuthzTest().
+							From(from).
+							To(to).
+							Allow(c.allow).
+							Path(c.path).
+							BuildAndRunForPorts(t, c.ports...)
+					}
+				})
+		})
+}
+
+func TestAuthz_TrustDomain(t *testing.T) {
+	framework.NewFullTest(t).
+		Run(func(t framework.TestContext) {
+			from := apps.Ns1.A.Append(apps.Ns2.A)
+			fromMatch := match.AnyServiceName(from.NamespacedNames())
+			toMatch := match.Not(fromMatch)
+			to := toMatch.GetServiceMatches(apps.Ns1.All)
+			fromAndTo := to.Instances().Append(from)
+
+			config.New(t).
+				Source(config.File("testdata/authz/mtls.yaml.tmpl")).
+				Source(config.File("testdata/authz/allow-trust-domain.yaml.tmpl")).
+				BuildAll(nil, to).
+				Apply()
+
+			newTrafficTest(t, fromAndTo).
+				FromMatch(fromMatch).
+				ToMatch(toMatch).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					cases := []struct {
+						ports []echo.Port
+						path  string
+						allow allowValue
+					}{
+						{
+							// All test instances are in cluster.local, so all should be allowed.
+							ports: []echo.Port{ports.GRPC, ports.TCP},
+							allow: true,
+						},
+						{
+							// trustDomains: ["cluster.local"] matches all test instances.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow",
+							allow: true,
+						},
+						{
+							// trustDomains: ["bad.example.com"] matches no test instance.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny",
+							allow: false,
+						},
+						{
+							// notTrustDomains: ["cluster.local"] excludes all test instances.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/not-trust-domain",
+							allow: false,
+						},
+						{
+							// notTrustDomains: ["bad.example.com"] excludes nothing, so cluster.local is allowed.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/not-deny",
+							allow: true,
+						},
+					}
+
+					for _, c := range cases {
+						newAuthzTest().
+							From(from).
+							To(to).
+							Allow(c.allow).
+							Path(c.path).
+							BuildAndRunForPorts(t, c.ports...)
+					}
+				})
+		})
+}
+
 func TestAuthz_DenyPrincipal(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp",
-			"security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -221,10 +350,7 @@ func TestAuthz_DenyPrincipal(t *testing.T) {
 }
 
 func TestAuthz_Namespace(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			// Allow anything from ns1. Any service in ns1 will work as the `from` (just using ns1.A)
 			allowed := apps.Ns1.A
@@ -295,11 +421,7 @@ func TestAuthz_Namespace(t *testing.T) {
 }
 
 func TestAuthz_DenyNamespace(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp",
-			"security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -402,11 +524,7 @@ func TestAuthz_DenyNamespace(t *testing.T) {
 }
 
 func TestAuthz_NotNamespace(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp",
-			"security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -442,8 +560,7 @@ func TestAuthz_NotNamespace(t *testing.T) {
 }
 
 func TestAuthz_NotHost(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.AnyServiceName(from.NamespacedNames())
@@ -477,7 +594,6 @@ func TestAuthz_NotHost(t *testing.T) {
 					}
 
 					for _, c := range cases {
-						c := c
 						testName := fmt.Sprintf("%s(%s)/http", c.host, c.allow)
 						t.NewSubTest(testName).Run(func(t framework.TestContext) {
 							wantCode := http.StatusOK
@@ -504,8 +620,7 @@ func TestAuthz_NotHost(t *testing.T) {
 func TestAuthz_NotMethod(t *testing.T) {
 	// NOTE: negative match for mtls is tested by TestAuthz_DenyPlaintext.
 	// Negative match for paths is tested by TestAuthz_DenyPrincipal, TestAuthz_DenyNamespace.
-	framework.NewTest(t).
-		Features("security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.AnyServiceName(from.NamespacedNames())
@@ -552,8 +667,7 @@ func TestAuthz_NotMethod(t *testing.T) {
 }
 
 func TestAuthz_NotPort(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.AnyServiceName(from.NamespacedNames())
@@ -596,11 +710,7 @@ func TestAuthz_NotPort(t *testing.T) {
 }
 
 func TestAuthz_DenyPlaintext(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.mtls-local",
-			"security.authorization.grpc-protocol",
-			"security.authorization.tcp",
-			"security.authorization.negative-match").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -626,9 +736,8 @@ func TestAuthz_DenyPlaintext(t *testing.T) {
 }
 
 func TestAuthz_JWT(t *testing.T) {
-	framework.NewTest(t).
+	framework.NewFullTest(t).
 		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("security.authorization.jwt-token").
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.ServiceName(from.NamespacedName())
@@ -637,7 +746,9 @@ func TestAuthz_JWT(t *testing.T) {
 			fromAndTo := to.Instances().Append(from)
 
 			config.New(t).
-				Source(config.File("testdata/authz/jwt.yaml.tmpl").WithNamespace(apps.Ns1.Namespace)).
+				Source(config.File("testdata/authz/jwt.yaml.tmpl").WithNamespace(apps.Ns1.Namespace).WithParams(param.Params{
+					"JWTServer": jwtServer,
+				})).
 				BuildAll(nil, to).
 				Apply()
 
@@ -722,10 +833,58 @@ func TestAuthz_JWT(t *testing.T) {
 							allow:  false,
 						},
 						{
-							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
-							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							prefix: "[PermissionTokenWithSpaceDelimitedPermission]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedPermission,
 							path:   "/permission",
 							allow:  true,
+						},
+						{
+							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							path:   "/scope",
+							allow:  true,
+						},
+						{
+							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							path:   "/otherscope",
+							allow:  false,
+						},
+						{
+							prefix: "[CustomScopeToken]",
+							jwt:    jwt.TokenIssuer2WithCustomScopeSpaceDelimitedScope,
+							path:   "/custom-scope-admin",
+							allow:  true,
+						},
+						{
+							prefix: "[CustomScopeToken]",
+							jwt:    jwt.TokenIssuer2WithCustomScopeSpaceDelimitedScope,
+							path:   "/custom-scope-user",
+							allow:  true,
+						},
+						{
+							prefix: "[NoJWT]",
+							jwt:    "",
+							path:   "/custom-scope-admin",
+							allow:  false,
+						},
+						{
+							prefix: "[NoJWT]",
+							jwt:    "",
+							path:   "/custom-scope-user",
+							allow:  false,
+						},
+						{
+							prefix: "[Token1]",
+							jwt:    jwt.TokenIssuer1,
+							path:   "/custom-scope-admin",
+							allow:  false,
+						},
+						{
+							prefix: "[Token1]",
+							jwt:    jwt.TokenIssuer1,
+							path:   "/custom-scope-user",
+							allow:  false,
 						},
 						{
 							prefix: "[NestedToken1]",
@@ -781,6 +940,18 @@ func TestAuthz_JWT(t *testing.T) {
 							path:   "/tokenAny",
 							allow:  false,
 						},
+						{
+							prefix: "[JWTWithAud]",
+							jwt:    jwt.TokenIssuer1WithAud,
+							path:   "/audiences",
+							allow:  true,
+						},
+						{
+							prefix: "[JWTWithAudList]",
+							jwt:    jwt.TokenIssuer1WithAudList,
+							path:   "/audiences",
+							allow:  true,
+						},
 					}
 					for _, c := range cases {
 						h := headers.New().WithAuthz(c.jwt).Build()
@@ -798,8 +969,7 @@ func TestAuthz_JWT(t *testing.T) {
 }
 
 func TestAuthz_WorkloadSelector(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.workload-selector").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			// Verify that the workload-specific path (/policy-<ns>-<svc>) works only on the selected workload.
 			t.NewSubTestf("single workload").
@@ -930,8 +1100,7 @@ func TestAuthz_WorkloadSelector(t *testing.T) {
 }
 
 func TestAuthz_PathPrecedence(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.deny-action").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.ServiceName(from.NamespacedName())
@@ -982,9 +1151,123 @@ func TestAuthz_PathPrecedence(t *testing.T) {
 		})
 }
 
+func TestAuthz_PathTemplating(t *testing.T) {
+	framework.NewFullTest(t).
+		Run(func(t framework.TestContext) {
+			from := apps.Ns1.A
+			fromMatch := match.ServiceName(from.NamespacedName())
+			toMatch := match.Not(fromMatch)
+			to := toMatch.GetServiceMatches(apps.Ns1.All)
+			fromAndTo := to.Instances().Append(from)
+
+			config.New(t).
+				Source(config.File("testdata/authz/path-templating.yaml.tmpl")).
+				BuildAll(nil, to).
+				Apply()
+
+			newTrafficTest(t, fromAndTo).
+				FromMatch(fromMatch).
+				ToMatch(toMatch).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					cases := []struct {
+						path  string
+						allow allowValue
+					}{
+						// Test matches for `/allow/admin/{**}`
+						{
+							path:  "/allow/admin/",
+							allow: true,
+						},
+						{
+							// When `**` is the last segment and operator in the template, the path must have a trailing `/` to match
+							path:  "/allow/admin",
+							allow: false,
+						},
+						{
+							path:  "/allow/user/",
+							allow: false,
+						},
+						{
+							path:  "/allow/admin?param=value",
+							allow: false,
+						},
+						{
+							path:  "/allow",
+							allow: false,
+						},
+						{
+							path:  "/allow/admin/temp",
+							allow: true,
+						},
+						{
+							path:  "/allow/admin/temp.txt",
+							allow: true,
+						},
+						{
+							path:  "/allow/admin/foo/temp.txt",
+							allow: true,
+						},
+						// Test matches for `/foo/{*}/bar/{**}`
+						{
+							path:  "/foo/buzz/bar/bat.txt",
+							allow: true,
+						},
+						{
+							path:  "/foo/buzz/bar/bat.temp.txt",
+							allow: true,
+						},
+						{
+							path:  "/foo/buzz/bar/bat/fuzz.txt",
+							allow: true,
+						},
+						{
+							path:  "/foo/bar/bat.txt",
+							allow: false,
+						},
+						{
+							path:  "/foo//bar/bat.txt",
+							allow: false,
+						},
+						{
+							path:  "/foo/buzz/bar/bat",
+							allow: true,
+						},
+						// Test matches for `/store/{**}/cart`
+						{
+							path:  "/store//cart",
+							allow: true,
+						},
+						{
+							path:  "/store/cart",
+							allow: false,
+						},
+						{
+							path:  "/store/foo/cart",
+							allow: true,
+						},
+						{
+							path:  "/store/foo/bar/cart",
+							allow: true,
+						},
+					}
+
+					for _, c := range cases {
+						testName := fmt.Sprintf("%s(%s)/http", c.path, c.allow)
+						t.NewSubTest(testName).Run(func(t framework.TestContext) {
+							newAuthzTest().
+								From(from).
+								To(to).
+								Allow(c.allow).
+								Path(c.path).
+								BuildAndRunForPorts(t, ports.HTTP, ports.HTTP2)
+						})
+					}
+				})
+		})
+}
+
 func TestAuthz_IngressGateway(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.ingress-gateway").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			to := apps.Ns1.All
 			config.New(t).
@@ -1123,7 +1406,6 @@ func TestAuthz_IngressGateway(t *testing.T) {
 					}
 
 					for _, c := range cases {
-						c := c
 						testName := fmt.Sprintf("%s%s(%s)/http", c.host, c.path, c.allow)
 						if len(c.ip) > 0 {
 							testName = c.ip + "->" + testName
@@ -1152,9 +1434,8 @@ func TestAuthz_IngressGateway(t *testing.T) {
 }
 
 func TestAuthz_EgressGateway(t *testing.T) {
-	framework.NewTest(t).
+	framework.NewFullTest(t).
 		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("security.authorization.egress-gateway").
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -1175,6 +1456,7 @@ func TestAuthz_EgressGateway(t *testing.T) {
 					"EgressGatewayServiceName":      i.Settings().EgressGatewayServiceName,
 					"EgressGatewayServiceNamespace": i.Settings().EgressGatewayServiceNamespace,
 					"Allowed":                       allowed,
+					"JWTServer":                     jwtServer,
 				})).
 				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
 					allow := allowValue(from.NamespacedName() == allowed.Config().NamespacedName())
@@ -1227,7 +1509,6 @@ func TestAuthz_EgressGateway(t *testing.T) {
 					}
 
 					for _, c := range cases {
-						c := c
 						testName := fmt.Sprintf("%s%s(%s)/http", c.host, c.path, c.allow)
 						t.NewSubTest(testName).Run(func(t framework.TestContext) {
 							wantCode := http.StatusOK
@@ -1262,7 +1543,6 @@ func TestAuthz_EgressGateway(t *testing.T) {
 
 func TestAuthz_Conditions(t *testing.T) {
 	framework.NewTest(t).
-		Features("security.authorization.conditions").
 		Run(func(t framework.TestContext) {
 			allowed := apps.Ns1.A
 			denied := apps.Ns2.A
@@ -1363,6 +1643,17 @@ func TestAuthz_Conditions(t *testing.T) {
 							allow: allow,
 						},
 
+						// Test source trust domain.
+						// All test instances are in cluster.local, so both cases always allow.
+						{
+							path:  "/source-trust-domain",
+							allow: true,
+						},
+						{
+							path:  "/source-trust-domain-notValues",
+							allow: true,
+						},
+
 						// Test destination IP
 						{
 							path:  "/destination-ip-good",
@@ -1412,7 +1703,6 @@ func TestAuthz_Conditions(t *testing.T) {
 					}
 
 					for _, c := range cases {
-						c := c
 						xfooHeader := ""
 						if c.headers != nil {
 							xfooHeader = "?x-foo=" + c.headers.Get("x-foo")
@@ -1438,8 +1728,7 @@ func TestAuthz_Conditions(t *testing.T) {
 }
 
 func TestAuthz_PathNormalization(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.path-normalization").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			from := apps.Ns1.A
 			fromMatch := match.ServiceName(from.NamespacedName())
@@ -1511,7 +1800,6 @@ func TestAuthz_PathNormalization(t *testing.T) {
 					}
 
 					for _, c := range cases {
-						c := c
 						testName := fmt.Sprintf("%s(%s)/http", c.path, c.allow)
 						t.NewSubTest(testName).Run(func(t framework.TestContext) {
 							newAuthzTest().
@@ -1528,8 +1816,7 @@ func TestAuthz_PathNormalization(t *testing.T) {
 }
 
 func TestAuthz_CustomServer(t *testing.T) {
-	framework.NewTest(t).
-		Features("security.authorization.custom").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			extAuthzHeaders := func(value string) http.Header {
 				return headers.New().
@@ -1620,7 +1907,6 @@ func TestAuthz_CustomServer(t *testing.T) {
 							}
 
 							for _, c := range cases {
-								c := c
 								if c.skip {
 									continue
 								}
@@ -1635,7 +1921,6 @@ func TestAuthz_CustomServer(t *testing.T) {
 										return provider.IsProtocolSupported(tst.opts.Port.Protocol)
 									})
 								for _, tst := range tsts {
-									tst := tst
 									params := ""
 									if c.headers != nil {
 										params = fmt.Sprintf("?%s=%s", authz.XExtAuthz, c.headers.Get(authz.XExtAuthz))
@@ -1832,7 +2117,6 @@ func (tsts authzTests) RunAll(t framework.TestContext) {
 	outerTestName := fmt.Sprintf("%s%s(%s)", firstTest.prefix, firstTest.opts.HTTP.Path, firstTest.allow)
 	t.NewSubTest(outerTestName).Run(func(t framework.TestContext) {
 		for _, tst := range tsts {
-			tst := tst
 			t.NewSubTest(tst.opts.Port.Name).Run(func(t framework.TestContext) {
 				tst.BuildAndRun(t)
 			})
@@ -1860,7 +2144,6 @@ func (tsts authzTests) RunInSerial(t framework.TestContext) {
 	outerTestName := fmt.Sprintf("%s%s(%s)", firstTest.prefix, firstTest.opts.HTTP.Path, firstTest.allow)
 	t.NewSubTest(outerTestName).Run(func(t framework.TestContext) {
 		for _, tst := range tsts {
-			tst := tst
 			t.NewSubTest(tst.opts.Port.Name).Run(func(t framework.TestContext) {
 				tst.BuildAndRun(t)
 			})

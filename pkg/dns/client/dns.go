@@ -28,9 +28,11 @@ import (
 	"github.com/miekg/dns"
 
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	dnsProto "istio.io/istio/pkg/dns/proto"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	netutil "istio.io/istio/pkg/util/net"
 	"istio.io/istio/pkg/util/sets"
 )
@@ -58,6 +60,7 @@ type LocalDNSServer struct {
 
 	respondBeforeSync         bool
 	forwardToUpstreamParallel bool
+	upstreamTimeout           time.Duration
 }
 
 // LookupTable is borrowed from https://github.com/coredns/coredns/blob/master/plugin/hosts/hostsfile.go
@@ -84,12 +87,38 @@ const (
 	// the latest IP for a host.
 	// TODO: make it configurable
 	defaultTTLInSeconds = 30
+
+	// DefaultUpstreamTimeout is the default timeout for DNS upstream queries
+	DefaultUpstreamTimeout = 5 * time.Second
 )
 
-func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, forwardToUpstreamParallel bool) (*LocalDNSServer, error) {
+// LocalDNSServerOption is a functional option for configuring LocalDNSServer.
+type LocalDNSServerOption func(*LocalDNSServer)
+
+// WithParallelForwarding enables or disables parallel forwarding to upstream DNS servers.
+func WithParallelForwarding(parallel bool) LocalDNSServerOption {
+	return func(s *LocalDNSServer) {
+		s.forwardToUpstreamParallel = parallel
+	}
+}
+
+// WithUpstreamTimeout sets the timeout for upstream DNS queries.
+func WithUpstreamTimeout(timeout time.Duration) LocalDNSServerOption {
+	return func(s *LocalDNSServer) {
+		s.upstreamTimeout = timeout
+	}
+}
+
+func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, opts ...LocalDNSServerOption) (*LocalDNSServer, error) {
 	h := &LocalDNSServer{
 		proxyNamespace:            proxyNamespace,
-		forwardToUpstreamParallel: forwardToUpstreamParallel,
+		forwardToUpstreamParallel: false,
+		upstreamTimeout:           DefaultUpstreamTimeout,
+	}
+
+	// Apply functional options
+	for _, opt := range opts {
+		opt(h)
 	}
 
 	// proxyDomain could contain the namespace making it redundant.
@@ -116,7 +145,7 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, forwardT
 			}
 		} else {
 			log.Error("DNS address :53 and not running as root, use default")
-			addr = "localhost:15053"
+			addr = constants.DefaultDNSProxyAddr
 		}
 	}
 
@@ -144,12 +173,12 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, forwardT
 	log.WithLabels("search", h.searchNamespaces, "servers", h.resolvConfServers).Debugf("initialized DNS")
 
 	if addr == "" {
-		addr = "localhost:15053"
+		addr = constants.DefaultDNSProxyAddr
 	}
 	v4, v6 := netutil.ParseIPsSplitToV4V6(dnsConfig.Servers)
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, fmt.Errorf("dns address must be a valid host:port")
+		return nil, fmt.Errorf("dns address must be a valid host:port: %v", err)
 	}
 	addresses := []string{addr}
 	if host == "localhost" && len(v4)+len(v6) > 0 {
@@ -165,7 +194,7 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, forwardT
 	}
 	for _, ipAddr := range addresses {
 		for _, proto := range []string{"udp", "tcp"} {
-			proxy, err := newDNSProxy(proto, ipAddr, h)
+			proxy, err := newDNSProxy(proto, ipAddr, h, h.upstreamTimeout)
 			if err != nil {
 				return nil, err
 			}
@@ -362,13 +391,13 @@ func roundRobin(in []dns.RR) []dns.RR {
 	return out
 }
 
-func roundRobinShuffle(records []dns.RR) {
-	switch l := len(records); l {
+func roundRobinShuffle[T any](entries []T) {
+	switch l := len(entries); l {
 	case 0, 1:
 		break
 	case 2:
 		if dns.Id()%2 == 0 {
-			records[0], records[1] = records[1], records[0]
+			entries[0], entries[1] = entries[1], entries[0]
 		}
 	default:
 		for j := 0; j < l*(int(dns.Id())%4+1); j++ {
@@ -377,7 +406,7 @@ func roundRobinShuffle(records []dns.RR) {
 			if q == p {
 				p = (p + 1) % l
 			}
-			records[q], records[p] = records[p], records[q]
+			entries[q], entries[p] = entries[p], entries[q]
 		}
 	}
 }
@@ -394,8 +423,9 @@ func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg,
 	}
 
 	var response *dns.Msg
-
-	for _, upstream := range h.resolvConfServers {
+	servers := slices.Clone(h.resolvConfServers)
+	roundRobinShuffle(servers)
+	for _, upstream := range servers {
 		cResponse, _, err := upstreamClient.Exchange(req, upstream)
 		if err == nil {
 			response = cResponse
@@ -479,6 +509,9 @@ func generateAltHosts(hostname string, nameinfo *dnsProto.NameTable_NameInfo, pr
 	proxyDomainParts []string,
 ) sets.String {
 	out := sets.New[string]()
+	if strings.HasSuffix(hostname, ".") {
+		return out
+	}
 	out.Insert(hostname + ".")
 	// do not generate alt hostnames if the service is in a different domain (i.e. cluster) than the proxy
 	// as we have no way to resolve conflicts on name.namespace entries across clusters of different domains
@@ -612,7 +645,7 @@ func (table *LookupTable) buildDNSAnswers(altHosts map[string]struct{}, ipv4 []n
 		if len(ipv6) > 0 {
 			table.name6[h] = aaaa(h, ipv6)
 		}
-		if len(searchNamespaces) > 0 {
+		if len(searchNamespaces) > 0 && !strings.HasSuffix(h, searchNamespaces[0]+".") {
 			// NOTE: Right now, rather than storing one expanded host for each one of the search namespace
 			// entries, we are going to store just the first one (assuming that most clients will
 			// do sequential dns resolution, starting with the first search namespace)

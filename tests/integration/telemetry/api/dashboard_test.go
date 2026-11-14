@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -101,6 +100,9 @@ var dashboards = []struct {
 		"istio-workload-dashboard.json",
 		[]string{
 			"istio_tcp_",
+			// there is no non-mtls traffic generated so the test flakes for the split query on
+			// "Outgoing Requests By Destination And Response Code"
+			"spiffe.*",
 		},
 		false,
 	},
@@ -134,8 +136,7 @@ var dashboards = []struct {
 func TestDashboard(t *testing.T) {
 	c, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	framework.NewTest(t).
-		Features("observability.telemetry.dashboard").
+	framework.NewFullTest(t).
 		Run(func(t framework.TestContext) {
 			p := promInst
 
@@ -154,7 +155,6 @@ func TestDashboard(t *testing.T) {
 			// all in a single scrape which can lead to `rate()` not behaving correctly.
 			go setupDashboardTest(c.Done())
 			for _, d := range dashboards {
-				d := d
 				t.NewSubTest(d.name).Run(func(t framework.TestContext) {
 					for _, cl := range t.Clusters() {
 						if !cl.IsPrimary() && d.requirePrimary {
@@ -189,29 +189,33 @@ func TestDashboard(t *testing.T) {
 		})
 }
 
-// Some templates use replacement variables. Instead, replace those with wildcard
-var replacer = strings.NewReplacer(
-	"$dstns", ".*",
-	"$dstwl", ".*",
-	"$service", ".*",
-	"$srcns", ".*",
-	"$srcwl", ".*",
-	"$namespace", ".*",
-	"$workload", ".*",
-	"$dstsvc", ".*",
-	"$adapter", ".*",
-	// Just allow all mTLS settings rather than trying to send mtls and plaintext
-	`connection_security_policy="unknown"`, `connection_security_policy=~".*"`,
-	`connection_security_policy="mutual_tls"`, `connection_security_policy=~".*"`,
-	`connection_security_policy!="mutual_tls"`, `connection_security_policy=~".*"`,
-	// Test runs in istio-system
-	`destination_workload_namespace!="istio-system"`, `destination_workload_namespace=~".*"`,
-	`source_workload_namespace!="istio-system"`, `source_workload_namespace=~".*"`,
-)
+func getTemplateReplacer() *strings.Replacer {
+	// Some templates use replacement variables. Instead, replace those with wildcard
+	return strings.NewReplacer(
+		"$dstns", ".*",
+		"$dstwl", ".*",
+		"$service", "b."+apps.Namespace.Name()+".svc.cluster.local", // Service only allows for a single selection, no wildcards
+		"$srcns", ".*",
+		"$srcwl", ".*",
+		"$namespace", ".*",
+		"$workload", ".*",
+		"$dstsvc", ".*",
+		"$adapter", ".*",
+		"$qrep", "destination",
+		// Just allow all mTLS settings rather than trying to send mtls and plaintext
+		`connection_security_policy="unknown"`, `connection_security_policy=~".*"`,
+		`connection_security_policy="mutual_tls"`, `connection_security_policy=~".*"`,
+		`connection_security_policy!="mutual_tls"`, `connection_security_policy=~".*"`,
+		// Test runs in istio-system
+		`destination_workload_namespace!="istio-system"`, `destination_workload_namespace=~".*"`,
+		`source_workload_namespace!="istio-system"`, `source_workload_namespace=~".*"`,
+		"$__rate_interval", "1m",
+	)
+}
 
 func checkMetric(cl cluster.Cluster, p prometheus.Instance, query string, excluded []string) error {
-	query = replacer.Replace(query)
-	value, _, err := p.APIForCluster(cl).QueryRange(context.Background(), query, promv1.Range{
+	query = getTemplateReplacer().Replace(query)
+	value, _, _, err := p.APIForCluster(cl).QueryRange(context.Background(), query, promv1.Range{
 		Start: time.Now().Add(-time.Minute),
 		End:   time.Now(),
 		Step:  time.Second,
@@ -246,7 +250,7 @@ func checkMetric(cl cluster.Cluster, p prometheus.Instance, query string, exclud
 }
 
 const gatewayConfig = `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: echo-gateway
@@ -267,7 +271,7 @@ spec:
     hosts:
     - "*"
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: echo
@@ -306,7 +310,9 @@ func setupDashboardTest(done <-chan struct{}) {
 			times++
 			scopes.Framework.Infof("sending traffic %v", times)
 			for _, ing := range ingr {
-				host, port := ing.TCPAddress()
+				hosts, ports := ing.TCPAddresses()
+				host := hosts[0]
+				port := ports[0]
 				_, err := ing.Call(echo.CallOptions{
 					Port: echo.Port{
 						Protocol: protocol.HTTP,
@@ -356,7 +362,8 @@ func setupDashboardTest(done <-chan struct{}) {
 
 // extractQueries pulls all prometheus queries out of a grafana dashboard
 // Rather than importing the entire grafana API just for this test, do some shoddy json parsing
-// Equivalent to jq command: '.panels[].targets[]?.expr'
+// Equivalent to the union of the jq commands:
+// '.panels[].targets[]?.expr' and '.panels[].panels[]?.targets[]?.expr'
 func extractQueries(dash string) ([]string, error) {
 	var queries []string
 	js := map[string]any{}
@@ -373,7 +380,18 @@ func extractQueries(dash string) ([]string, error) {
 	}
 	for _, p := range panelsList {
 		pm := p.(map[string]any)
-		targets, f := pm["targets"]
+		if pm["type"] == "row" {
+			continue
+		}
+		subPanels, exist := pm["panels"]
+		var targets any
+		var f bool
+		if exist {
+			subpm := subPanels.(map[string]any)
+			targets, f = subpm["targets"]
+		} else {
+			targets, f = pm["targets"]
+		}
 		if !f {
 			continue
 		}
@@ -385,7 +403,7 @@ func extractQueries(dash string) ([]string, error) {
 			tm := t.(map[string]any)
 			expr, f := tm["expr"]
 			if !f {
-				return nil, fmt.Errorf("failed to find expr in %v", t)
+				continue
 			}
 			queries = append(queries, expr.(string))
 		}

@@ -15,16 +15,16 @@
 package model
 
 import (
-	"sort"
 	"strings"
 
 	udpa "github.com/cncf/xds/go/udpa/type/v1"
-	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/hash"
 	netutil "istio.io/istio/pkg/util/net"
 	"istio.io/istio/pkg/util/sets"
@@ -47,10 +47,10 @@ func (key ConfigKey) HashCode() ConfigHash {
 	h := hash.New()
 	h.Write([]byte{byte(key.Kind)})
 	// Add separator / to avoid collision.
-	h.Write([]byte("/"))
-	h.Write([]byte(key.Namespace))
-	h.Write([]byte("/"))
-	h.Write([]byte(key.Name))
+	h.WriteString("/")
+	h.WriteString(key.Namespace)
+	h.WriteString("/")
+	h.WriteString(key.Name)
 	return ConfigHash(h.Sum64())
 }
 
@@ -81,37 +81,21 @@ func HasConfigsOfKind(configs sets.Set[ConfigKey], kind kind.Kind) bool {
 	return false
 }
 
+// OnlyHasConfigsOfKind returns true if configs is non-empty and all configs are of the specified kind.
+func OnlyHasConfigsOfKind(configs sets.Set[ConfigKey], k kind.Kind) bool {
+	if len(configs) == 0 {
+		return false
+	}
+	for c := range configs {
+		if c.Kind != k {
+			return false
+		}
+	}
+	return true
+}
+
 // ConfigNamesOfKind extracts config names of the specified kind.
 func ConfigNamesOfKind(configs sets.Set[ConfigKey], kind kind.Kind) sets.String {
-	ret := sets.New[string]()
-
-	for conf := range configs {
-		if conf.Kind == kind {
-			ret.Insert(conf.Name)
-		}
-	}
-
-	return ret
-}
-
-// ConfigNamespacedNameOfKind extracts config names of the specified kind.
-func ConfigNamespacedNameOfKind(configs map[ConfigKey]struct{}, kind kind.Kind) sets.Set[types.NamespacedName] {
-	ret := sets.New[types.NamespacedName]()
-
-	for conf := range configs {
-		if conf.Kind == kind {
-			ret.Insert(types.NamespacedName{
-				Namespace: conf.Namespace,
-				Name:      conf.Name,
-			})
-		}
-	}
-
-	return ret
-}
-
-// ConfigNameOfKind extracts config names of the specified kind.
-func ConfigNameOfKind(configs map[ConfigKey]struct{}, kind kind.Kind) sets.String {
 	ret := sets.New[string]()
 
 	for conf := range configs {
@@ -176,10 +160,6 @@ type ConfigStore interface {
 	Update(config config.Config) (newRevision string, err error)
 	UpdateStatus(config config.Config) (newRevision string, err error)
 
-	// Patch applies only the modifications made in the PatchFunc rather than doing a full replace. Useful to avoid
-	// read-modify-write conflicts when there are many concurrent-writers to the same resource.
-	Patch(orig config.Config, patchFn config.PatchFunc) (string, error)
-
 	// Delete removes an object from the store by key
 	// For k8s, resourceVersion must be fulfilled before a deletion is carried out.
 	// If not possible, a 409 Conflict status will be returned.
@@ -214,6 +194,9 @@ type ConfigStoreController interface {
 
 	// HasSynced returns true after initial cache synchronization is complete
 	HasSynced() bool
+
+	// Returns the backing krt collection for the given kind, or nil if the kind is not supported by the controller
+	KrtCollection(kind config.GroupVersionKind) krt.Collection[config.Config]
 }
 
 const (
@@ -281,9 +264,8 @@ func resolveGatewayName(gwname string, meta config.Meta) string {
 		}
 	} else {
 		// remove the . from ./gateway and substitute it with the namespace name
-		i := strings.Index(gwname, "/")
-		if gwname[:i] == "." {
-			out = meta.Namespace + "/" + gwname[i+1:]
+		if before, after, _ := strings.Cut(gwname, "/"); before == "." {
+			out = meta.Namespace + "/" + after
 		}
 	}
 	return out
@@ -331,56 +313,21 @@ func mostSpecificHostWildcardMatch[V any](needle string, wildcard map[host.Name]
 	return matchHost, matchValue, found
 }
 
-// OldestMatchingHost returns the oldest matching host for a given needle (whether specific or wildcarded)
-func OldestMatchingHost(needle host.Name, specific map[host.Name]config.Config, wildcard map[host.Name]config.Config) (host.Name, config.Config, bool) {
-	// The algorithm is a bit different than MostSpecificHostMatch. We can't short-circuit on the first
-	// match, regardless of whether it's specific or wildcarded. This is because we have to check the timestamp
-	// of all configs to make sure there's not an older matching one that we should use instead.
-
-	if needle.IsWildCarded() {
-		needle = needle[1:]
-	}
-
-	found := false
-	var matchHost host.Name
-	var matchValue config.Config
-	// exact match first
-	if v, ok := specific[needle]; ok {
-		found = true
-		matchHost = needle
-		matchValue = v
-	}
-
-	// Even if we have a match, we still need to check the wildcard map to see if there's an older match
-	for h, v := range wildcard {
-		if strings.HasSuffix(string(needle), string(h[1:])) {
-			if !found {
-				matchHost = h
-				matchValue = wildcard[h]
-				found = true
-			} else if h.Matches(matchHost) && v.GetCreationTimestamp().Before(matchValue.GetCreationTimestamp()) {
-				// Only replace if the new match is more specific and older than the current match
-				matchHost = h
-				matchValue = v
-			}
-		}
-	}
-
-	return matchHost, matchValue, found
+// sortConfigByCreationTime sorts the list of config objects in ascending order by their creation time (if available)
+func sortConfigByCreationTime(configs []config.Config) []config.Config {
+	slices.SortFunc(configs, configCompareByCreationTime)
+	return configs
 }
 
-// sortConfigByCreationTime sorts the list of config objects in ascending order by their creation time (if available).
-func sortConfigByCreationTime(configs []config.Config) []config.Config {
-	sort.Slice(configs, func(i, j int) bool {
-		// If creation time is the same, then behavior is nondeterministic. In this case, we can
-		// pick an arbitrary but consistent ordering based on name and namespace, which is unique.
-		// CreationTimestamp is stored in seconds, so this is not uncommon.
-		if configs[i].CreationTimestamp == configs[j].CreationTimestamp {
-			in := configs[i].Name + "." + configs[i].Namespace
-			jn := configs[j].Name + "." + configs[j].Namespace
-			return in < jn
-		}
-		return configs[i].CreationTimestamp.Before(configs[j].CreationTimestamp)
-	})
-	return configs
+func configCompareByCreationTime(a, b config.Config) int {
+	if r := a.CreationTimestamp.Compare(b.CreationTimestamp); r != 0 {
+		return r
+	}
+	// If creation time is the same, then behavior is nondeterministic. In this case, we can
+	// pick an arbitrary but consistent ordering based on name and namespace, which is unique.
+	// CreationTimestamp is stored in seconds, so this is not uncommon.
+	if r := strings.Compare(a.Name, b.Name); r != 0 {
+		return r
+	}
+	return strings.Compare(a.Namespace, b.Namespace)
 }

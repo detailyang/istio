@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -22,6 +21,7 @@ import (
 	"os"
 	"path"
 
+	"istio.io/api/label"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/env"
@@ -63,15 +63,15 @@ type EchoDeployments struct {
 	External      echo.Instances
 }
 
-func EchoConfig(name string, headless bool, annos echo.Annotations) echo.Config {
+func EchoConfig(name string, headless bool, labels map[string]string) echo.Config {
 	out := echo.Config{
 		Service:        name,
 		ServiceAccount: true,
 		Headless:       headless,
 		Subsets: []echo.SubsetConfig{
 			{
-				Version:     "v1",
-				Annotations: annos,
+				Version: "v1",
+				Labels:  labels,
 			},
 		},
 		Ports: []echo.Port{
@@ -199,14 +199,14 @@ func SetupApps(ctx resource.Context, customCfg *[]echo.Config, buildVM bool) err
 			},
 			// Legacy deployment subset, does not have sidecar injected.
 			{
-				Version:     "vlegacy",
-				Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+				Version: "vlegacy",
+				Labels:  map[string]string{label.SidecarInject.Name: "false"},
 			},
 		}
 		return multiVersionCfg
 	}()
-	nakedSvc := EchoConfig(NakedSvc, false, echo.NewAnnotations().
-		SetBool(echo.SidecarInject, false))
+
+	nakedSvc := EchoConfig(NakedSvc, false, map[string]string{label.SidecarInject.Name: "false"})
 
 	vmCfg := func() echo.Config {
 		// VM specific setup
@@ -246,13 +246,13 @@ func SetupApps(ctx resource.Context, customCfg *[]echo.Config, buildVM bool) err
 			Hostname: "server.default.svc",
 		},
 		Subsets: []echo.SubsetConfig{{
-			Version:     "v1",
-			Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+			Version: "v1",
+			Labels:  map[string]string{label.SidecarInject.Name: "false"},
 		}},
 	}
 
 	headlessSvc := EchoConfig(HeadlessSvc, true, nil)
-	headlessNakedSvc := EchoConfig(HeadlessNakedSvc, true, echo.NewAnnotations().SetBool(echo.SidecarInject, false))
+	headlessNakedSvc := EchoConfig(HeadlessNakedSvc, true, map[string]string{label.SidecarInject.Name: "false"})
 
 	customConfig = append(customConfig, a, b, c, d, e, multiversionCfg, nakedSvc, vmCfg, externalSvc, headlessSvc, headlessNakedSvc)
 	*customCfg = customConfig
@@ -268,8 +268,10 @@ var IsMultiversion match.Matcher = func(i echo.Instance) bool {
 	for _, s := range i.Config().Subsets {
 		if s.Version == "vistio" {
 			matchIstio = true
-		} else if s.Version == "vlegacy" && !s.Annotations.GetBool(echo.SidecarInject) {
-			matchLegacy = true
+		} else if s.Version == "vlegacy" {
+			if val, ok := s.Labels[label.SidecarInject.Name]; ok && val == "false" {
+				matchLegacy = true
+			}
 		}
 	}
 	return matchIstio && matchLegacy

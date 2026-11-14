@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -23,6 +22,7 @@ import (
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo/common/deployment"
 	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/tests/integration/pilot/common"
 )
@@ -40,6 +40,7 @@ func TestMain(m *testing.M) {
 	// nolint: staticcheck
 	framework.
 		NewSuite(m).
+		Label(label.Multicluster).
 		RequireExternalControlPlaneTopology().
 		RequireMinVersion(17).
 		RequireMinClusters(2).
@@ -57,7 +58,6 @@ values:
 func TestTraffic(t *testing.T) {
 	framework.
 		NewTest(t).
-		Features("traffic.routing", "traffic.reachability", "traffic.shifting").
 		Run(func(t framework.TestContext) {
 			common.RunAllTrafficTests(t, i, apps)
 		})

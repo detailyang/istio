@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -21,6 +20,7 @@ import (
 	"net/http"
 	"testing"
 
+	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
 )
 
@@ -196,5 +196,5 @@ func TestOutboundTrafficPolicy_AllowAny(t *testing.T) {
 		},
 	}
 
-	RunExternalRequest(t, cases, prom, AllowAny)
+	RunExternalRequest(framework.NewTest(t), cases, prom, AllowAny)
 }

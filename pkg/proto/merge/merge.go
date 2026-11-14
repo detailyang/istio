@@ -32,9 +32,12 @@ import (
 )
 
 type (
-	MergeFunction func(dst, src protoreflect.Message)
+	MergeFunction func(dst, src protoreflect.Message) protoreflect.Message
 	mergeOptions  struct {
 		customMergeFn map[protoreflect.FullName]MergeFunction
+		// replaceList, when true, makes repeated (list) fields present in src
+		// fully replace the corresponding list in dst instead of being appended.
+		replaceList bool
 	}
 )
 type OptionFn func(options mergeOptions) mergeOptions
@@ -46,16 +49,19 @@ func MergeFunctionOptionFn(name protoreflect.FullName, function MergeFunction) O
 	}
 }
 
-// ReplaceMergeFn instead of merging all subfields one by one, takes src and set it to dest
-var ReplaceMergeFn MergeFunction = func(dst, src protoreflect.Message) {
-	dst.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		dst.Clear(fd)
-		return true
-	})
-	src.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		dst.Set(fd, v)
-		return true
-	})
+// ReplaceMergeFn instead of merging all subfields one by one, returns src
+var ReplaceMergeFn MergeFunction = func(dst, src protoreflect.Message) protoreflect.Message {
+	// we can return src directly because this is a replace
+	return src
+}
+
+// ReplaceListOptionFn makes repeated (list) fields present in src fully replace
+// the corresponding list in dst instead of being appended to it. Singular and
+// map fields retain normal merge semantics. The replacement is recursive: any
+// list set by src at any nesting level replaces the matching list in dst.
+var ReplaceListOptionFn OptionFn = func(options mergeOptions) mergeOptions {
+	options.replaceList = true
+	return options
 }
 
 var options = []OptionFn{
@@ -65,6 +71,14 @@ var options = []OptionFn{
 
 func Merge(dst, src proto.Message) {
 	merge(dst, src, options...)
+}
+
+// MergeWithReplaceList behaves like Merge, except that repeated (list) fields
+// present in src fully replace the corresponding list in dst rather than being
+// appended. This is useful for callers that want proto merge semantics for
+// scalar and message fields while overwriting arrays wholesale.
+func MergeWithReplaceList(dst, src proto.Message) {
+	merge(dst, src, append(append([]OptionFn{}, options...), ReplaceListOptionFn)...)
 }
 
 // Merge Code of proto.Merge with modifications to support custom types
@@ -93,13 +107,20 @@ func (o mergeOptions) mergeMessage(dst, src protoreflect.Message) {
 	src.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch {
 		case fd.IsList():
-			o.mergeList(dst.Mutable(fd).List(), v.List(), fd)
+			dstList := dst.Mutable(fd).List()
+			if o.replaceList {
+				// Replace semantics: drop the existing entries so the src list
+				// fully overwrites dst instead of being appended.
+				dstList.Truncate(0)
+			}
+			o.mergeList(dstList, v.List(), fd)
 		case fd.IsMap():
 			o.mergeMap(dst.Mutable(fd).Map(), v.Map(), fd.MapValue())
 		case fd.Message() != nil:
 			mergeFn, exists := o.customMergeFn[fd.Message().FullName()]
 			if exists {
-				mergeFn(dst.Mutable(fd).Message(), v.Message())
+				dstV := mergeFn(dst.Mutable(fd).Message(), v.Message())
+				dst.Set(fd, protoreflect.ValueOf(dstV))
 			} else {
 				o.mergeMessage(dst.Mutable(fd).Message(), v.Message())
 			}

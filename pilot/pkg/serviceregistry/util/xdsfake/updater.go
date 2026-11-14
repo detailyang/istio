@@ -24,12 +24,14 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // NewFakeXDS creates a XdsUpdater reporting events via a channel.
 func NewFakeXDS() *Updater {
 	return &Updater{
-		Events: make(chan Event, 100),
+		SplitEvents: false,
+		Events:      make(chan Event, 100),
 	}
 }
 
@@ -46,6 +48,9 @@ type Updater struct {
 	// Events tracks notifications received by the updater
 	Events   chan Event
 	Delegate model.XDSUpdater
+	// If SplitEvents is true, updates changing multiple objects will be split into multiple events with 1 item each
+	// otherwise they are joined as a CSV
+	SplitEvents bool
 }
 
 var _ model.XDSUpdater = &Updater{}
@@ -58,14 +63,27 @@ func (fx *Updater) ConfigUpdate(req *model.PushRequest) {
 		}
 	}
 	sort.Strings(names)
-	id := strings.Join(names, ",")
-	event := "xds"
-	if req.Full {
-		event += " full"
-	}
-	select {
-	case fx.Events <- Event{Type: event, ID: id, Reason: req.Reason}:
-	default:
+	if fx.SplitEvents {
+		for _, n := range names {
+			event := "xds"
+			if req.Forced {
+				event += " forced"
+			}
+			select {
+			case fx.Events <- Event{Type: event, ID: n}:
+			default:
+			}
+		}
+	} else {
+		id := strings.Join(names, ",")
+		event := "xds"
+		if req.Forced {
+			event += " forced"
+		}
+		select {
+		case fx.Events <- Event{Type: event, ID: id, Reason: req.Reason}:
+		default:
+		}
 	}
 	if fx.Delegate != nil {
 		fx.Delegate.ConfigUpdate(req)
@@ -101,6 +119,16 @@ type Event struct {
 	EndpointCount int
 }
 
+type EventMatcher struct {
+	// Type must match exactly
+	Type string
+	// A prefix to match the id of incoming events.
+	IDPrefix string
+
+	// A prefix to match the namespace of incoming events.
+	NamespacePrefix string
+}
+
 func (fx *Updater) EDSUpdate(c model.ShardKey, hostname string, ns string, entry []*model.IstioEndpoint) {
 	select {
 	case fx.Events <- Event{Type: "eds", ID: hostname, Endpoints: entry, Namespace: ns}:
@@ -108,6 +136,17 @@ func (fx *Updater) EDSUpdate(c model.ShardKey, hostname string, ns string, entry
 	}
 	if fx.Delegate != nil {
 		fx.Delegate.EDSUpdate(c, hostname, ns, entry)
+	}
+}
+
+// EDSReplace is recorded as an "eds" event, like EDSUpdate: tests observe the same publication.
+func (fx *Updater) EDSReplace(c model.ShardKey, hostname string, ns string, entry []*model.IstioEndpoint) {
+	select {
+	case fx.Events <- Event{Type: "eds", ID: hostname, Endpoints: entry, Namespace: ns}:
+	default:
+	}
+	if fx.Delegate != nil {
+		fx.Delegate.EDSReplace(c, hostname, ns, entry)
 	}
 }
 
@@ -142,6 +181,16 @@ func (fx *Updater) RemoveShard(shardKey model.ShardKey) {
 	}
 	if fx.Delegate != nil {
 		fx.Delegate.RemoveShard(shardKey)
+	}
+}
+
+func (fx *Updater) PruneShard(shardKey model.ShardKey, keep map[string]sets.String) {
+	select {
+	case fx.Events <- Event{Type: "pruneShard", ID: shardKey.String()}:
+	default:
+	}
+	if fx.Delegate != nil {
+		fx.Delegate.PruneShard(shardKey, keep)
 	}
 }
 
@@ -185,6 +234,7 @@ func (fx *Updater) matchOrFail(t test.Failer, strict bool, events ...Event) {
 		}
 		select {
 		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
 			found := false
 			for i, want := range events {
 				if e.Type == want.Type &&
@@ -216,7 +266,8 @@ func (fx *Updater) Clear() {
 	wait := true
 	for wait {
 		select {
-		case <-fx.Events:
+		case e := <-fx.Events:
+			log.Infof("skipping event (due to clear) %q", e.Type)
 		default:
 			wait = false
 		}
@@ -225,6 +276,7 @@ func (fx *Updater) Clear() {
 
 // AssertEmpty ensures there are no events in the channel
 func (fx *Updater) AssertEmpty(t test.Failer, dur time.Duration) {
+	t.Helper()
 	if dur == 0 {
 		select {
 		case e := <-fx.Events:
@@ -235,6 +287,37 @@ func (fx *Updater) AssertEmpty(t test.Failer, dur time.Duration) {
 		select {
 		case e := <-fx.Events:
 			t.Fatalf("got unexpected event %+v", e)
+		case <-time.After(dur):
+		}
+	}
+}
+
+func (fx *Updater) AssertNoMatch(t test.Failer, dur time.Duration, matchers ...EventMatcher) {
+	t.Helper()
+	if dur == 0 {
+		select {
+		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
+			for _, m := range matchers {
+				if e.Type == m.Type &&
+					(m.IDPrefix != "" && strings.HasPrefix(e.ID, m.IDPrefix)) ||
+					(m.NamespacePrefix != "" && strings.HasPrefix(e.Namespace, m.NamespacePrefix)) {
+					t.Fatalf("got unexpected matching event %+v", e)
+				}
+			}
+		default:
+		}
+	} else {
+		select {
+		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
+			for _, m := range matchers {
+				if e.Type == m.Type &&
+					(m.IDPrefix != "" && strings.HasPrefix(e.ID, m.IDPrefix)) ||
+					(m.NamespacePrefix != "" && strings.HasPrefix(e.Namespace, m.NamespacePrefix)) {
+					t.Fatalf("got unexpected matching event before timeout %+v", e)
+				}
+			}
 		case <-time.After(dur):
 		}
 	}

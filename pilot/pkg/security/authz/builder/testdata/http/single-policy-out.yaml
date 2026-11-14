@@ -25,10 +25,12 @@ typedConfig:
                     name: :method
                     stringMatch:
                       exact: rule[0]-to[0]-method[1]
+                      ignoreCase: true
                 - header:
                     name: :method
                     stringMatch:
                       exact: rule[0]-to[0]-method[2]
+                      ignoreCase: true
             - orRules:
                 rules:
                 - urlPath:
@@ -69,10 +71,12 @@ typedConfig:
                     name: :method
                     stringMatch:
                       exact: rule[0]-to[1]-method[1]
+                      ignoreCase: true
                 - header:
                     name: :method
                     stringMatch:
                       exact: rule[0]-to[1]-method[2]
+                      ignoreCase: true
             - orRules:
                 rules:
                 - urlPath:
@@ -106,30 +110,52 @@ typedConfig:
                       exact: spiffe://rule[0]-from[0]-principal[2]
             - orIds:
                 ids:
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[0]-from[0]-requestPrincipal[1]
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[0]-from[0]-requestPrincipal[2]
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[0]-from[0]-requestPrincipal[1]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[0]-from[0]-requestPrincipal[2]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
             - orIds:
                 ids:
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[0]-from[0]-ns[1]/.*
+                        regex: .*/ns/rule\[0\]-from\[0\]-ns\[1\]/.*
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[0]-from[0]-ns[2]/.*
+                        regex: .*/ns/rule\[0\]-from\[0\]-ns\[2\]/.*
             - orIds:
                 ids:
                 - remoteIp:
@@ -180,30 +206,52 @@ typedConfig:
                       exact: spiffe://rule[0]-from[1]-principal[2]
             - orIds:
                 ids:
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[0]-from[1]-requestPrincipal[1]
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[0]-from[1]-requestPrincipal[2]
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[0]-from[1]-requestPrincipal[1]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[0]-from[1]-requestPrincipal[2]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
             - orIds:
                 ids:
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[0]-from[1]-ns[1]/.*
+                        regex: .*/ns/rule\[0\]-from\[1\]-ns\[1\]/.*
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[0]-from[1]-ns[2]/.*
+                        regex: .*/ns/rule\[0\]-from\[1\]-ns\[2\]/.*
             - orIds:
                 ids:
                 - remoteIp:
@@ -267,10 +315,12 @@ typedConfig:
                     name: :method
                     stringMatch:
                       exact: rule[1]-to[0]-method[1]
+                      ignoreCase: true
                 - header:
                     name: :method
                     stringMatch:
                       exact: rule[1]-to[0]-method[2]
+                      ignoreCase: true
             - orRules:
                 rules:
                 - urlPath:
@@ -303,10 +353,12 @@ typedConfig:
                     name: :method
                     stringMatch:
                       exact: rule[1]-to[1]-method[1]
+                      ignoreCase: true
                 - header:
                     name: :method
                     stringMatch:
                       exact: rule[1]-to[1]-method[2]
+                      ignoreCase: true
             - orRules:
                 rules:
                 - urlPath:
@@ -332,30 +384,52 @@ typedConfig:
                       exact: spiffe://rule[1]-from[0]-principal[2]
             - orIds:
                 ids:
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[1]-from[0]-requestPrincipal[1]
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[1]-from[0]-requestPrincipal[2]
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[1]-from[0]-requestPrincipal[1]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[1]-from[0]-requestPrincipal[2]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
             - orIds:
                 ids:
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[1]-from[0]-ns[1]/.*
+                        regex: .*/ns/rule\[1\]-from\[0\]-ns\[1\]/.*
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[1]-from[0]-ns[2]/.*
+                        regex: .*/ns/rule\[1\]-from\[0\]-ns\[2\]/.*
             - orIds:
                 ids:
                 - remoteIp:
@@ -384,30 +458,52 @@ typedConfig:
                       exact: spiffe://rule[1]-from[1]-principal[2]
             - orIds:
                 ids:
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[1]-from[1]-requestPrincipal[1]
-                - metadata:
-                    filter: istio_authn
-                    path:
-                    - key: request.auth.principal
-                    value:
-                      stringMatch:
-                        exact: rule[1]-from[1]-requestPrincipal[2]
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[1]-from[1]-requestPrincipal[1]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
+                - andIds:
+                    ids:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: iss
+                        value:
+                          stringMatch:
+                            exact: rule[1]-from[1]-requestPrincipal[2]
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: payload
+                        - key: sub
+                        value:
+                          stringMatch:
+                            exact: ""
             - orIds:
                 ids:
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[1]-from[1]-ns[1]/.*
+                        regex: .*/ns/rule\[1\]-from\[1\]-ns\[1\]/.*
                 - authenticated:
                     principalName:
                       safeRegex:
-                        regex: .*/ns/rule[1]-from[1]-ns[2]/.*
+                        regex: .*/ns/rule\[1\]-from\[1\]-ns\[2\]/.*
             - orIds:
                 ids:
                 - remoteIp:

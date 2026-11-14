@@ -15,6 +15,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -25,7 +26,6 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	"golang.org/x/net/http2"
 	cert "k8s.io/api/certificates/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +38,7 @@ import (
 	"istio.io/istio/pkg/filewatcher"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/testcerts"
@@ -124,7 +125,7 @@ func TestNewServerCertInit(t *testing.T) {
 				CaCertFile: tlsArgcaCertFile,
 			},
 			enableCA:                  false,
-			certProvider:              constants.CertProviderKubernetes,
+			certProvider:              constants.CertProviderIstiod,
 			expNewCert:                false,
 			expCert:                   testcerts.ServerCert,
 			expKey:                    testcerts.ServerKey,
@@ -202,6 +203,8 @@ func TestNewServerCertInit(t *testing.T) {
 			test.SetForTest(t, &features.PilotCertProvider, c.certProvider)
 			test.SetForTest(t, &features.EnableCAServer, c.enableCA)
 
+			// Run test in an isolated directory so we don't read test files written by other cases
+			assert.NoError(t, os.Chdir(t.TempDir()))
 			// check if we have some tls assets to write for test
 			if c.FSCertsPaths != (TLSFSLoadPaths{}) {
 				err := loadCertFilesAtPaths(c.FSCertsPaths)
@@ -265,6 +268,88 @@ func TestNewServerCertInit(t *testing.T) {
 	}
 }
 
+// TestHasCustomTLSCerts checks which CA cert path hasCustomTLSCerts picks. The co-located
+// tls/ca.crt must win over the separate ca/root-cert.pem when both exist, since the latter may
+// not match the serving cert's CA after switching to an external CA.
+func TestHasCustomTLSCerts(t *testing.T) {
+	writeFile := func(t *testing.T, path string, contents []byte) {
+		t.Helper()
+		assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
+		assert.NoError(t, os.WriteFile(path, contents, 0o644))
+	}
+
+	cases := []struct {
+		name          string
+		setup         func(t *testing.T)
+		tlsOptions    TLSOptions
+		expOk         bool
+		expCaCertPath string
+	}{
+		{
+			name: "tls args take priority",
+			setup: func(t *testing.T) {
+				writeFile(t, constants.DefaultPilotTLSCert, testcerts.ServerCert)
+				writeFile(t, constants.DefaultPilotTLSKey, testcerts.ServerKey)
+				writeFile(t, constants.DefaultPilotTLSCaCertAlternatePath, testcerts.CACert)
+			},
+			tlsOptions:    TLSOptions{CertFile: "/args/cert.pem", KeyFile: "/args/key.pem", CaCertFile: "/args/ca.pem"},
+			expOk:         true,
+			expCaCertPath: "/args/ca.pem",
+		},
+		{
+			name: "only separate ca/root-cert.pem present",
+			setup: func(t *testing.T) {
+				writeFile(t, constants.DefaultPilotTLSCert, testcerts.ServerCert)
+				writeFile(t, constants.DefaultPilotTLSKey, testcerts.ServerKey)
+				writeFile(t, constants.DefaultPilotTLSCaCert, testcerts.CACert)
+			},
+			expOk:         true,
+			expCaCertPath: constants.DefaultPilotTLSCaCert,
+		},
+		{
+			name: "only co-located tls/ca.crt present",
+			setup: func(t *testing.T) {
+				writeFile(t, constants.DefaultPilotTLSCert, testcerts.ServerCert)
+				writeFile(t, constants.DefaultPilotTLSKey, testcerts.ServerKey)
+				writeFile(t, constants.DefaultPilotTLSCaCertAlternatePath, testcerts.CACert)
+			},
+			expOk:         true,
+			expCaCertPath: constants.DefaultPilotTLSCaCertAlternatePath,
+		},
+		{
+			name: "both present: co-located tls/ca.crt wins over separate ca/root-cert.pem",
+			setup: func(t *testing.T) {
+				writeFile(t, constants.DefaultPilotTLSCert, testcerts.ServerCert)
+				writeFile(t, constants.DefaultPilotTLSKey, testcerts.ServerKey)
+				// old CA
+				writeFile(t, constants.DefaultPilotTLSCaCert, testcerts.CACert)
+				// current CA
+				writeFile(t, constants.DefaultPilotTLSCaCertAlternatePath, testcerts.RotatedCert)
+			},
+			expOk:         true,
+			expCaCertPath: constants.DefaultPilotTLSCaCertAlternatePath,
+		},
+		{
+			name:  "neither present",
+			setup: func(t *testing.T) {},
+			expOk: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.NoError(t, os.Chdir(t.TempDir()))
+			c.setup(t)
+
+			ok, _, _, caCertPath := hasCustomTLSCerts(c.tlsOptions)
+			assert.Equal(t, ok, c.expOk)
+			if c.expOk {
+				assert.Equal(t, caCertPath, c.expCaCertPath)
+			}
+		})
+	}
+}
+
 func TestReloadIstiodCert(t *testing.T) {
 	dir := t.TempDir()
 	stop := make(chan struct{})
@@ -302,12 +387,12 @@ func TestReloadIstiodCert(t *testing.T) {
 	}
 
 	// setup cert watches.
-	if err := s.initCertificateWatches(tlsOptions); err != nil {
+	if err := s.initFileCertificateWatches(tlsOptions); err != nil {
 		t.Fatalf("initCertificateWatches failed: %v", err)
 	}
 
 	if err := s.initIstiodCertLoader(); err != nil {
-		t.Fatalf("istiod unable to load its cert")
+		t.Fatal("istiod unable to load its cert")
 	}
 
 	if err := s.server.Start(stop); err != nil {
@@ -333,6 +418,264 @@ func TestReloadIstiodCert(t *testing.T) {
 	g.Eventually(func() bool {
 		return checkCert(t, s, testcerts.RotatedCert, testcerts.RotatedKey)
 	}, "10s", "100ms").Should(BeTrue())
+}
+
+// TestReloadIstiodCABundle verifies that rotating only the CA (root) cert file, leaving the serving
+// cert and key untouched, is picked up by the file watcher. This is the path used when istiod's TLS
+// is provided via files (e.g. an external CA such as istio-csr); a missed root reload leaves stale
+// CA bundles in webhook configs that istiod manages.
+func TestReloadIstiodCABundle(t *testing.T) {
+	dir := t.TempDir()
+	stop := make(chan struct{})
+	s := &Server{
+		fileWatcher:             filewatcher.NewWatcher(),
+		server:                  server.New(),
+		istiodCertBundleWatcher: keycertbundle.NewWatcher(),
+	}
+
+	defer func() {
+		close(stop)
+		_ = s.fileWatcher.Close()
+	}()
+
+	certFile := filepath.Join(dir, "cert-file.yaml")
+	keyFile := filepath.Join(dir, "key-file.yaml")
+	caFile := filepath.Join(dir, "ca-file.yaml")
+
+	if err := os.WriteFile(certFile, testcerts.ServerCert, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
+	}
+	if err := os.WriteFile(keyFile, testcerts.ServerKey, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
+	}
+	if err := os.WriteFile(caFile, testcerts.CACert, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", caFile, err)
+	}
+
+	tlsOptions := TLSOptions{
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+		CaCertFile: caFile,
+	}
+
+	if err := s.initFileCertificateWatches(tlsOptions); err != nil {
+		t.Fatalf("initFileCertificateWatches failed: %v", err)
+	}
+	if err := s.server.Start(stop); err != nil {
+		t.Fatalf("Could not invoke startFuncs: %v", err)
+	}
+
+	g := NewWithT(t)
+	g.Expect(s.istiodCertBundleWatcher.GetCABundle()).To(Equal(testcerts.CACert))
+
+	// Rotate only the CA bundle.
+	if err := os.WriteFile(caFile, testcerts.RotatedCert, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", caFile, err)
+	}
+
+	g.Eventually(func() bool {
+		return bytes.Equal(s.istiodCertBundleWatcher.GetCABundle(), testcerts.RotatedCert)
+	}, "10s", "100ms").Should(BeTrue())
+
+	// The serving cert and key are unaffected by a CA-only rotation.
+	kc := s.istiodCertBundleWatcher.GetKeyCertBundle()
+	g.Expect(kc.CertPem).To(Equal(testcerts.ServerCert))
+	g.Expect(kc.KeyPem).To(Equal(testcerts.ServerKey))
+}
+
+func TestReloadcacerts(t *testing.T) {
+	var err error
+
+	// Run test in an isolated directory so we don't read test files written by other cases
+	// set ROOT_CA_DIR to temp cacertsDir and create the directory
+	cacertsDir := filepath.Join(t.TempDir(), "/etc/cacerts")
+	if err := os.MkdirAll(cacertsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%v) failed: %v", cacertsDir, err)
+	}
+	test.SetEnvForTest(t, "ROOT_CA_DIR", cacertsDir)
+	test.SetForTest(t, &features.EnableCAServer, true)
+	assert.NoError(t, os.Chdir(t.TempDir()))
+
+	// load cacerts files into memory
+	var caCert, caKey, certChain, rootCert []byte
+	if caCert, err = readSampleCertFromFile("ca-cert.pem"); err != nil {
+		t.Fatal(err)
+	}
+	if caKey, err = readSampleCertFromFile("ca-key.pem"); err != nil {
+		t.Fatal(err)
+	}
+	if certChain, err = readSampleCertFromFile("cert-chain.pem"); err != nil {
+		t.Fatal(err)
+	}
+	if rootCert, err = readSampleCertFromFile("root-cert.pem"); err != nil {
+		t.Fatal(err)
+	}
+	// write cacerts files to temp dir
+	if err := os.WriteFile(filepath.Join(cacertsDir, "ca-cert.pem"), caCert, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", filepath.Join(cacertsDir, "ca-cert.pem"), err)
+	}
+	if err := os.WriteFile(filepath.Join(cacertsDir, "ca-key.pem"), caKey, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", filepath.Join(cacertsDir, "ca-key.pem"), err)
+	}
+	if err := os.WriteFile(filepath.Join(cacertsDir, "cert-chain.pem"), certChain, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", filepath.Join(cacertsDir, "cert-chain.pem"), err)
+	}
+	if err := os.WriteFile(filepath.Join(cacertsDir, "root-cert.pem"), rootCert, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", filepath.Join(cacertsDir, "root-cert.pem"), err)
+	}
+
+	stop := make(chan struct{})
+	s := &Server{
+		istiodCertBundleWatcher: keycertbundle.NewWatcher(),
+		server:                  server.New(),
+	}
+
+	defer func() {
+		close(stop)
+		_ = s.cacertsWatcher.Close()
+	}()
+
+	// start server
+	if err := s.server.Start(stop); err != nil {
+		t.Fatalf("Could not invoke startFuncs: %v", err)
+	}
+
+	// create server CA for load cacerts files
+	if err = s.maybeCreateCA(&caOptions{}); err != nil {
+		t.Fatalf("Could not create CA: %v", err)
+	}
+
+	// validate that the cacerts files are loaded
+	g := NewWithT(t)
+	g.Eventually(func() bool {
+		return len(s.CA.GetCAKeyCertBundle().GetCertChainPem()) > 0
+	}, "10s", "100ms").Should(BeTrue())
+
+	// update cert chain of cert bundle to alt version
+	certChainAlt, err := readSampleCertFromFile("cert-chain-alt.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacertsDir, "cert-chain.pem"), certChainAlt, 0o644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", filepath.Join(cacertsDir, "cert-chain.pem"), err)
+	}
+
+	// validate that the cert chain is updated
+	g.Eventually(func() bool {
+		currentCertChain := s.CA.GetCAKeyCertBundle().GetCertChainPem()
+		return bytes.Equal(currentCertChain, certChainAlt)
+	}, "10s", "100ms").Should(BeTrue())
+}
+
+func TestClearCRL(t *testing.T) {
+	crlTestDir := filepath.Join(env.IstioSrc, "security/pkg/pki/testdata/crl")
+
+	cacertsDir := filepath.Join(t.TempDir(), "etc", "cacerts")
+	if err := os.MkdirAll(cacertsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%v) failed: %v", cacertsDir, err)
+	}
+	test.SetEnvForTest(t, "ROOT_CA_DIR", cacertsDir)
+	test.SetForTest(t, &features.EnableCACRL, true)
+
+	readTestFile := func(name string) []byte {
+		data, err := os.ReadFile(filepath.Join(crlTestDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return data
+	}
+	validCRL := readTestFile("ca-crl.pem")
+
+	// Seed a complete plugged-in signing bundle from the CRL testdata.
+	for _, f := range []string{"ca-cert.pem", "ca-key.pem", "cert-chain.pem", "root-cert.pem"} {
+		if err := os.WriteFile(filepath.Join(cacertsDir, f), readTestFile(f), 0o644); err != nil {
+			t.Fatalf("WriteFile(%v) failed: %v", f, err)
+		}
+	}
+
+	stop := make(chan struct{})
+	s := &Server{
+		istiodCertBundleWatcher: keycertbundle.NewWatcher(),
+		server:                  server.New(),
+	}
+
+	defer func() {
+		close(stop)
+		_ = s.cacertsWatcher.Close()
+		s.WaitUntilCompletion()
+	}()
+
+	// start server
+	if err := s.server.Start(stop); err != nil {
+		t.Fatalf("Could not invoke startFuncs: %v", err)
+	}
+
+	// create server CA for load cacerts files
+	if err := s.maybeCreateCA(&caOptions{}); err != nil {
+		t.Fatalf("Could not create CA: %v", err)
+	}
+
+	// validate that the cacerts files are loaded
+	g := NewWithT(t)
+	g.Eventually(func() bool {
+		return len(s.CA.GetCAKeyCertBundle().GetCertChainPem()) > 0
+	}, "10s", "100ms").Should(BeTrue())
+
+	g.Expect(s.CA.GetCAKeyCertBundle().GetCRLPem()).Should(BeEmpty())
+	g.Expect(s.istiodCertBundleWatcher.GetCRL()).Should(BeEmpty())
+
+	crlPath := filepath.Join(cacertsDir, "ca-crl.pem")
+	for _, tt := range []struct {
+		name   string
+		action func(t *testing.T)
+	}{
+		{
+			"crl deleted",
+			func(t *testing.T) {
+				if err := os.Remove(crlPath); err != nil {
+					t.Fatal(err)
+				}
+				// deletes are not watched so create a file
+				if err := os.WriteFile(filepath.Join(cacertsDir, "trigger"), []byte{}, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			"empty crl",
+			func(t *testing.T) {
+				if err := os.WriteFile(crlPath, []byte{}, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(crlPath, validCRL, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			g.Eventually(func() bool {
+				currentCRL := s.CA.GetCAKeyCertBundle().GetCRLPem()
+				return bytes.Equal(currentCRL, validCRL)
+			}, "10s", "100ms").Should(BeTrue())
+			g.Eventually(func() bool {
+				currentCRL := s.istiodCertBundleWatcher.GetCRL()
+				return bytes.Equal(currentCRL, validCRL)
+			}, "10s", "100ms").Should(BeTrue())
+
+			tt.action(t)
+
+			g.Eventually(func() bool {
+				currentCRL := s.CA.GetCAKeyCertBundle().GetCRLPem()
+				return currentCRL != nil && len(currentCRL) == 0
+			}, "10s", "100ms").Should(BeTrue())
+			g.Eventually(func() bool {
+				currentCRL := s.istiodCertBundleWatcher.GetCRL()
+				return currentCRL != nil && len(currentCRL) == 0
+			}, "10s", "100ms").Should(BeTrue())
+		})
+	}
 }
 
 func TestNewServer(t *testing.T) {
@@ -520,7 +863,7 @@ func TestIstiodCipherSuites(t *testing.T) {
 					GRPCAddr:       ":0",
 					HTTPSAddr:      ":0",
 					TLSOptions: TLSOptions{
-						CipherSuits: c.serverCipherSuites,
+						CipherSuites: c.serverCipherSuites,
 					},
 				}
 				p.RegistryOptions = RegistryOptions{
@@ -544,6 +887,243 @@ func TestIstiodCipherSuites(t *testing.T) {
 				close(stop)
 				s.WaitUntilCompletion()
 			}()
+
+			httpsReadyClient := &http.Client{
+				Timeout: time.Second,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true, //nolint:gosec
+						CipherSuites:       c.clientCipherSuites,
+						MinVersion:         tls.VersionTLS12,
+						MaxVersion:         tls.VersionTLS12,
+					},
+				},
+			}
+
+			retry.UntilSuccessOrFail(t, func() error {
+				response, err := httpsReadyClient.Get("https://" + s.httpsAddr + "/ready")
+				if response != nil {
+					defer response.Body.Close()
+				}
+				if c.expectSuccess && err != nil {
+					return fmt.Errorf("expect success but got err %v", err)
+				}
+				if !c.expectSuccess && err == nil {
+					return fmt.Errorf("expect failure but succeeded")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestIstiodMinTLSVersion(t *testing.T) {
+	cases := []struct {
+		name                string
+		serverMinTLSVersion uint16
+		clientMinTLSVersion uint16
+		clientMaxTLSVersion uint16
+		expectSuccess       bool
+	}{
+		{
+			name:          "default TLS version",
+			expectSuccess: true,
+		},
+		{
+			name:                "client and server TLS versions compatible",
+			serverMinTLSVersion: tls.VersionTLS12,
+			clientMinTLSVersion: tls.VersionTLS12,
+			clientMaxTLSVersion: tls.VersionTLS13,
+			expectSuccess:       true,
+		},
+		{
+			name:                "server requires TLS 1.3, client supports it",
+			serverMinTLSVersion: tls.VersionTLS13,
+			clientMinTLSVersion: tls.VersionTLS12,
+			clientMaxTLSVersion: tls.VersionTLS13,
+			expectSuccess:       true,
+		},
+		{
+			name:                "server requires TLS 1.3, client only supports TLS 1.2",
+			serverMinTLSVersion: tls.VersionTLS13,
+			clientMinTLSVersion: tls.VersionTLS12,
+			clientMaxTLSVersion: tls.VersionTLS12,
+			expectSuccess:       false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			args := NewPilotArgs(func(p *PilotArgs) {
+				p.Namespace = "istio-system"
+				p.ServerOptions = DiscoveryServerOptions{
+					// Dynamically assign all ports.
+					HTTPAddr:       ":0",
+					MonitoringAddr: ":0",
+					GRPCAddr:       ":0",
+					HTTPSAddr:      ":0",
+					TLSOptions: TLSOptions{
+						MinVersion: c.serverMinTLSVersion,
+					},
+				}
+				p.RegistryOptions = RegistryOptions{
+					KubeConfig: "config",
+					FileDir:    configDir,
+				}
+
+				// Include all of the default plugins
+				p.ShutdownDuration = 1 * time.Millisecond
+			})
+
+			g := NewWithT(t)
+			s, err := NewServer(args, func(s *Server) {
+				s.kubeClient = kube.NewFakeClient()
+			})
+			g.Expect(err).To(Succeed())
+
+			stop := make(chan struct{})
+			g.Expect(s.Start(stop)).To(Succeed())
+			defer func() {
+				close(stop)
+				s.WaitUntilCompletion()
+			}()
+
+			httpsReadyClient := &http.Client{
+				Timeout: time.Second,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true, //nolint:gosec
+						MinVersion:         c.clientMinTLSVersion,
+						MaxVersion:         c.clientMaxTLSVersion,
+					},
+				},
+			}
+
+			retry.UntilSuccessOrFail(t, func() error {
+				response, err := httpsReadyClient.Get("https://" + s.httpsAddr + "/ready")
+				if response != nil {
+					defer response.Body.Close()
+				}
+				if c.expectSuccess && err != nil {
+					return fmt.Errorf("expect success but got err %v", err)
+				}
+				if !c.expectSuccess && err == nil {
+					return fmt.Errorf("expect failure but succeeded")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestIstiodReadinessHandler(t *testing.T) {
+	configDir := t.TempDir()
+
+	args := NewPilotArgs(func(p *PilotArgs) {
+		p.Namespace = "istio-system"
+		p.ServerOptions = DiscoveryServerOptions{
+			// Dynamically assign all ports.
+			HTTPAddr:       ":0",
+			HTTPSAddr:      ":0",
+			MonitoringAddr: ":0",
+			GRPCAddr:       ":0",
+		}
+		p.RegistryOptions = RegistryOptions{
+			KubeConfig: "config",
+			FileDir:    configDir,
+		}
+		p.ShutdownDuration = 1 * time.Millisecond
+	})
+
+	g := NewWithT(t)
+	s, err := NewServer(args, func(s *Server) {
+		s.kubeClient = kube.NewFakeClient()
+	})
+	g.Expect(err).To(Succeed())
+
+	stop := make(chan struct{})
+	g.Expect(s.Start(stop)).To(Succeed())
+	defer func() {
+		close(stop)
+		s.WaitUntilCompletion()
+	}()
+
+	c := http.Client{}
+	c.Transport = &http.Transport{
+		// nolint: gosec
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	defer c.CloseIdleConnections()
+
+	for _, url := range []string{"http://" + s.httpAddr, "https://" + s.httpsAddr} {
+		resp, err := c.Get(url + "/ready")
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(resp.StatusCode).To(Equal(http.StatusOK))
+		g.Expect(resp.Body.Close()).To(Succeed())
+	}
+}
+
+// Webhook readiness must track when the server hosting the handlers is serving:
+// immediately for the shared main HTTP server, only after Start() for a dedicated
+// HTTPS server (istio/istio#61049).
+func TestWebhookReadiness(t *testing.T) {
+	cases := []struct {
+		name          string
+		httpsAddr     string
+		readyAfterNew bool // expected webhook readiness immediately after NewServer
+	}{
+		{
+			// istio defaults this to :15017.
+			name:          "dedicated HTTPS server",
+			httpsAddr:     ":45017",
+			readyAfterNew: false,
+		},
+		{
+			name:          "shared main HTTP server",
+			httpsAddr:     "",
+			readyAfterNew: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			args := NewPilotArgs(func(p *PilotArgs) {
+				p.Namespace = "istio-system"
+				p.ServerOptions = DiscoveryServerOptions{
+					HTTPAddr:       ":0",
+					HTTPSAddr:      c.httpsAddr,
+					MonitoringAddr: ":0",
+					GRPCAddr:       ":0",
+				}
+				p.RegistryOptions = RegistryOptions{
+					KubeConfig: "config",
+					FileDir:    configDir,
+				}
+				p.ShutdownDuration = 1 * time.Millisecond
+			})
+
+			g := NewWithT(t)
+			s, err := NewServer(args, func(s *Server) {
+				s.kubeClient = kube.NewFakeClient()
+			})
+			g.Expect(err).To(Succeed())
+
+			g.Expect(s.readinessFlags.configValidationReady.Load()).To(Equal(c.readyAfterNew))
+			g.Expect(s.readinessFlags.sidecarInjectorReady.Load()).To(Equal(c.readyAfterNew))
+
+			stop := make(chan struct{})
+			g.Expect(s.Start(stop)).To(Succeed())
+			defer func() {
+				close(stop)
+				s.WaitUntilCompletion()
+			}()
+
+			g.Expect(s.readinessFlags.configValidationReady.Load()).To(BeTrue())
+			g.Expect(s.readinessFlags.sidecarInjectorReady.Load()).To(BeTrue())
 		})
 	}
 }
@@ -576,7 +1156,7 @@ func TestInitOIDC(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := &PilotArgs{JwtRule: tt.jwtRule}
 
-			_, err := initOIDC(args)
+			_, err := initOIDC(args, nil)
 			gotErr := err != nil
 			if gotErr != tt.expectErr {
 				t.Errorf("expect error is %v while actual error is %v", tt.expectErr, gotErr)
@@ -641,12 +1221,12 @@ func TestWatchDNSCertForK8sCA(t *testing.T) {
 			}
 			cert, certErr := util.ParsePemEncodedCertificate(rotatedCertBytes)
 			if certErr != nil {
-				t.Fatalf("rotated cert is not valid")
+				t.Fatal("rotated cert is not valid")
 			}
 			currTime := time.Now()
 			timeToExpire := cert.NotAfter.Sub(currTime)
 			if timeToExpire < 0 {
-				t.Fatalf("rotated cert is already expired")
+				t.Fatal("rotated cert is already expired")
 			}
 		})
 	}
@@ -656,11 +1236,11 @@ func checkCert(t *testing.T, s *Server, cert, key []byte) bool {
 	t.Helper()
 	actual, err := s.getIstiodCertificate(nil)
 	if err != nil {
-		t.Fatalf("fail to load fetch certs.")
+		t.Fatal("fail to load fetch certs.")
 	}
 	expected, err := tls.X509KeyPair(cert, key)
 	if err != nil {
-		t.Fatalf("fail to load test certs.")
+		t.Fatal("fail to load test certs.")
 	}
 	return bytes.Equal(actual.Certificate[0], expected.Certificate[0])
 }

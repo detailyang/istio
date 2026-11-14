@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
+
+	gwConformanceConfig "sigs.k8s.io/gateway-api/conformance/utils/config"
 
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test/env"
@@ -50,15 +53,17 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 	}
 
 	// NOTE: not using echo.VM, etc. here to avoid circular dependency.
-	if s.SkipVM {
+
+	// VM auto-registration relies on Pilot reconciling WorkloadEntry, which is disabled
+	// under GatewayAPIOnly
+	if s.SkipVM || s.GatewayAPIOnly {
 		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "vm")
 	}
 	if s.SkipTProxy {
 		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "tproxy")
 	}
-	if s.SkipDelta {
-		// TODO we may also want to trigger this if we have an old version
-		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "delta")
+	if s.SkipUserNamespace {
+		s.SkipWorkloadClasses = append(s.SkipWorkloadClasses, "userns")
 	}
 	// Allow passing a single CSV flag as well
 	normalized := make(ArrayFlags, 0)
@@ -67,12 +72,22 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 	}
 	s.SkipWorkloadClasses = normalized
 
+	normalizedIPFamilies := make(ArrayFlags, 0)
+	for _, ipFamily := range s.IPFamilies {
+		normalizedIPFamilies = append(normalizedIPFamilies, strings.Split(ipFamily, ",")...)
+	}
+	s.IPFamilies = normalizedIPFamilies
+
 	if s.Image.Hub == "" {
-		s.Image.Hub = env.HUB.ValueOrDefault("gcr.io/istio-testing")
+		s.Image.Hub = env.HUB.ValueOrDefault("registry.istio.io/testing")
 	}
 
 	if s.Image.Tag == "" {
 		s.Image.Tag = env.TAG.ValueOrDefault("latest")
+	}
+
+	if s.Image.Variant == "" {
+		s.Image.Variant = env.VARIANT.ValueOrDefault("")
 	}
 
 	if s.Image.PullPolicy == "" {
@@ -88,7 +103,9 @@ func SettingsFromCommandLine(testID string) (*Settings, error) {
 	}
 
 	if s.HelmRepo == "" {
-		s.HelmRepo = "https://istio-release.storage.googleapis.com/charts"
+		// istio-release.storage.googleapis.com stops at 1.31.0-rc.0 and is deleted in December
+		// 2026. blob.istio.io carries every release, including the ones the GCS bucket mirrored.
+		s.HelmRepo = "https://blob.istio.io/istio-release/charts"
 	}
 
 	if err = validate(s); err != nil {
@@ -127,6 +144,11 @@ func validate(s *Settings) error {
 		return fmt.Errorf("values for Hub & Tag are not detected. Please supply them through command-line or via environment")
 	}
 
+	for _, ipFamily := range s.IPFamilies {
+		if ipFamily != "IPv4" && ipFamily != "IPv6" {
+			return fmt.Errorf("supported values for --istio.test.IPFamilies are `IPv4`, `IPv6`, `IPv4,IPv6` or `IPv6,IPv4`")
+		}
+	}
 	return nil
 }
 
@@ -172,14 +194,17 @@ func init() {
 	flag.BoolVar(&settingsFromCommandLine.SkipVM, "istio.test.skipVM", settingsFromCommandLine.SkipVM,
 		"Skip VM related parts in all tests.")
 
-	flag.BoolVar(&settingsFromCommandLine.SkipDelta, "istio.test.skipDelta", settingsFromCommandLine.SkipDelta,
-		"Skip Delta XDS related parts in all tests.")
-
 	flag.BoolVar(&settingsFromCommandLine.SkipTProxy, "istio.test.skipTProxy", settingsFromCommandLine.SkipTProxy,
 		"Skip TProxy related parts in all tests.")
 
+	flag.BoolVar(&settingsFromCommandLine.SkipUserNamespace, "istio.test.skipUserNs", true,
+		"Skip user namespace related parts in all tests.")
+
 	flag.BoolVar(&settingsFromCommandLine.Ambient, "istio.test.ambient", settingsFromCommandLine.Ambient,
 		"Indicate the use of ambient mesh.")
+
+	flag.BoolVar(&settingsFromCommandLine.GatewayAPIOnly, "istio.test.gatewayAPIOnly", settingsFromCommandLine.GatewayAPIOnly,
+		"Indicate a Gateway API-only cluster (no sidecar injection). Echo apps will be deployed without istio-proxy overlay.")
 
 	flag.BoolVar(&settingsFromCommandLine.PeerMetadataDiscovery, "istio.test.peer_metadata_discovery", settingsFromCommandLine.PeerMetadataDiscovery,
 		"Force the use of peer metadata discovery fallback for metadata exchange")
@@ -196,17 +221,103 @@ func init() {
 		"Container registry hub to use")
 	flag.StringVar(&settingsFromCommandLine.Image.Tag, "istio.test.tag", settingsFromCommandLine.Image.Tag,
 		"Common Container tag to use when deploying container images")
+	flag.StringVar(&settingsFromCommandLine.Image.Variant, "istio.test.variant", settingsFromCommandLine.Image.Variant,
+		"Common Container variant to use when deploying container images")
 	flag.StringVar(&settingsFromCommandLine.Image.PullPolicy, "istio.test.pullpolicy", settingsFromCommandLine.Image.PullPolicy,
 		"Common image pull policy to use when deploying container images")
 	flag.StringVar(&settingsFromCommandLine.Image.PullSecret, "istio.test.imagePullSecret", settingsFromCommandLine.Image.PullSecret,
 		"Path to a file containing a DockerConfig secret use for test apps. This will be pushed to all created namespaces."+
 			"Secret should already exist when used with istio.test.stableNamespaces.")
-
+	flag.StringVar(&settingsFromCommandLine.AmbientPodRuntimeClass, "istio.test.ambientPodRuntimeClass",
+		settingsFromCommandLine.AmbientPodRuntimeClass, "RuntimeClassName to assign to echo pods without sidecars.")
 	flag.Uint64Var(&settingsFromCommandLine.MaxDumps, "istio.test.maxDumps", settingsFromCommandLine.MaxDumps,
 		"Maximum number of full test dumps that are allowed to occur within a test suite.")
-
-	flag.BoolVar(&settingsFromCommandLine.EnableDualStack, "istio.test.enableDualStack", settingsFromCommandLine.EnableDualStack,
-		"Deploy Istio with Dual Stack enabled.")
-
 	flag.StringVar(&settingsFromCommandLine.HelmRepo, "istio.test.helmRepo", settingsFromCommandLine.HelmRepo, "Helm repo to use to pull the charts.")
+	flag.Var(&settingsFromCommandLine.IPFamilies, "istio.test.IPFamilies",
+		"IP families (IPv6, IPv4) to test with. If both specified, dualstack config will be used. The order the families are defined indicates precedence.")
+	flag.BoolVar(&settingsFromCommandLine.GatewayConformanceStandardOnly, "istio.test.gatewayConformanceStandardOnly",
+		settingsFromCommandLine.GatewayConformanceStandardOnly,
+		"If set, only the standard gateway conformance tests will be run; tests relying on experimental resources will be skipped.")
+
+	flag.BoolVar(&settingsFromCommandLine.OpenShift, "istio.test.openshift", settingsFromCommandLine.OpenShift,
+		"Indicate the tests run in an OpenShift platform rather than in plain Kubernetes.")
+
+	flag.BoolVar(&settingsFromCommandLine.AmbientMultiNetwork, "istio.test.ambient.multinetwork", settingsFromCommandLine.AmbientMultiNetwork,
+		"Indicate the use of ambient multicluster.")
+
+	flag.BoolVar(&settingsFromCommandLine.IstioOwnedCNIConfig, "istio.test.ambient.istioOwnedCNIConfig", settingsFromCommandLine.IstioOwnedCNIConfig,
+		"Indicate the use of an Istio owned CNI configuration.")
+
+	flag.BoolVar(
+		&settingsFromCommandLine.GatewayConformanceAllowCRDsMismatch,
+		"istio.test.GatewayConformanceAllowCRDsMismatch",
+		settingsFromCommandLine.GatewayConformanceAllowCRDsMismatch,
+		"If set, gateway conformance tests will run even if the environment has pre-installed Gateway API CRDs that differ from the current Gateway API version.",
+	)
+
+	flag.BoolVar(&settingsFromCommandLine.NativeNftables, "istio.test.nativeNftables", settingsFromCommandLine.NativeNftables,
+		"If set, native nftable rules will be used instead of iptable rules for traffic redirection.")
+
+	flag.BoolVar(&settingsFromCommandLine.Agentgateway, "istio.test.agentgateway", settingsFromCommandLine.Agentgateway,
+		"If set, agentgateway conformance tests will be run.")
+	initGatewayConformanceTimeouts()
+}
+
+func initGatewayConformanceTimeouts() {
+	defaults := gwConformanceConfig.DefaultTimeoutConfig()
+	// Cleanup waits for namespace deletion, including pod termination and finalization.
+	defaults.DeleteTimeout = 2 * time.Minute
+	settingsFromCommandLine.GatewayConformanceTimeoutConfig = defaults
+
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.CreateTimeout, "istio.test.gatewayConformance.createTimeout",
+		defaults.CreateTimeout, "Gateway conformance test timeout for waiting for creating a k8s resource.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.DeleteTimeout, "istio.test.gatewayConformance.deleteTimeout",
+		defaults.DeleteTimeout, "Gateway conformance test timeout for getting a k8s resource.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GetTimeout, "istio.test.gatewayConformance.geTimeout",
+		defaults.GetTimeout, "Gateway conformance test timeout for getting a k8s resource.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GatewayMustHaveAddress,
+		"istio.test.gatewayConformance.gatewayMustHaveAddressTimeout", defaults.GatewayMustHaveAddress,
+		"Gateway conformance test timeout for waiting for a Gateway to have an address.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GatewayMustHaveCondition,
+		"istio.test.gatewayConformance.gatewayMustHaveConditionTimeout", defaults.GatewayMustHaveCondition,
+		"Gateway conformance test timeout for waiting for a Gateway to have a certain condition.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GatewayStatusMustHaveListeners,
+		"istio.test.gatewayConformance.gatewayStatusMustHaveListenersTimeout", defaults.GatewayStatusMustHaveListeners,
+		"Gateway conformance test timeout for waiting for a Gateway's status to have listeners.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GatewayListenersMustHaveConditions,
+		"istio.test.gatewayConformance.gatewayListenersMustHaveConditionTimeout", defaults.GatewayListenersMustHaveConditions,
+		"Gateway conformance test timeout for waiting for a Gateway's listeners to have certain conditions.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.GWCMustBeAccepted,
+		"istio.test.gatewayConformance.gatewayClassMustBeAcceptedTimeout",
+		defaults.GWCMustBeAccepted, "Gateway conformance test timeout for waiting for a GatewayClass to be accepted.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.HTTPRouteMustNotHaveParents,
+		"istio.test.gatewayConformance.httpRouteMustNotHaveParentsTimeout", defaults.HTTPRouteMustNotHaveParents,
+		"Gateway conformance test timeout for waiting for an HTTPRoute to either have no parents or a single parent that is not accepted.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.HTTPRouteMustHaveCondition,
+		"istio.test.gatewayConformance.httpRouteMustHaveConditionTimeout",
+		defaults.HTTPRouteMustHaveCondition, "Gateway conformance test timeout for waiting for an HTTPRoute to have a certain condition.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.TLSRouteMustHaveCondition,
+		"istio.test.gatewayConformance.tlsRouteMustHaveConditionTimeout", defaults.TLSRouteMustHaveCondition,
+		"Gateway conformance test timeout for waiting for an TLSRoute to have a certain condition.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.RouteMustHaveParents, "istio.test.gatewayConformance.routeMustHaveParentsTimeout",
+		defaults.RouteMustHaveParents,
+		"Maximum time in the Gateway conformance test for an xRoute to have parents in status that match the expected parents before timing out.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.ManifestFetchTimeout, "istio.test.gatewayConformance.manifestFetchTimeout",
+		defaults.ManifestFetchTimeout, "Gateway conformance test timeout for the maximum time for getting content from a https:// URL.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.MaxTimeToConsistency, "istio.test.gatewayConformance.maxTimeToConsistency",
+		defaults.MaxTimeToConsistency,
+		"Gateway conformance test setting for the maximum time for requiredConsecutiveSuccesses (default 3) requests to succeed in a row before failing the test.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.NamespacesMustBeReady,
+		"istio.test.gatewayConformance.namespacesMustBeReadyTimeout", defaults.NamespacesMustBeReady,
+		"Gateway conformance test timeout for waiting for namespaces to be ready.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.RequestTimeout, "istio.test.gatewayConformance.requestTimeout",
+		defaults.RequestTimeout, "Gateway conformance test timeout for an HTTP request.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.LatestObservedGenerationSet,
+		"istio.test.gatewayConformance.latestObservedGenerationSetTimeout", defaults.LatestObservedGenerationSet,
+		"Gateway conformance test timeout for waiting for a latest observed generation to be set.")
+	flag.DurationVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.DefaultTestTimeout, "istio.test.gatewayConformance.defaultTestTimeout",
+		defaults.DefaultTestTimeout, "Default gateway conformance test case timeout.")
+	flag.IntVar(&settingsFromCommandLine.GatewayConformanceTimeoutConfig.RequiredConsecutiveSuccesses,
+		"istio.test.gatewayConformance.requiredConsecutiveSuccesses", defaults.RequiredConsecutiveSuccesses,
+		"Gateway conformance test setting for the required number of consecutive successes before failing the test.")
 }

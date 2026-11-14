@@ -120,7 +120,7 @@ func TestSecretsController(t *testing.T) {
 		wrongKeys,
 	}
 	client := kube.NewFakeClient(secrets...)
-	sc := NewCredentialsController(client)
+	sc := NewCredentialsController(client, nil, true)
 	client.RunAndWait(test.NewStop(t))
 	cases := []struct {
 		name            string
@@ -287,7 +287,7 @@ func TestDockerCredentials(t *testing.T) {
 		genericCert,
 	}
 	client := kube.NewFakeClient(secrets...)
-	sc := NewCredentialsController(client)
+	sc := NewCredentialsController(client, nil, true)
 	client.RunAndWait(test.NewStop(t))
 	cases := []struct {
 		name                string
@@ -358,15 +358,39 @@ func allowIdentities(c kube.Client, identities ...string) {
 	})
 }
 
+func allowGroups(c kube.Client, groups ...string) {
+	allowed := sets.New(groups...)
+	c.Kube().(*fake.Clientset).Fake.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		a := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+		for _, group := range a.Spec.Groups {
+			if allowed.Contains(group) {
+				return true, &authorizationv1.SubjectAccessReview{
+					Status: authorizationv1.SubjectAccessReviewStatus{
+						Allowed: true,
+					},
+				}, nil
+			}
+		}
+		return true, &authorizationv1.SubjectAccessReview{
+			Status: authorizationv1.SubjectAccessReviewStatus{
+				Allowed: false,
+				Reason:  fmt.Sprintf("groups %v cannot access secrets", a.Spec.Groups),
+			},
+		}, nil
+	})
+}
+
 func TestForCluster(t *testing.T) {
+	stop := test.NewStop(t)
 	localClient := kube.NewFakeClient()
-	localClient.RunAndWait(test.NewStop(t))
+	localClient.RunAndWait(stop)
 	remoteClient := kube.NewFakeClient()
-	remoteClient.RunAndWait(test.NewStop(t))
-	sc := NewMulticluster("local")
-	sc.ClusterAdded(&multicluster.Cluster{ID: "local", Client: localClient}, nil)
-	sc.ClusterAdded(&multicluster.Cluster{ID: "remote", Client: remoteClient}, nil)
-	sc.ClusterAdded(&multicluster.Cluster{ID: "remote2", Client: remoteClient}, nil)
+	remoteClient.RunAndWait(stop)
+	mc := multicluster.NewFakeController()
+	sc := NewMulticluster("local", mc)
+	mc.Add("local", localClient, stop)
+	mc.Add("remote", remoteClient, stop)
+	mc.Add("remote2", remoteClient, stop)
 	cases := []struct {
 		cluster cluster2.ID
 		allowed bool
@@ -387,15 +411,17 @@ func TestForCluster(t *testing.T) {
 }
 
 func TestAuthorize(t *testing.T) {
+	stop := test.NewStop(t)
 	localClient := kube.NewFakeClient()
-	localClient.RunAndWait(test.NewStop(t))
+	localClient.RunAndWait(stop)
 	remoteClient := kube.NewFakeClient()
-	remoteClient.RunAndWait(test.NewStop(t))
+	remoteClient.RunAndWait(stop)
 	allowIdentities(localClient, "system:serviceaccount:ns-local:sa-allowed")
 	allowIdentities(remoteClient, "system:serviceaccount:ns-remote:sa-allowed")
-	sc := NewMulticluster("local")
-	sc.ClusterAdded(&multicluster.Cluster{ID: "local", Client: localClient}, nil)
-	sc.ClusterAdded(&multicluster.Cluster{ID: "remote", Client: remoteClient}, nil)
+	mc := multicluster.NewFakeController()
+	sc := NewMulticluster("local", mc)
+	mc.Add("local", localClient, stop)
+	mc.Add("remote", remoteClient, stop)
 	cases := []struct {
 		sa      string
 		ns      string
@@ -418,6 +444,37 @@ func TestAuthorize(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := con.Authorize(tt.sa, tt.ns)
+			if (got == nil) != tt.allowed {
+				t.Fatalf("expected allowed=%v, got error=%v", tt.allowed, got)
+			}
+		})
+	}
+}
+
+// TestAuthorizeGroups ensures the authorization check reports the Kubernetes groups a service
+// account belongs to, so that RBAC rules bound to a group rather than to the service account
+// itself are honored.
+func TestAuthorizeGroups(t *testing.T) {
+	cases := []struct {
+		name string
+		// grantedTo is the group a RoleBinding grants secret access to.
+		grantedTo string
+		allowed   bool
+	}{
+		{"namespace service accounts", "system:serviceaccounts:ns-local", true},
+		{"all service accounts", "system:serviceaccounts", true},
+		{"another namespace", "system:serviceaccounts:ns-other", false},
+		// Istio deliberately does not claim system:authenticated on behalf of the proxy, so a
+		// grant to that group must not be enough to read secrets.
+		{"all authenticated users", "system:authenticated", false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			client := kube.NewFakeClient()
+			allowGroups(client, tt.grantedTo)
+			con := NewCredentialsController(client, nil, true)
+			client.RunAndWait(test.NewStop(t))
+			got := con.Authorize("sa-any", "ns-local")
 			if (got == nil) != tt.allowed {
 				t.Fatalf("expected allowed=%v, got error=%v", tt.allowed, got)
 			}
@@ -448,10 +505,11 @@ func TestSecretsControllerMulticluster(t *testing.T) {
 	localClient := kube.NewFakeClient(secretsLocal...)
 	remoteClient := kube.NewFakeClient(secretsRemote...)
 	otherRemoteClient := kube.NewFakeClient()
-	sc := NewMulticluster("local")
-	sc.ClusterAdded(&multicluster.Cluster{ID: "local", Client: localClient}, nil)
-	sc.ClusterAdded(&multicluster.Cluster{ID: "remote", Client: remoteClient}, nil)
-	sc.ClusterAdded(&multicluster.Cluster{ID: "other", Client: otherRemoteClient}, nil)
+	mc := multicluster.NewFakeController()
+	sc := NewMulticluster("local", mc)
+	mc.Add("local", localClient, stop)
+	mc.Add("remote", remoteClient, stop)
+	mc.Add("other", otherRemoteClient, stop)
 
 	// normally the remote secrets controller would start these
 	localClient.RunAndWait(stop)

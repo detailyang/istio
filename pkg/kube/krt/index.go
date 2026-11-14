@@ -15,65 +15,331 @@
 package krt
 
 import (
-	"sync"
+	"fmt"
 
+	"k8s.io/client-go/tools/cache"
+
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
-// Index maintains a simple index over an informer
-type Index[I any, K comparable] struct {
-	mu      sync.RWMutex
-	objects map[K]sets.Set[Key[I]]
-	c       Collection[I]
+type Index[K comparable, O any] interface {
+	Lookup(k K) []O
+	// LookupFiltered returns objects matching the key and filter. A nil filter returns all objects for the key.
+	//
+	// The filter may be evaluated while a collection's read lock is held. It must not access or modify the
+	// collection, its indexes, or its objects: attempting to acquire the read lock again can deadlock. Filters must be
+	// short-lived and non-blocking, since they can delay collection updates.
+	LookupFiltered(k K, filter func(O) bool) []O
+	AsCollection(opts ...CollectionOption) IndexCollection[K, O]
+	Fetch(ctx HandlerContext, key K, opts ...FetchOption) []O
+	objectHasKey(obj O, k K) bool
+	extractKeys(o O) []K
+	id() collectionUID
+}
+
+type IndexCollection[K comparable, O any] = Collection[IndexObject[K, O]]
+
+type IndexObject[K comparable, O any] struct {
+	Key     K
+	Objects []O
+}
+
+func (i IndexObject[K, O]) ResourceName() string {
+	return toString(i.Key)
+}
+
+// NewNamespaceIndex is a small helper to index a collection by namespace
+func NewNamespaceIndex[O Namespacer](c Collection[O]) Index[string, O] {
+	return NewIndex(c, cache.NamespaceIndex, func(o O) []string {
+		return []string{o.GetNamespace()}
+	})
+}
+
+// NewIndex creates a simple index, keyed by key K, over a collection for O. This is similar to
+// Informer.AddIndex, but is easier to use and can be added after an informer has already started.
+// Different collection implementations may reuse existing indexes with the same name.
+// Informer collections will always share the same underlying index, other collections only share indexes if
+// they are created on the same collection instance.
+func NewIndex[K comparable, O any](
+	c Collection[O],
+	name string,
+	extract func(o O) []K,
+) Index[K, O] {
+	idx := c.internal().index(name, func(o O) []string {
+		return slices.Map(extract(o), func(e K) string {
+			return toString(e)
+		})
+	})
+
+	return index[K, O]{
+		nextUID(),
+		idx,
+		c,
+		extract,
+	}
+}
+
+type index[K comparable, O any] struct {
+	uid collectionUID
+	indexer[O]
+	c       Collection[O]
+	extract func(o O) []K
+}
+
+func WithIndexCollectionFromString[K any](f func(string) K) CollectionOption {
+	return func(c *collectionOptions) {
+		c.indexCollectionFromString = func(s string) any {
+			return f(s)
+		}
+	}
+}
+
+// AsCollection does a best-effort approximation of turning an index into a Collection. This is intended to be used as a
+// primary input with NewCollection or similar transformations.
+// This has some limitations that impact usage *outside* of NewCollection:
+// * List() is not recommended since it is slow.
+// * Building an index is not allowed
+// * Events are not 100% precise; only Add and Delete events are triggered. Updates will be `Add` events.
+// The intended use case for this is to do merging within a collection (like a SQL 'group by').
+// WARNING: when merging, its critical the output key includes the merge key. Otherwise, you may end up with multiple
+// input keys mapping to the same output key, corrupting krt state.
+func (i index[K, O]) AsCollection(opts ...CollectionOption) IndexCollection[K, O] {
+	o := buildCollectionOptions(opts...)
+
+	c := indexCollection[K, O]{
+		idx:            i,
+		id:             nextUID(),
+		collectionName: fmt.Sprintf("index/%s", o.name),
+		fromKey:        o.indexCollectionFromString,
+	}
+	if c.fromKey == nil {
+		if _, ok := any(ptr.Empty[K]()).(string); !ok {
+			// This is a limitation of the way the API is encoded, unfortunately.
+			panic("index.AsCollection requires a string key or WithIndexCollectionFromString to be set")
+		}
+		c.fromKey = func(s string) any {
+			return s
+		}
+	}
+	if o.metadata != nil {
+		c.metadata = o.metadata
+	}
+	maybeRegisterCollectionForDebugging(c, o.debugger)
+	if o.debugger != nil && o.stopProvided {
+		go func() {
+			<-o.stop
+			maybeUnregisterCollectionFromDebugger(c, o.debugger)
+		}()
+	}
+	return newCollection(c)
+}
+
+// Fetch fetches all entries from the index with dependency tracking
+func (i index[K, O]) Fetch(ctx HandlerContext, key K, opts ...FetchOption) []O {
+	return Fetch(ctx, i.c, append([]FetchOption{FilterIndex(i, key)}, opts...)...)
+}
+
+// nolint: unused // (not true)
+func (i index[K, O]) objectHasKey(obj O, k K) bool {
+	return slices.Contains(i.extract(obj), k)
+}
+
+// nolint: unused // (not true)
+func (i index[K, O]) extractKeys(o O) []K {
+	return i.extract(o)
+}
+
+// nolint: unused // (not true)
+func (i index[K, O]) id() collectionUID {
+	return i.uid
 }
 
 // Lookup finds all objects matching a given key
-func (i *Index[I, K]) Lookup(k K) []I {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	var res []I
-	for obj := range i.objects[k] {
-		item := i.c.GetKey(obj)
-		if item == nil {
-			log.Errorf("Impossible missing item for %v", obj)
-			// This should be extremely rare, maybe impossible due to the mutex.
-			continue
+func (i index[K, O]) Lookup(k K) []O {
+	return i.LookupFiltered(k, nil)
+}
+
+// LookupFiltered finds objects matching a given key that are accepted by filter.
+// A nil filter returns all objects matching the key.
+//
+// The filter may be evaluated while a collection's read lock is held. It must not access or modify the
+// collection, its indexes, or its objects: attempting to acquire the read lock again can deadlock. Filters must be
+// short-lived and non-blocking, since they can delay collection updates.
+func (i index[K, O]) LookupFiltered(k K, filter func(O) bool) []O {
+	if i.indexer == nil {
+		return nil
+	}
+	return i.indexer.LookupFiltered(toString(k), filter)
+}
+
+func toString(rk any) string {
+	tk, ok := rk.(string)
+	if !ok {
+		return rk.(fmt.Stringer).String()
+	}
+	return tk
+}
+
+type indexCollection[K comparable, O any] struct {
+	idx      index[K, O]
+	id       collectionUID
+	metadata Metadata
+	// nolint: unused // (not true, its to implement an interface)
+	collectionName string
+	fromKey        func(string) any
+}
+
+// nolint: unused // (not true, its to implement an interface)
+func (i indexCollection[K, O]) name() string {
+	return i.collectionName
+}
+
+// nolint: unused // (not true, its to implement an interface)
+func (i indexCollection[K, O]) uid() collectionUID {
+	return i.id
+}
+
+// nolint: unused // (not true, its to implement an interface)
+func (i indexCollection[K, O]) dump() CollectionDump {
+	return CollectionDump{
+		Outputs:         i.dumpOutput(),
+		InputCollection: i.idx.c.name(),
+		Synced:          i.HasSynced(),
+	}
+}
+
+// nolint: unused // (not true, its to implement an interface)
+func (i indexCollection[K, O]) augment(a any) any {
+	return a
+}
+
+// nolint: unused // (not true, its to implement an interface)
+func (i indexCollection[K, O]) index(name string, extract func(o IndexObject[K, O]) []string) indexer[IndexObject[K, O]] {
+	panic("an index cannot be indexed")
+}
+
+func (i indexCollection[K, O]) GetKey(k string) *IndexObject[K, O] {
+	tk := i.fromKey(k).(K)
+	objs := i.idx.Lookup(tk)
+	if len(objs) == 0 {
+		return nil
+	}
+	return &IndexObject[K, O]{
+		Key:     tk,
+		Objects: objs,
+	}
+}
+
+// ListFiltered returns index objects accepted by filter. A nil filter returns all index objects.
+//
+// The filter may be evaluated while a collection's read lock is held. It must not access or modify the
+// collection, its indexes, or its objects: attempting to acquire the read lock again can deadlock. Filters must be
+// short-lived and non-blocking, since they can delay collection updates.
+func (i indexCollection[K, O]) ListFiltered(filter func(IndexObject[K, O]) bool) []IndexObject[K, O] {
+	keys := sets.New[K]()
+	i.idx.c.ListFiltered(func(oo O) bool {
+		keys.InsertAll(i.idx.extractKeys(oo)...)
+		return false
+	})
+	var res []IndexObject[K, O]
+	if filter == nil {
+		res = make([]IndexObject[K, O], 0, len(keys))
+	}
+	for k := range keys {
+		v := *i.GetKey(toString(k))
+		if filter == nil || filter(v) {
+			res = append(res, v)
 		}
-		res = append(res, *item)
 	}
 	return res
 }
 
-// CreateIndex creates a simple index, keyed by key K, over an informer for O. This is similar to
-// NewInformer.AddIndex, but is easier to use and can be added after an informer has already started.
-func CreateIndex[I any, K comparable](
-	c Collection[I],
-	extract func(o I) []K,
-) *Index[I, K] {
-	idx := Index[I, K]{
-		objects: make(map[K]sets.Set[Key[I]]),
-		c:       c,
-		mu:      sync.RWMutex{},
+// dumpOutput dumps the current state. This has no synchronization, so it's not perfect.
+// This will not result in a Go level data-race, but can give incorrect information so is best-effort only.
+// nolint: unused // (not true...)
+func (i indexCollection[K, O]) dumpOutput() map[string]any {
+	o := i.idx.c.List()
+	keys := sets.New[K]()
+	for _, oo := range o {
+		keys.InsertAll(i.idx.extractKeys(oo)...)
 	}
-	c.Register(func(o Event[I]) {
-		idx.mu.Lock()
-		defer idx.mu.Unlock()
+	res := map[string]any{}
+	for k := range keys {
+		ks := toString(k)
+		res[ks] = *i.GetKey(ks)
+	}
+	return res
+}
 
-		if o.Old != nil {
-			obj := *o.Old
-			key := GetKey(obj)
-			for _, indexKey := range extract(obj) {
-				sets.DeleteCleanupLast(idx.objects, indexKey, key)
+func (i indexCollection[K, O]) WaitUntilSynced(stop <-chan struct{}) bool {
+	return i.idx.c.WaitUntilSynced(stop)
+}
+
+func (i indexCollection[K, O]) HasSynced() bool {
+	return i.idx.c.HasSynced()
+}
+
+func (i indexCollection[K, O]) Metadata() Metadata {
+	return i.metadata
+}
+
+func (i indexCollection[K, O]) RegisterBatch(f func(o []Event[IndexObject[K, O]]), runExistingState bool) HandlerRegistration {
+	return i.idx.c.RegisterBatch(func(o []Event[O]) {
+		allKeys := sets.New[K]()
+		for _, ev := range o {
+			if ev.Old != nil {
+				allKeys.InsertAll(i.idx.extractKeys(*ev.Old)...)
+			}
+			if ev.New != nil {
+				allKeys.InsertAll(i.idx.extractKeys(*ev.New)...)
 			}
 		}
-		if o.New != nil {
-			obj := *o.New
-			key := GetKey(obj)
-			for _, indexKey := range extract(obj) {
-				sets.InsertOrNew(idx.objects, indexKey, key)
+		downstream := make([]Event[IndexObject[K, O]], 0, len(allKeys))
+		for key := range allKeys {
+			v := i.GetKey(toString(key))
+			// Due to the semantics around indexes, we cannot reasonably compute exactly correctly.
+			// However, we don't really need to: simply triggering an Add/Delete is close enough to work.
+			// Building a collection from an indexCollection only uses the events to determine the changed keys, which is
+			// available with this information.
+			if v == nil {
+				downstream = append(downstream, Event[IndexObject[K, O]]{
+					Old:   &IndexObject[K, O]{Key: key, Objects: nil},
+					Event: controllers.EventDelete,
+				})
+			} else {
+				downstream = append(downstream, Event[IndexObject[K, O]]{
+					New:   v,
+					Event: controllers.EventAdd,
+				})
 			}
 		}
-	})
+		f(downstream)
+	}, runExistingState)
+}
 
-	return &idx
+// UnnamedIndex creates a simple index, keyed by key K, over a collection for O. This is similar to
+// Informer.AddIndex, but is easier to use and can be added after an informer has already started.
+//
+// This differs from NewIndex in that it does not require a name. A name can be passed to dedupe indexes by the same name;
+// however, when not intended to dedupe, this can lead to accidental deduping.
+func UnnamedIndex[K comparable, O any](
+	c Collection[O],
+	extract func(o O) []K,
+) Index[K, O] {
+	// We just need some unique key, any will do
+	key := fmt.Sprintf("%p", extract)
+
+	return NewIndex(c, key, extract)
+}
+
+// FetchIndexObjects fetches all objects from the index that match the given key.
+func FetchIndexObjects[K comparable, O any](ctx HandlerContext, index IndexCollection[K, O], name K) []O {
+	res := FetchOne(ctx, index, FilterKey(toString(name)))
+	if res == nil {
+		return nil
+	}
+	return res.Objects
 }

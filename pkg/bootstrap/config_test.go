@@ -15,20 +15,22 @@
 package bootstrap
 
 import (
-	"encoding/json"
+	"math"
 	"os"
 	"reflect"
+	"regexp"
 	"testing"
 
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	. "github.com/onsi/gomega"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/kubectl/pkg/util/fieldpath"
 
 	"istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/bootstrap/option"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/version"
 )
 
@@ -118,6 +120,20 @@ func TestGetNodeMetaData(t *testing.T) {
 	g.Expect(node.Metadata.Labels[model.LocalityLabel]).To(Equal("region/zone/subzone"))
 }
 
+func TestGetNodeMetaDataSecureMetricsPorts(t *testing.T) {
+	node, err := GetNodeMetaData(MetadataOptions{
+		ID:                           "test",
+		Envs:                         os.Environ(),
+		EnvoySecureMetricsPort:       15091,
+		EnvoySecureMergedMetricsPort: 15092,
+	})
+
+	g := NewWithT(t)
+	g.Expect(err).Should(BeNil())
+	g.Expect(node.Metadata.EnvoySecureMetricsPort).To(Equal(15091))
+	g.Expect(node.Metadata.EnvoySecureMergedMetricsPort).To(Equal(15092))
+}
+
 func TestSetIstioVersion(t *testing.T) {
 	test.SetForTest(t, &version.Info.Version, "binary")
 
@@ -148,131 +164,6 @@ func TestSetIstioVersion(t *testing.T) {
 			ret := SetIstioVersion(tc.meta)
 			if ret.IstioVersion != tc.expectedVersion {
 				t.Fatalf("SetIstioVersion: expected '%s', got '%s'", tc.expectedVersion, ret.IstioVersion)
-			}
-		})
-	}
-}
-
-func TestConvertNodeMetadata(t *testing.T) {
-	node := &model.Node{
-		ID: "test",
-		Metadata: &model.BootstrapNodeMetadata{
-			NodeMetadata: model.NodeMetadata{
-				ProxyConfig: &model.NodeMetaProxyConfig{
-					ClusterName: &v1alpha1.ProxyConfig_ServiceCluster{
-						ServiceCluster: "cluster",
-					},
-				},
-			},
-			Owner: "real-owner",
-		},
-		RawMetadata: map[string]any{},
-	}
-	node.Metadata.Owner = "real-owner"
-	node.RawMetadata["OWNER"] = "fake-owner"
-	node.RawMetadata["UNKNOWN"] = "new-field"
-	node.RawMetadata["A"] = 1
-	node.RawMetadata["B"] = map[string]any{"b": 1}
-
-	out := ConvertNodeToXDSNode(node)
-	{
-		b, err := protomarshal.MarshalProtoNames(out)
-		if err != nil {
-			t.Fatalf("failed to marshal: %v", err)
-		}
-		// nolint: lll
-		want := `{"id":"test","cluster":"cluster","metadata":{"A":1,"B":{"b":1},"OWNER":"real-owner","PROXY_CONFIG":{"serviceCluster":"cluster"},"UNKNOWN":"new-field"}}`
-		test.JSONEquals(t, want, string(b))
-	}
-
-	node2 := ConvertXDSNodeToNode(out)
-	{
-		got, err := json.Marshal(node2)
-		if err != nil {
-			t.Fatalf("failed to marshal: %v", err)
-		}
-		// nolint: lll
-		want := `{"ID":"test","Metadata":{"PROXY_CONFIG":{"serviceCluster":"cluster"},"OWNER":"real-owner"},"RawMetadata":null,"Locality":null}`
-		if want != string(got) {
-			t.Fatalf("ConvertXDSNodeToNode: got %q, want %q", string(got), want)
-		}
-	}
-}
-
-func TestConvertNodeServiceClusterNaming(t *testing.T) {
-	cases := []struct {
-		name        string
-		proxyCfg    *model.NodeMetaProxyConfig
-		labels      map[string]string
-		wantCluster string
-	}{
-		{
-			name:        "no cluster name (no labels)",
-			proxyCfg:    &model.NodeMetaProxyConfig{},
-			wantCluster: "istio-proxy.bar",
-		},
-		{
-			name:        "no cluster name (defaults)",
-			proxyCfg:    &model.NodeMetaProxyConfig{},
-			labels:      map[string]string{"app": "foo"},
-			wantCluster: "foo.bar",
-		},
-		{
-			name: "service cluster",
-			proxyCfg: &model.NodeMetaProxyConfig{
-				ClusterName: &v1alpha1.ProxyConfig_ServiceCluster{
-					ServiceCluster: "foo",
-				},
-			},
-			wantCluster: "foo",
-		},
-		{
-			name: "trace service name (app label and namespace)",
-			proxyCfg: &model.NodeMetaProxyConfig{
-				ClusterName: &v1alpha1.ProxyConfig_TracingServiceName_{
-					TracingServiceName: v1alpha1.ProxyConfig_APP_LABEL_AND_NAMESPACE,
-				},
-			},
-			labels:      map[string]string{"app": "foo"},
-			wantCluster: "foo.bar",
-		},
-		{
-			name: "trace service name (canonical name)",
-			proxyCfg: &model.NodeMetaProxyConfig{
-				ClusterName: &v1alpha1.ProxyConfig_TracingServiceName_{
-					TracingServiceName: v1alpha1.ProxyConfig_CANONICAL_NAME_ONLY,
-				},
-			},
-			labels:      map[string]string{"service.istio.io/canonical-name": "foo"},
-			wantCluster: "foo",
-		},
-		{
-			name: "trace service name (canonical name and namespace)",
-			proxyCfg: &model.NodeMetaProxyConfig{
-				ClusterName: &v1alpha1.ProxyConfig_TracingServiceName_{
-					TracingServiceName: v1alpha1.ProxyConfig_CANONICAL_NAME_AND_NAMESPACE,
-				},
-			},
-			labels:      map[string]string{"service.istio.io/canonical-name": "foo"},
-			wantCluster: "foo.bar",
-		},
-	}
-
-	for _, v := range cases {
-		t.Run(v.name, func(tt *testing.T) {
-			node := &model.Node{
-				ID: "test",
-				Metadata: &model.BootstrapNodeMetadata{
-					NodeMetadata: model.NodeMetadata{
-						ProxyConfig: v.proxyCfg,
-						Labels:      v.labels,
-						Namespace:   "bar",
-					},
-				},
-			}
-			out := ConvertNodeToXDSNode(node)
-			if got, want := out.Cluster, v.wantCluster; got != want {
-				tt.Errorf("ConvertNodeToXDSNode(%#v) => cluster = %s; want %s", node, got, want)
 			}
 		})
 	}
@@ -315,6 +206,304 @@ func TestGetStatOptions(t *testing.T) {
 			inclusionSuffixes := templateParams["inclusionSuffix"]
 			if !reflect.DeepEqual(inclusionSuffixes, tc.wantInclusionSuffixes) {
 				tt.Errorf("unexpected inclusion suffixes. want: %v, got: %v", tc.wantInclusionSuffixes, inclusionSuffixes)
+			}
+		})
+	}
+}
+
+func TestRequiredEnvoyStatsMatcherInclusionRegexes(t *testing.T) {
+	ok, _ := regexp.MatchString(requiredEnvoyStatsMatcherInclusionRegexes, "vhost.default.local:18000.route.routev1.upstream_rq_200")
+	if !ok {
+		t.Fatal("requiredEnvoyStatsMatcherInclusionRegexes doesn't match the route's stat_prefix")
+	}
+}
+
+func TestServiceClusterOrDefault(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		metadata *model.BootstrapNodeMetadata
+		expected string
+	}{
+		{
+			name:  "non-empty name that is not istio-proxy",
+			input: "my-service",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app": "test"},
+				},
+			},
+			expected: "my-service",
+		},
+		{
+			name:  "app label takes priority over workload name for backward compatibility",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+						"app":                    "legacy-app",
+					},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "app label takes priority for backward compatibility",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+						"app":                    "legacy-app",
+					},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "app.kubernetes.io/name used when app not present",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+					},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "empty name with only app label",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app": "legacy-app"},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "canonical service label used as last fallback when no app labels",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						model.IstioCanonicalServiceLabelName: "canonical-name",
+					},
+				},
+			},
+			expected: "canonical-name.default",
+		},
+		{
+			name:  "istio-proxy name falls back to labels first then workload name",
+			input: "istio-proxy",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+					Labels:       map[string]string{"app.kubernetes.io/name": "k8s-app"},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "workload name used when no labels present",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+				},
+			},
+			expected: "my-workload.default",
+		},
+		{
+			name:  "istio-proxy name falls back to labels when no workload name",
+			input: "istio-proxy",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app.kubernetes.io/name": "k8s-app"},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "no labels and no workload name falls back to istio-proxy",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+				},
+			},
+			expected: "istio-proxy.default",
+		},
+		{
+			name:  "no namespace returns just istio-proxy",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{},
+			},
+			expected: "istio-proxy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := serviceClusterOrDefault(tt.input, tt.metadata)
+			if result != tt.expected {
+				t.Errorf("serviceClusterOrDefault() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestZoneAwareRoutingTemplateParam(t *testing.T) {
+	cases := []struct {
+		name   string
+		envVal string
+		want   bool
+	}{
+		{"disabled", "", false},
+		{"enabled", "true", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envs := os.Environ()
+			if tc.envVal != "" {
+				envs = append(envs, "ISTIO_META_ENABLE_SELF_DISCOVERY="+tc.envVal)
+			}
+			node, err := GetNodeMetaData(MetadataOptions{
+				ID:          "sidecar~1.2.3.4~foo~bar",
+				Envs:        envs,
+				ProxyConfig: &v1alpha1.ProxyConfig{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			params, err := (Config{Node: node}).toTemplateParams()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := params["enable_self_discovery"].(bool)
+			if got != tc.want {
+				t.Errorf("enable_self_discovery = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGlobalDownstreamConnectionLimitPrecedence(t *testing.T) {
+	tests := []struct {
+		name     string
+		node     *model.Node
+		expected int
+	}{
+		{
+			name: "connection_settings takes precedence over metadata",
+			node: &model.Node{
+				Metadata: &model.BootstrapNodeMetadata{
+					NodeMetadata: model.NodeMetadata{
+						ProxyConfig: &model.NodeMetaProxyConfig{
+							ConnectionSettings: &v1alpha1.ProxyConfig_ConnectionSettings{
+								GlobalDownstreamConnectionLimit: &wrappers.Int32Value{Value: 25000},
+							},
+							ProxyMetadata: map[string]string{
+								GlobalDownstreamMaxConnections: "10000",
+							},
+						},
+					},
+				},
+				Locality: &core.Locality{},
+			},
+			expected: 25000,
+		},
+		{
+			name: "connection_settings takes precedence over runtime",
+			node: &model.Node{
+				Metadata: &model.BootstrapNodeMetadata{
+					NodeMetadata: model.NodeMetadata{
+						ProxyConfig: &model.NodeMetaProxyConfig{
+							ConnectionSettings: &v1alpha1.ProxyConfig_ConnectionSettings{
+								GlobalDownstreamConnectionLimit: &wrappers.Int32Value{Value: 30000},
+							},
+							RuntimeValues: map[string]string{
+								"overload.global_downstream_max_connections": "5000",
+							},
+						},
+					},
+				},
+				Locality: &core.Locality{},
+			},
+			expected: 30000,
+		},
+		{
+			name: "metadata used when connection_settings not set",
+			node: &model.Node{
+				Metadata: &model.BootstrapNodeMetadata{
+					NodeMetadata: model.NodeMetadata{
+						ProxyConfig: &model.NodeMetaProxyConfig{
+							ProxyMetadata: map[string]string{
+								GlobalDownstreamMaxConnections: "10000",
+							},
+						},
+					},
+				},
+				Locality: &core.Locality{},
+			},
+			expected: 10000,
+		},
+		{
+			name: "runtime used when nothing else set",
+			node: &model.Node{
+				Metadata: &model.BootstrapNodeMetadata{
+					NodeMetadata: model.NodeMetadata{
+						ProxyConfig: &model.NodeMetaProxyConfig{
+							RuntimeValues: map[string]string{
+								"overload.global_downstream_max_connections": "5000",
+							},
+						},
+					},
+				},
+				Locality: &core.Locality{},
+			},
+			expected: 5000,
+		},
+		{
+			name: "default when nothing set",
+			node: &model.Node{
+				Metadata: &model.BootstrapNodeMetadata{
+					NodeMetadata: model.NodeMetadata{
+						ProxyConfig: &model.NodeMetaProxyConfig{},
+					},
+				},
+				Locality: &core.Locality{},
+			},
+			expected: math.MaxInt32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := getNodeMetadataOptions(tt.node, "")
+			params, err := option.NewTemplateParams(opts...)
+			if err != nil {
+				t.Fatalf("NewTemplateParams failed: %v", err)
+			}
+			got, ok := params["global_downstream_max_connections"]
+			if !ok {
+				t.Fatal("global_downstream_max_connections not found in template params")
+			}
+			if got != tt.expected {
+				t.Errorf("global_downstream_max_connections = %v, want %v", got, tt.expected)
 			}
 		})
 	}

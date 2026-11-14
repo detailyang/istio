@@ -15,6 +15,7 @@
 package status
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -33,30 +34,34 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/klauspost/compress/gzhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
-	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcHealth "google.golang.org/grpc/health/grpc_health_v1"
 	grpcStatus "google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"google.golang.org/protobuf/proto"
 	k8sUtilIo "k8s.io/utils/io"
 
 	"istio.io/istio/pilot/cmd/pilot-agent/metrics"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/grpcready"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config"
+	"istio.io/istio/pilot/pkg/features"
 	dnsProto "istio.io/istio/pkg/dns/proto"
 	"istio.io/istio/pkg/env"
+	commonFeatures "istio.io/istio/pkg/features"
 	"istio.io/istio/pkg/kube/apimirror"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/slices"
+	istioNetUtil "istio.io/istio/pkg/util/net"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 const (
@@ -77,6 +82,10 @@ const (
 	maxRespBodyLength = 10 * 1 << 10
 )
 
+// probes is a logging scope for probe responses. Since these logs are about the application, not Istio, users may need
+// to configure them to meet their preferences.
+var probes = log.RegisterScope("probes", "Status of forwarded application probes")
+
 var (
 	UpstreamLocalAddressIPv4 = &net.TCPAddr{IP: net.ParseIP("127.0.0.6")}
 	UpstreamLocalAddressIPv6 = &net.TCPAddr{IP: net.ParseIP("::6")}
@@ -85,7 +94,7 @@ var (
 var PrometheusScrapingConfig = env.Register("ISTIO_PROMETHEUS_ANNOTATIONS", "", "")
 
 var (
-	appProberPattern = regexp.MustCompile(`^/app-health/[^/]+/(livez|readyz|startupz)$`)
+	appProberPattern = regexp.MustCompile(`^/(app-health|app-lifecycle)/[^/]+/(livez|readyz|startupz|prestopz|poststartz)$`)
 
 	EnableHTTP2Probing = env.Register("ISTIO_ENABLE_HTTP2_PROBING", true,
 		"If enabled, HTTP2 probes will be enabled for HTTPS probes, following Kubernetes").Get()
@@ -132,8 +141,9 @@ type Options struct {
 	EnableProfiling     bool
 	// PrometheusRegistry to use. Just for testing.
 	PrometheusRegistry prometheus.Gatherer
-	Shutdown           context.CancelFunc
+	Shutdown           context.CancelCauseFunc
 	TriggerDrain       func()
+	DisableDrain       func()
 }
 
 // Server provides an endpoint for handling status probes.
@@ -153,9 +163,18 @@ type Server struct {
 	http                  *http.Client
 	enableProfiling       bool
 	registry              prometheus.Gatherer
-	shutdown              context.CancelFunc
+	shutdown              context.CancelCauseFunc
 	drain                 func()
+	disableDrain          func()
+
+	// maxAppBodyBytes caps the per-target app metrics body to bound agent memory
+	// across N concurrent scrape targets. Reads above the cap are dropped as failures
+	// and incremented on AppScrapeErrors. Defaults to defaultMaxAppMetricsBodyBytes;
+	// tests may override via the struct literal.
+	maxAppBodyBytes int
 }
+
+const defaultMaxAppMetricsBodyBytes = 10 * 1024 * 1024 // 10 MiB
 
 func initializeMonitoring() (prometheus.Gatherer, error) {
 	registry := prometheus.NewRegistry()
@@ -220,10 +239,10 @@ func NewServer(config Options) (*Server, error) {
 		config:                config,
 		enableProfiling:       config.EnableProfiling,
 		registry:              registry,
-		shutdown: func() {
-			config.Shutdown()
-		},
-		drain: config.TriggerDrain,
+		shutdown:              config.Shutdown,
+		drain:                 config.TriggerDrain,
+		disableDrain:          config.DisableDrain,
+		maxAppBodyBytes:       defaultMaxAppMetricsBodyBytes,
 	}
 	if LegacyLocalhostProbeDestination.Get() {
 		s.appProbersDestination = "localhost"
@@ -242,16 +261,49 @@ func NewServer(config Options) (*Server, error) {
 		log.Infof("Prometheus scraping configuration: %v", prom)
 		if prom.Scrape != "false" {
 			s.prometheus = &prom
-			if s.prometheus.Path == "" {
-				s.prometheus.Path = "/metrics"
+			if len(s.prometheus.Targets) == 0 {
+				// Legacy path: apply defaults and synthesize a single Targets entry.
+				if s.prometheus.Path == "" {
+					s.prometheus.Path = "/metrics"
+				}
+				if s.prometheus.Port == "" {
+					s.prometheus.Port = "80"
+				}
+				if s.prometheus.Port == strconv.Itoa(int(config.StatusPort)) {
+					return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
+						"application port is the same as agent port, which may lead to a recursive loop. "+
+						"Ensure pod does not have prometheus.io/port=%d label, or that injection is not happening multiple times", config.StatusPort)
+				}
+				s.prometheus.Targets = []ScrapeTarget{{Port: s.prometheus.Port, Path: s.prometheus.Path}}
+			} else {
+				// New-format path: populate legacy Port/Path from Targets[0] if absent so that
+				// handleStats (which reads Port/Path directly) scrapes the primary endpoint correctly.
+				if s.prometheus.Port == "" {
+					s.prometheus.Port = s.prometheus.Targets[0].Port
+				}
+				if s.prometheus.Path == "" {
+					s.prometheus.Path = s.prometheus.Targets[0].Path
+				}
 			}
-			if s.prometheus.Port == "" {
-				s.prometheus.Port = "80"
-			}
-			if s.prometheus.Port == strconv.Itoa(int(config.StatusPort)) {
-				return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
-					"application port is the same as agent port, which may lead to a recursive loop. "+
-					"Ensure pod does not have prometheus.io/port=%d label, or that injection is not happening multiple times", config.StatusPort)
+			// Default path and validate every target port numerically to catch leading-zero
+			// representations (e.g. "015020" dials 15020 at runtime but != "15020" as a string).
+			for i, t := range s.prometheus.Targets {
+				if t.Path == "" {
+					s.prometheus.Targets[i].Path = "/metrics"
+				}
+				portNum, atoiErr := strconv.Atoi(t.Port)
+				if atoiErr != nil || portNum < 1 || portNum > 65535 {
+					return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
+						"invalid target port %q", t.Port)
+				}
+				if portNum == int(config.StatusPort) {
+					return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
+						"target port %s is the same as agent port, which may lead to a recursive loop", t.Port)
+				}
+				if reason, reserved := IstioReservedPortReason(strconv.Itoa(portNum)); reserved {
+					return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
+						"target port %s is reserved for Istio (%s) and cannot be scraped", t.Port, reason)
+				}
 			}
 		}
 	}
@@ -275,16 +327,13 @@ func NewServer(config Options) (*Server, error) {
 			d.LocalAddr = s.upstreamLocalAddress
 			// nolint: gosec
 			// This is matching Kubernetes. It is a reasonable usage of this, as it is just a health check over localhost.
-			transport, err := setTransportDefaults(&http.Transport{
+			transport := setTransportDefaults(&http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 				DialContext:     d.DialContext,
 				// https://github.com/kubernetes/kubernetes/blob/0153febd9f0098d4b8d0d484927710eaf899ef40/pkg/probe/http/http.go#L55
 				// Match Kubernetes logic. This also ensures idle timeouts do not trigger probe failures
 				DisableKeepAlives: !ProbeKeepaliveConnections,
 			})
-			if err != nil {
-				return nil, err
-			}
 			// Construct a http client and cache it in order to reuse the connection.
 			s.appProbeClient[path] = &http.Client{
 				Timeout: time.Duration(prober.TimeoutSeconds) * time.Second,
@@ -339,10 +388,10 @@ func validateAppKubeProber(path string, prober *Prober) error {
 	if count != 1 {
 		return fmt.Errorf(`invalid prober type, must be one of type httpGet, tcpSocket or gRPC`)
 	}
-	if prober.HTTPGet != nil && prober.HTTPGet.Port.Type != intstr.Int {
+	if prober.HTTPGet != nil && prober.HTTPGet.Port.Type != apimirror.Int {
 		return fmt.Errorf("invalid prober config for %v, the port must be int type", path)
 	}
-	if prober.TCPSocket != nil && prober.TCPSocket.Port.Type != intstr.Int {
+	if prober.TCPSocket != nil && prober.TCPSocket.Port.Type != apimirror.Int {
 		return fmt.Errorf("invalid prober config for %v, the port must be int type", path)
 	}
 	return nil
@@ -350,13 +399,15 @@ func validateAppKubeProber(path string, prober *Prober) error {
 
 // FormatProberURL returns a set of HTTP URLs that pilot agent will serve to take over Kubernetes
 // app probers.
-func FormatProberURL(container string) (string, string, string) {
+func FormatProberURL(container string) (string, string, string, string, string) {
 	return fmt.Sprintf("/app-health/%v/readyz", container),
 		fmt.Sprintf("/app-health/%v/livez", container),
-		fmt.Sprintf("/app-health/%v/startupz", container)
+		fmt.Sprintf("/app-health/%v/startupz", container),
+		fmt.Sprintf("/app-lifecycle/%v/prestopz", container),
+		fmt.Sprintf("/app-lifecycle/%v/poststartz", container)
 }
 
-// Run opens a the status port and begins accepting probes.
+// Run opens the status port and begins accepting probes.
 func (s *Server) Run(ctx context.Context) {
 	log.Infof("Opening status port %d", s.statusPort)
 
@@ -372,6 +423,7 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc(drainPath, s.handleDrain)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
+	mux.HandleFunc("/app-lifecycle/", s.handleAppProbe)
 
 	if s.enableProfiling {
 		// Add the handler for pprof.
@@ -399,7 +451,7 @@ func (s *Server) Run(ctx context.Context) {
 	defer l.Close()
 
 	go func() {
-		if err := http.Serve(l, mux); err != nil {
+		if err := http.Serve(l, gzhttp.GzipHandler(mux)); err != nil {
 			if network.IsUnexpectedListenerError(err) {
 				log.Error(err)
 			}
@@ -421,7 +473,7 @@ func (s *Server) Run(ctx context.Context) {
 }
 
 func (s *Server) handlePprofIndex(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -430,7 +482,7 @@ func (s *Server) handlePprofIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePprofCmdline(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -439,7 +491,7 @@ func (s *Server) handlePprofCmdline(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePprofSymbol(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -448,7 +500,7 @@ func (s *Server) handlePprofSymbol(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePprofProfile(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -457,7 +509,7 @@ func (s *Server) handlePprofProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePprofTrace(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -493,20 +545,71 @@ func (s *Server) isReady() error {
 	return nil
 }
 
-func isRequestFromLocalhost(r *http.Request) bool {
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return false
-	}
-
-	userIP := net.ParseIP(ip)
-	return userIP.IsLoopback()
+// ScrapeTarget represents a single application metrics endpoint to scrape.
+type ScrapeTarget struct {
+	Port string `json:"port"`
+	Path string `json:"path"`
 }
 
 type PrometheusScrapeConfiguration struct {
-	Scrape string `json:"scrape"`
-	Path   string `json:"path"`
-	Port   string `json:"port"`
+	Scrape  string         `json:"scrape"`
+	Path    string         `json:"path"`
+	Port    string         `json:"port"`
+	Targets []ScrapeTarget `json:"targets,omitempty"`
+}
+
+// IsEmpty reports whether no scrape configuration is set.
+func (p PrometheusScrapeConfiguration) IsEmpty() bool {
+	return p.Scrape == "" && p.Path == "" && p.Port == "" && len(p.Targets) == 0
+}
+
+// istioReservedPorts are data-plane ports the Istio sidecar/agent owns. Users must
+// not point metrics-merging scrape targets at any of these: they either hit a
+// non-application surface (admin, tunnel, traffic capture, DNS) or would create a
+// recursive / double-counted scrape (15020 is the merged endpoint itself; 15090 is
+// Envoy's raw Prom output, already merged).
+var istioReservedPorts = map[string]string{
+	"15000": "Envoy admin",
+	"15001": "outbound traffic capture",
+	"15004": "pilot debug",
+	"15006": "inbound traffic capture",
+	"15008": "HBONE tunnel",
+	"15020": "pilot-agent status / merged Prometheus",
+	"15021": "Envoy health",
+	"15053": "DNS proxy",
+	"15090": "Envoy Prometheus (already merged)",
+}
+
+// IstioReservedPortReason returns the human-readable reason port is reserved by the
+// Istio data plane, along with whether it is reserved. Callers should surface the
+// reason to users; the error message is more actionable when users see *why*.
+func IstioReservedPortReason(port string) (string, bool) {
+	reason, ok := istioReservedPorts[port]
+	return reason, ok
+}
+
+// ParseScrapeTargets parses a comma-separated list of "port:path" pairs into ScrapeTargets.
+// Whitespace is trimmed from each entry. An empty path defaults to "/metrics".
+// Returns an error if any entry has an empty port.
+func ParseScrapeTargets(raw string) ([]ScrapeTarget, error) {
+	var targets []ScrapeTarget
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 2)
+		port := strings.TrimSpace(parts[0])
+		if port == "" {
+			return nil, fmt.Errorf("empty port in scrape target %q", entry)
+		}
+		path := "/metrics"
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			path = strings.TrimSpace(parts[1])
+		}
+		targets = append(targets, ScrapeTarget{Port: port, Path: path})
+	}
+	return targets, nil
 }
 
 // handleStats handles prometheus stats scraping. This will scrape envoy metrics, and, if configured,
@@ -516,7 +619,24 @@ type PrometheusScrapeConfiguration struct {
 // This merging works for both FmtText and FmtOpenMetrics and will use the format of the application metrics
 // Note that we do not return any errors here. If we do, we will drop metrics. For example, the app may be having issues,
 // but we still want Envoy metrics. Instead, errors are tracked in the failed scrape metrics/logs.
+// handleStats handles prometheus stats scraping. This will scrape envoy metrics, and, if configured,
+// the application metrics and merge them together.
+// The merge here is a simple string concatenation for the all-text and all-OpenMetrics cases.
+// This works for almost all cases, assuming the application is not exposing the same metrics as Envoy.
+// When at least one upstream advertises the delimited Prometheus protobuf format
+// (application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited
+// — required for native Prometheus histograms), the merger switches to a parse-and-re-encode
+// path that decodes each upstream into MetricFamily values, gathers agent self-metrics, and
+// re-emits the merged stream in the negotiated format. Mixed formats (e.g. one proto upstream
+// and one text upstream) downgrade to text — converting text to proto would require the
+// CPU/memory cost-comparison study mandated by the Istio TOC and is deferred to a follow-up.
+// Note that we do not return any errors here. If we do, we will drop metrics. For example, the app may be having issues,
+// but we still want Envoy metrics. Instead, errors are tracked in the failed scrape metrics/logs.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if commonFeatures.MetricsLocalhostAccessOnly && !istioNetUtil.IsRequestFromLocalhost(r) {
+		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
+		return
+	}
 	metrics.ScrapeTotals.Increment()
 	var err error
 	var envoy, application io.ReadCloser
@@ -542,32 +662,134 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Gather all the metrics we will merge
-	if !s.config.NoEnvoy {
-		if envoy, envoyCancel, _, err = s.scrape(fmt.Sprintf("http://localhost:%d/stats/prometheus", s.envoyStatsPort), r.Header); err != nil {
+	// Gather all the metrics we will merge.
+	var envoyFormat expfmt.Format
+	if !s.config.NoEnvoy && features.AgentMergeEnvoyStats {
+		scrapeURL := fmt.Sprintf("http://localhost:%d/stats/prometheus", s.envoyStatsPort)
+		if r.URL != nil && len(r.URL.RawQuery) > 0 {
+			scrapeURL = fmt.Sprintf("%s?%s", scrapeURL, r.URL.RawQuery)
+		}
+		var envoyCT string
+		if envoy, envoyCancel, envoyCT, err = s.scrape(scrapeURL, r.Header); err != nil {
 			log.Errorf("failed scraping envoy metrics: %v", err)
 			metrics.EnvoyScrapeErrors.Increment()
+		} else {
+			envoyFormat = negotiateMetricsFormat(envoyCT)
 		}
 	}
 
-	// Scrape app metrics if defined and capture their format
-	var format expfmt.Format
+	// Scrape app metrics. Multi-target buffers each response so we can rewrite the
+	// OpenMetrics "# EOF" trailer; single-target streams via io.Copy.
+	var appFormat expfmt.Format
+	var appBodies [][]byte
+	// appBodyFormats is the per-body negotiated format for the multi-target case.
+	// When targets disagree (mixed proto/text), scrapeMultipleApps aggregates
+	// `appFormat` to FmtText, but the underlying body bytes are still in their
+	// original Content-Types. The proto path needs the per-body formats so a
+	// binary proto body is not text-parsed (which would silently drop the target).
+	var appBodyFormats []expfmt.Format
 	if s.prometheus != nil {
-		var contentType string
-		url := fmt.Sprintf("http://localhost:%s%s", s.prometheus.Port, s.prometheus.Path)
-		if application, appCancel, contentType, err = s.scrape(url, r.Header); err != nil {
-			log.Errorf("failed scraping application metrics: %v", err)
-			metrics.AppScrapeErrors.Increment()
+		if len(s.prometheus.Targets) > 1 {
+			appFormat, appBodies, appBodyFormats = s.scrapeMultipleApps(r)
+		} else {
+			var contentType string
+			if application, appCancel, contentType, err = s.scrape(appMetricsURL(s.prometheus.Port, s.prometheus.Path), r.Header); err != nil {
+				log.Errorf("failed scraping application metrics: %v", err)
+				metrics.AppScrapeErrors.Increment()
+			} else {
+				appFormat = negotiateMetricsFormat(contentType)
+			}
 		}
-		format = negotiateMetricsFormat(contentType)
-	} else {
-		// Without app metrics format use a default
-		format = expfmt.FmtText
 	}
 
-	w.Header().Set("Content-Type", string(format))
+	// Compute the negotiated output format.
+	//
+	//   1. If any upstream returns anything other than text/plain (i.e. proto or
+	//      OpenMetrics), we must parse-and-re-encode the merged stream. The
+	//      byte-concatenation fast path would otherwise corrupt the stream:
+	//      proto bodies can't be byte-merged with text, and an OpenMetrics body's
+	//      trailing "# EOF" would end up mid-stream when other sources are
+	//      appended after it. mergeFormat decides the output format and downgrades
+	//      to text on disagreement.
+	//
+	//   2. If every upstream is text/plain, the historical byte-concat behavior
+	//      is wire-correct and we preserve it for performance: the app's format
+	//      wins (matching the prior implementation that discarded the Envoy
+	//      content-type in single-target mode). When there is no app at all,
+	//      we default to FmtText.
+	//
+	// Behavior change vs prior istio releases: clients that previously requested
+	// protobuf and were force-downgraded to text by istio#60622 (because the
+	// merger could not safely combine proto with text) will now actually receive
+	// protobuf. For clients that did not request protobuf, the output is
+	// unchanged.
+	// Take the parse-and-re-encode merger path when either:
+	//   (a) any upstream advertised the delimited Prometheus protobuf format
+	//       (the byte-concat fast path cannot merge binary proto with text); or
+	//   (b) Envoy returns a non-text/plain body (e.g. OpenMetrics). The
+	//       byte-concat fast path writes Envoy bytes mid-stream, before app
+	//       bodies, so an OM "# EOF" in the Envoy body would land mid-stream
+	//       and corrupt the response. Today Envoy never serves OpenMetrics —
+	//       it only supports text/plain and proto — but the check defends
+	//       against any future Envoy format support without further code
+	//       changes here.
+	//
+	// All-text-plain and all-OpenMetrics-via-apps cases keep the byte-concat
+	// fast path (the multi-target loop already strips + reappends a single
+	// "# EOF" trailer; the single-target app body is the last thing written
+	// in this branch, so its own "# EOF" terminates the response correctly).
+	envoyNonText := envoyFormat != "" && envoyFormat.FormatType() != expfmt.TypeTextPlain
+	anyProto := envoyFormat.FormatType() == expfmt.TypeProtoDelim ||
+		appFormat.FormatType() == expfmt.TypeProtoDelim
+	needsParseMerge := anyProto || envoyNonText
 
-	// Write out the metrics
+	var outFormat expfmt.Format
+	if needsParseMerge {
+		outFormat = mergeFormat(envoyFormat, appFormat)
+	} else {
+		outFormat = appFormat
+		if outFormat == "" {
+			outFormat = FmtText
+		}
+	}
+
+	w.Header().Set("Content-Type", string(outFormat))
+
+	// Record the delivered format. A downgrade is "any upstream offered proto but we
+	// emitted text because another upstream did not". This is the metric a future
+	// PR3 (text→proto upconversion behind a feature gate) will optimize against.
+	switch {
+	case anyProto && outFormat.FormatType() != expfmt.TypeProtoDelim:
+		metrics.ScrapeFormatDowngraded.Increment()
+	default:
+		switch scrapeFormatLabel(outFormat) {
+		case metrics.ScrapeFormatLabelProto:
+			metrics.ScrapeFormatProto.Increment()
+		case metrics.ScrapeFormatLabelOpenMetrics:
+			metrics.ScrapeFormatOpenMetric.Increment()
+		default:
+			metrics.ScrapeFormatText.Increment()
+		}
+	}
+
+	// PARSE-AND-RE-ENCODE PATH: at least one upstream is non-text/plain. We must
+	// decode all upstream bodies (any text ones get decoded too — they will be
+	// re-encoded in outFormat below) and re-encode them as a single stream so the
+	// merged response is wire-correct. Byte concatenation is unsafe here because:
+	//   (1) when outFormat is proto, concatenating text and delimited bytes corrupts the stream;
+	//   (2) when outFormat is text (downgrade), the binary proto upstream cannot be passed through;
+	//   (3) when an OpenMetrics body carries a trailing "# EOF", concatenating
+	//       additional bodies after it lands the EOF marker mid-stream.
+	if needsParseMerge {
+		s.writeMergedProtoPath(w, outFormat, envoy, envoyFormat, application, appFormat, appBodies, appBodyFormats)
+		return
+	}
+
+	// TEXT / OPENMETRICS FAST PATH: byte-concatenation is wire-correct when
+	// Envoy is text/plain (or absent) and the apps return either text or
+	// OpenMetrics — the multi-target loop below strips and reappends a single
+	// "# EOF" terminator for the OM case, and the single-target branch writes
+	// the app body last so its own "# EOF" terminates the response.
 	if err = scrapeAndWriteAgentMetrics(s.registry, io.Writer(w)); err != nil {
 		log.Errorf("failed scraping and writing agent metrics: %v", err)
 		metrics.AgentScrapeErrors.Increment()
@@ -582,35 +804,445 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// App metrics must go last because if they are FmtOpenMetrics,
-	// they will have a trailing "# EOF" which terminates the full exposition
-	if application != nil {
-		_, err = io.Copy(w, application)
-		if err != nil {
+	// they will have a trailing "# EOF" which terminates the full exposition.
+	// The two branches are mutually exclusive: the dispatcher above sets exactly
+	// one of `application` (single-target streaming) or `appBodies` (multi-target buffered).
+	if appBodies != nil {
+		// Multi-target path: write each target's buffered body in Targets order.
+		// EOF-handling rule:
+		//   - Strip "# EOF" from every body unconditionally.
+		//   - When the negotiated format is OpenMetrics, append a single "# EOF\n" after
+		//     all bodies via expfmt.FinalizeOpenMetrics. When the format is text, no
+		//     terminator is appended.
+		// Newline rule: ensure a "\n" separates concatenated bodies in case a target
+		// response does not end with one. Split into a second w.Write so the stripped
+		// sub-slice does not trigger a body-sized append+realloc.
+		openMetrics := outFormat.FormatType() == expfmt.TypeOpenMetrics
+		for i, body := range appBodies {
+			if body == nil {
+				continue
+			}
+			out := stripOpenMetricsEOF(body)
+			if _, werr := w.Write(out); werr != nil {
+				log.Errorf("failed writing application metrics from target %d: %v", i, werr)
+				metrics.AppScrapeErrors.Increment()
+			} else if len(out) > 0 && out[len(out)-1] != '\n' {
+				if _, werr := w.Write([]byte{'\n'}); werr != nil {
+					log.Errorf("failed writing newline separator for target %d: %v", i, werr)
+					metrics.AppScrapeErrors.Increment()
+				}
+			}
+			// Release the body for GC before the next iteration; the merged response is
+			// already on the wire (or in the buffered ResponseWriter) at this point.
+			appBodies[i] = nil
+		}
+		if openMetrics {
+			if _, werr := expfmt.FinalizeOpenMetrics(w); werr != nil {
+				log.Errorf("failed writing application metrics EOF marker: %v", werr)
+				metrics.AppScrapeErrors.Increment()
+			}
+		}
+	} else if application != nil {
+		if _, err = io.Copy(w, application); err != nil {
 			log.Errorf("failed to scraping and writing application metrics: %v", err)
 			metrics.AppScrapeErrors.Increment()
 		}
 	}
 }
 
-func negotiateMetricsFormat(contentType string) expfmt.Format {
-	mediaType, params, err := mime.ParseMediaType(contentType)
-	if err == nil && mediaType == expfmt.OpenMetricsType {
-		switch params["version"] {
-		case expfmt.OpenMetricsVersion_1_0_0:
-			return expfmt.FmtOpenMetrics_1_0_0
-		case expfmt.OpenMetricsVersion_0_0_1, "":
-			return expfmt.FmtOpenMetrics_0_0_1
+// writeMergedProtoPath is the parse-and-re-encode merger used whenever at least one
+// upstream returned the delimited Prometheus protobuf format. It decodes every upstream
+// (proto and non-proto alike) into MetricFamily values, gathers the agent's own
+// MetricFamily values directly from the registry, and re-encodes the union in outFormat.
+//
+// Failure handling matches the text fast path: a malformed upstream is dropped with an
+// error log and a scrape-errors counter increment; the merged response still contains
+// the remaining upstreams and the agent self-metrics. Ordering inside the encoded
+// stream is envoy → agent → app(s); this preserves the agent-metrics-precede-trailer
+// invariant the text path relies on, which keeps log analyzers and grafana dashboards
+// happy when format negotiation flips back and forth.
+//
+// Memory safety: each external upstream Reader (Envoy and single-target app) is wrapped
+// in a body-cap LimitReader bounded by s.maxAppBodyBytes. Reading past the cap is
+// detected (we read cap+1 bytes) and surfaced as a per-upstream drop, mirroring the
+// multi-target text path's pre-existing cap in scrapeMultipleApps. The agent path
+// reads directly from the in-process registry and needs no cap.
+//
+// appBodyFormats is the per-body negotiated format for the multi-target case; the
+// merger decodes each buffered body in its own format so a binary proto body and a
+// text body in the same target list are both correctly parsed even though the
+// aggregated appFormat has been downgraded to text.
+//
+// Note: when an app upstream is text on the mixed-format downgrade path, the
+// underlying expfmt textDecoder emits MetricFamilies in Go map-iteration order,
+// which is non-deterministic across scrapes. Output is still wire-correct; only
+// the human-visible ordering of app metrics jitters between scrapes.
+func (s *Server) writeMergedProtoPath(
+	w io.Writer,
+	outFormat expfmt.Format,
+	envoy io.Reader,
+	envoyFormat expfmt.Format,
+	application io.Reader,
+	appFormat expfmt.Format,
+	appBodies [][]byte,
+	appBodyFormats []expfmt.Format,
+) {
+	enc := expfmt.NewEncoder(w, outFormat)
+
+	encodeAll := func(mfs []*dto.MetricFamily, errLabel string, counter monitoring.Metric) {
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				log.Errorf("failed encoding %s metric family %q: %v", errLabel, mf.GetName(), err)
+				counter.Increment()
+				return
+			}
 		}
 	}
-	return expfmt.FmtText
+
+	// decodeCapped wraps r in a body-cap LimitReader and runs the format-aware decoder.
+	// Returns the decoded families plus any error (parse error OR body-too-large).
+	// Partial decodes are preserved on overflow, matching the text path's behavior of
+	// surfacing whatever data was readable before the failure.
+	decodeCapped := func(r io.Reader, format expfmt.Format) ([]*dto.MetricFamily, error) {
+		bodyCap := int64(s.maxAppBodyBytes)
+		counted := &countingReader{R: io.LimitReader(r, bodyCap+1)}
+		mfs, err := decodeAll(counted, format)
+		if counted.N > bodyCap {
+			return mfs, fmt.Errorf("upstream body exceeds %d bytes; dropping", s.maxAppBodyBytes)
+		}
+		return mfs, err
+	}
+
+	// Envoy first.
+	if envoy != nil {
+		mfs, err := decodeCapped(envoy, envoyFormat)
+		if err != nil {
+			log.Errorf("failed decoding envoy metrics (format=%q): %v", envoyFormat, err)
+			metrics.EnvoyScrapeErrors.Increment()
+		}
+		encodeAll(mfs, "envoy", metrics.EnvoyScrapeErrors)
+	}
+
+	// Agent self-metrics: native MetricFamily values from the gatherer; no parse step.
+	mfs, err := s.registry.Gather()
+	if err != nil {
+		log.Errorf("failed gathering agent metrics: %v", err)
+		metrics.AgentScrapeErrors.Increment()
+	} else {
+		encodeAll(mfs, "agent", metrics.AgentScrapeErrors)
+	}
+
+	// Application metrics: either a single-target streaming body or multi-target
+	// buffered bodies, mirroring the text fast-path dispatch.
+	switch {
+	case appBodies != nil:
+		for i, body := range appBodies {
+			if body == nil {
+				continue
+			}
+			// Use the per-body negotiated format. When appBodyFormats is missing
+			// or short (defensive — shouldn't happen if scrapeMultipleApps is the
+			// only producer), fall back to the aggregated appFormat.
+			perBodyFormat := appFormat
+			if i < len(appBodyFormats) && appBodyFormats[i] != "" {
+				perBodyFormat = appBodyFormats[i]
+			}
+			// Multi-target bodies are already capped at maxAppBodyBytes inside
+			// scrapeMultipleApps; decode directly from bytes.NewReader without
+			// re-applying the cap (which would just no-op anyway).
+			appMfs, decodeErr := decodeAll(bytes.NewReader(body), perBodyFormat)
+			if decodeErr != nil {
+				log.Errorf("failed decoding app target %d (format=%q): %v", i, perBodyFormat, decodeErr)
+				metrics.AppScrapeErrors.Increment()
+			}
+			encodeAll(appMfs, "application", metrics.AppScrapeErrors)
+			appBodies[i] = nil
+		}
+	case application != nil:
+		appMfs, decodeErr := decodeCapped(application, appFormat)
+		if decodeErr != nil {
+			log.Errorf("failed decoding application metrics (format=%q): %v", appFormat, decodeErr)
+			metrics.AppScrapeErrors.Increment()
+		}
+		encodeAll(appMfs, "application", metrics.AppScrapeErrors)
+	}
+
+	// Close the encoder: for OpenMetrics this writes "# EOF"; for proto/text it is a no-op.
+	if closer, ok := enc.(expfmt.Closer); ok {
+		if cerr := closer.Close(); cerr != nil {
+			log.Errorf("failed closing merged metrics encoder: %v", cerr)
+		}
+	}
 }
 
+// countingReader counts the bytes returned by an underlying Reader. It is used by
+// writeMergedProtoPath to enforce s.maxAppBodyBytes on proto-path upstreams: pair
+// it with io.LimitReader(r, cap+1) and check N > cap after decoding to distinguish
+// an at-cap legitimate body from one that saturated the limit.
+type countingReader struct {
+	R io.Reader
+	N int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.R.Read(p)
+	c.N += int64(n)
+	return n, err
+}
+
+// scrapeMultipleApps fans out one scrape per entry in s.prometheus.Targets concurrently and
+// returns the bodies indexed by Targets position. Failed targets are represented by nil entries;
+// each failure increments metrics.AppScrapeErrors once. The returned aggregated format is the
+// first successful target's negotiated format (which matches Targets[0] when Targets[0]
+// succeeds), falling back to FmtText when no target succeeds; if any later successful target
+// disagrees, the aggregated format downgrades to FmtText. The returned per-body formats slice
+// gives each body's own negotiated format so the proto path can decode each body in its true
+// format when the aggregated format has been downgraded.
+func (s *Server) scrapeMultipleApps(r *http.Request) (expfmt.Format, [][]byte, []expfmt.Format) {
+	bodies := make([][]byte, len(s.prometheus.Targets))
+	contentTypes := make([]string, len(s.prometheus.Targets))
+	var wg sync.WaitGroup
+	for i, t := range s.prometheus.Targets {
+		wg.Add(1)
+		go func(idx int, tgt ScrapeTarget) {
+			defer wg.Done()
+			// fail* dedup the log+counter+return shape across the three failure paths.
+			// Path is %q-quoted to neutralize CWE-117 log injection via newline-containing
+			// annotation values (the path comes from prometheus.istio.io/scrape-targets).
+			failErr := func(format string, args ...any) {
+				log.Errorf("scrape target %q:%q: "+format, append([]any{tgt.Port, tgt.Path}, args...)...)
+				metrics.AppScrapeErrors.Increment()
+			}
+			failWarn := func(format string, args ...any) {
+				log.Warnf("scrape target %q:%q: "+format, append([]any{tgt.Port, tgt.Path}, args...)...)
+				metrics.AppScrapeErrors.Increment()
+			}
+			body, cancel, contentType, err := s.scrape(appMetricsURL(tgt.Port, tgt.Path), r.Header)
+			if cancel != nil {
+				defer cancel()
+			}
+			if err != nil {
+				failErr("scrape failed: %v", err)
+				return
+			}
+			defer body.Close()
+			// Pre-size the read buffer to 64 KiB so io.ReadAll's power-of-two growth does
+			// not allocate ~14 times for a 10 MiB body. cap+1 lets us distinguish at-cap
+			// (legitimate boundary) from saturation (cap+1 or more bytes consumed).
+			buf := bytes.NewBuffer(make([]byte, 0, 64*1024))
+			if _, readErr := buf.ReadFrom(io.LimitReader(body, int64(s.maxAppBodyBytes)+1)); readErr != nil {
+				failErr("read failed: %v", readErr)
+				return
+			}
+			if buf.Len() > s.maxAppBodyBytes {
+				failWarn("response exceeds %d bytes; dropping target", s.maxAppBodyBytes)
+				return
+			}
+			bodies[idx] = buf.Bytes()
+			contentTypes[idx] = contentType
+		}(i, t)
+	}
+	wg.Wait()
+
+	// Format selection: first successful target's format wins, unless any later successful
+	// target disagrees — in which case we downgrade to text. An OpenMetrics-claimed
+	// response containing a text body (or vice versa) is invalid. Single-format scrapes
+	// (all-text or all-OM) keep their format and EOF semantics.
+	//
+	// bodyFormats parallels bodies and gives the proto path each body's own negotiated
+	// format for per-body decoding when the aggregated format has been downgraded.
+	var format expfmt.Format
+	bodyFormats := make([]expfmt.Format, len(bodies))
+	for i, ct := range contentTypes {
+		if bodies[i] == nil {
+			continue
+		}
+		f := negotiateMetricsFormat(ct)
+		bodyFormats[i] = f
+		if format == "" {
+			format = f
+			continue
+		}
+		if f != format {
+			format = FmtText
+		}
+	}
+	if format == "" {
+		format = FmtText
+	}
+	return format, bodies, bodyFormats
+}
+
+func appMetricsURL(port, path string) string {
+	return fmt.Sprintf("http://localhost:%s%s", port, path)
+}
+
+// openMetricsEOF is the OpenMetrics exposition terminator without trailing newline.
+var openMetricsEOF = []byte("# EOF")
+
+// stripOpenMetricsEOF returns body without its trailing "# EOF" line if present,
+// or the body unchanged if not. Trailing whitespace and "\r\n" line endings around
+// the terminator are tolerated. This is the "strip" half of the OpenMetrics merge
+// rule; the matching reappend uses expfmt.FinalizeOpenMetrics.
+func stripOpenMetricsEOF(body []byte) []byte {
+	trimmed := bytes.TrimRight(body, " \t\r\n")
+	if bytes.HasSuffix(trimmed, openMetricsEOF) {
+		return trimmed[:len(trimmed)-len(openMetricsEOF)]
+	}
+	return body
+}
+
+const (
+	// nolint: revive, stylecheck
+	FmtOpenMetrics_0_0_1 = expfmt.OpenMetricsType + `; version=` + expfmt.OpenMetricsVersion_0_0_1 + `; charset=utf-8`
+	// nolint: revive, stylecheck
+	FmtOpenMetrics_1_0_0 = expfmt.OpenMetricsType + `; version=` + expfmt.OpenMetricsVersion_1_0_0 + `; charset=utf-8`
+	FmtText              = `text/plain; version=` + expfmt.TextVersion + `; charset=utf-8`
+)
+
+// FmtProtoDelim is the delimited Prometheus protobuf exposition format. Re-exported
+// from prometheus/common so the merger can negotiate and emit it symmetrically with
+// FmtText and the FmtOpenMetrics_* constants. Native Prometheus histograms are only
+// defined for this wire format.
+//
+// We declare it as a var rather than a const because expfmt.NewFormat is a function
+// call (the upstream library deprecated the corresponding constant); the value is
+// computed once at init.
+//
+//nolint:gochecknoglobals // see comment above
+var FmtProtoDelim = expfmt.NewFormat(expfmt.TypeProtoDelim)
+
+// negotiateMetricsFormat inspects an upstream's response Content-Type and maps it to a
+// known expfmt.Format. Recognized formats are OpenMetrics (versions 0.0.1 / 1.0.0), the
+// delimited Prometheus protobuf format (used for native histograms), and text/plain
+// (the default for anything unrecognized, preserving back-compat).
+//
+// The mapping for the protobuf branch mirrors expfmt.ResponseFormat in prometheus/common:
+// the media type must be application/vnd.google.protobuf, the "proto" parameter must be
+// io.prometheus.client.MetricFamily, and the "encoding" parameter must be "delimited".
+// Anything else (a different proto, a different encoding, or absent params) falls through
+// to text — the merger then either decodes text or, if the upstream lied about its
+// Content-Type, the downstream decoder surfaces the error and the upstream is dropped.
+func negotiateMetricsFormat(contentType string) expfmt.Format {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return FmtText
+	}
+	switch mediaType {
+	case expfmt.OpenMetricsType:
+		switch params["version"] {
+		case expfmt.OpenMetricsVersion_1_0_0:
+			return FmtOpenMetrics_1_0_0
+		case expfmt.OpenMetricsVersion_0_0_1, "":
+			return FmtOpenMetrics_0_0_1
+		}
+	case expfmt.ProtoType:
+		// Both parameters are mandatory per the Prometheus native-histogram spec.
+		// We accept "" for proto only when absent (matching expfmt.ResponseFormat
+		// which treats absent as "matches").
+		if proto, ok := params["proto"]; ok && proto != expfmt.ProtoProtocol {
+			return FmtText
+		}
+		if encoding, ok := params["encoding"]; ok && encoding != "delimited" {
+			return FmtText
+		} else if !ok {
+			// expfmt.ResponseFormat tolerates absent encoding; we require it
+			// explicitly so the merger never tries to delimit-decode a body
+			// that the upstream advertised as compact-text or proto-text.
+			return FmtText
+		}
+		return FmtProtoDelim
+	}
+	return FmtText
+}
+
+// mergeFormat returns the negotiated output format given the formats negotiated for each
+// successful upstream. Disagreement downgrades to FmtText (the universal common
+// denominator). An empty argument list returns FmtText.
+//
+// The downgrade rule is deliberately conservative: if any two upstreams disagree we emit
+// text, even when one of them is protobuf. The alternative (text→protobuf upconversion)
+// is gated on a CPU/memory cost-comparison study mandated by the Istio TOC and is the
+// subject of PR3 in the native-histogram contribution sequence.
+func mergeFormat(formats ...expfmt.Format) expfmt.Format {
+	var out expfmt.Format
+	for _, f := range formats {
+		if f == "" {
+			continue
+		}
+		if out == "" {
+			out = f
+			continue
+		}
+		if f != out {
+			return FmtText
+		}
+	}
+	if out == "" {
+		return FmtText
+	}
+	return out
+}
+
+// (the dead legacy helper has been intentionally removed; the protobuf-aware
+// negotiateMetricsFormat above is the single source of truth.)
+
+// scrapeFormatLabel maps an expfmt.Format to the value used for the
+// istio_agent_scrape_format_total{format=...} label.
+func scrapeFormatLabel(f expfmt.Format) string {
+	switch f.FormatType() {
+	case expfmt.TypeProtoDelim, expfmt.TypeProtoText, expfmt.TypeProtoCompact:
+		return metrics.ScrapeFormatLabelProto
+	case expfmt.TypeOpenMetrics:
+		return metrics.ScrapeFormatLabelOpenMetrics
+	default:
+		return metrics.ScrapeFormatLabelText
+	}
+}
+
+// decodeAll reads body as `format` and returns the decoded MetricFamily slice.
+// Used only on the protobuf path; for the text-only fast path the merger keeps
+// byte concatenation so adding a parse step would be a regression.
+//
+// OpenMetrics bodies are dispatched to decodeOpenMetricsToFamilies (which uses
+// prometheus/prometheus/model/textparse.OpenMetricsParser) so that exemplars,
+// _created timestamps, # UNIT, INFO, and STATESET survive the round-trip.
+// The expfmt text decoder silently drops these — see prometheus/common#812.
+func decodeAll(body io.Reader, format expfmt.Format) ([]*dto.MetricFamily, error) {
+	if format.FormatType() == expfmt.TypeOpenMetrics {
+		return decodeOpenMetricsToFamilies(body)
+	}
+	dec := expfmt.NewDecoder(body, format)
+	var mfs []*dto.MetricFamily
+	for {
+		var mf dto.MetricFamily
+		if err := dec.Decode(&mf); err != nil {
+			if errors.Is(err, io.EOF) {
+				return mfs, nil
+			}
+			return mfs, err
+		}
+		mfs = append(mfs, &mf)
+	}
+}
+
+// scrapeAndWriteAgentMetrics writes the agent's own self-metrics as the first
+// chunk of the byte-concatenation fast path. It always encodes as plain text.
+//
+// This chunk is followed by the Envoy and application bodies, so it must not be
+// a self-contained document. The OpenMetrics encoder requires a closing "# EOF"
+// marker to be a valid document (expfmt's encoder emits it on Close), and
+// writing that terminator here would place it mid-stream and corrupt the merged
+// response. Plain text has no such terminator; the response is terminated
+// correctly by the application body, which is written last. Proto and
+// OpenMetrics output never flow through this function — the parse-and-re-encode
+// path (writeMergedProtoPath) gathers and encodes the agent registry itself.
 func scrapeAndWriteAgentMetrics(registry prometheus.Gatherer, w io.Writer) error {
 	mfs, err := registry.Gather()
-	enc := expfmt.NewEncoder(w, expfmt.FmtText)
 	if err != nil {
 		return err
 	}
+	enc := expfmt.NewEncoder(w, FmtText)
 	for _, mf := range mfs {
 		if err := enc.Encode(mf); err != nil {
 			return err
@@ -675,7 +1307,7 @@ func (s *Server) scrape(url string, header http.Header) (io.ReadCloser, context.
 }
 
 func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -686,11 +1318,13 @@ func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 	log.Infof("handling %s, notifying pilot-agent to exit", quitPath)
-	s.shutdown()
+	s.disableDrain()
+	// Notify the agent to exit.
+	s.shutdown(fmt.Errorf("%v called", quitPath))
 }
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -772,7 +1406,7 @@ func (s *Server) handleAppProbeHTTPGet(w http.ResponseWriter, req *http.Request,
 	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
-		log.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, proberPath)
+		probes.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, proberPath)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -809,7 +1443,7 @@ func (s *Server) handleAppProbeTCPSocket(w http.ResponseWriter, prober *Prober) 
 		w.WriteHeader(http.StatusOK)
 		err = conn.Close()
 		if err != nil {
-			log.Infof("tcp connection is not closed: %v", err)
+			probes.Infof("tcp connection is not closed: %v", err)
 		}
 	}
 }
@@ -841,7 +1475,7 @@ func (s *Server) handleAppProbeGRPC(w http.ResponseWriter, req *http.Request, pr
 	addr := net.JoinHostPort(s.appProbersDestination, strconv.Itoa(int(prober.GRPC.Port)))
 	conn, err := grpc.DialContext(ctx, addr, opts...)
 	if err != nil {
-		log.Errorf("Failed to create grpc connection to probe app: %v", err)
+		probes.Errorf("Failed to create grpc connection to probe app: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -861,14 +1495,14 @@ func (s *Server) handleAppProbeGRPC(w http.ResponseWriter, req *http.Request, pr
 		if ok {
 			switch status.Code() {
 			case codes.Unimplemented:
-				log.Errorf("server does not implement the grpc health protocol (grpc.health.v1.Health): %v", err)
+				probes.Errorf("server does not implement the grpc health protocol (grpc.health.v1.Health): %v", err)
 			case codes.DeadlineExceeded:
-				log.Errorf("grpc request not finished within timeout: %v", err)
+				probes.Errorf("grpc request not finished within timeout: %v", err)
 			default:
-				log.Errorf("grpc probe failed: %v", err)
+				probes.Errorf("grpc probe failed: %v", err)
 			}
 		} else {
-			log.Errorf("grpc probe failed: %v", err)
+			probes.Errorf("grpc probe failed: %v", err)
 		}
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -882,7 +1516,7 @@ func (s *Server) handleAppProbeGRPC(w http.ResponseWriter, req *http.Request, pr
 }
 
 func (s *Server) handleNdsz(w http.ResponseWriter, r *http.Request) {
-	if !isRequestFromLocalhost(r) {
+	if !istioNetUtil.IsRequestFromLocalhost(r) {
 		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
@@ -897,9 +1531,9 @@ func (s *Server) handleNdsz(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeJSONProto writes a protobuf to a json payload, handling content type, marshaling, and errors
-func writeJSONProto(w http.ResponseWriter, obj any) {
+func writeJSONProto(w http.ResponseWriter, obj proto.Message) {
 	w.Header().Set("Content-Type", "application/json")
-	b, err := config.ToJSON(obj)
+	b, err := protomarshal.Marshal(obj)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(err.Error()))
@@ -924,11 +1558,9 @@ func notifyExit() {
 
 var defaultTransport = http.DefaultTransport.(*http.Transport)
 
-// SetTransportDefaults mirrors Kubernetes probe settings
-// https://github.com/kubernetes/kubernetes/blob/0153febd9f0098d4b8d0d484927710eaf899ef40/pkg/probe/http/http.go#L52
-func setTransportDefaults(t *http.Transport) (*http.Transport, error) {
+func setTransportDefaults(t *http.Transport) *http.Transport {
 	if !EnableHTTP2Probing {
-		return t, nil
+		return t
 	}
 	if t.TLSHandshakeTimeout == 0 {
 		t.TLSHandshakeTimeout = defaultTransport.TLSHandshakeTimeout
@@ -936,11 +1568,20 @@ func setTransportDefaults(t *http.Transport) (*http.Transport, error) {
 	if t.IdleConnTimeout == 0 {
 		t.IdleConnTimeout = defaultTransport.IdleConnTimeout
 	}
-	t2, err := http2.ConfigureTransports(t)
-	if err != nil {
-		return nil, err
+	// Advertise h2 and http/1.1 in ALPN. h2c is deliberately left out, so cleartext probes stay HTTP/1.1.
+	//
+	// Both have to be listed explicitly: net/http does not auto-enable HTTP/2 for transports
+	// with a custom TLSClientConfig or DialContext, both of which we set, and assigning Protocols
+	// replaces the default protocol set rather than adding to it.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	t.Protocols = protocols
+	t.HTTP2 = &http.HTTP2Config{
+		// Send a health check ping once the connection has been idle this long,
+		SendPingTimeout: time.Duration(30) * time.Second,
+		// and close the connection if that ping is not answered within this long.
+		PingTimeout: time.Duration(15) * time.Second,
 	}
-	t2.ReadIdleTimeout = time.Duration(30) * time.Second
-	t2.PingTimeout = time.Duration(15) * time.Second
-	return t, nil
+	return t
 }

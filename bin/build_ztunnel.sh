@@ -49,6 +49,9 @@ function set_download_command () {
   exit 1
 }
 
+# shellcheck source=bin/setup_cf_credentials.sh
+source "$(dirname "${BASH_SOURCE[0]}")/setup_cf_credentials.sh"
+
 # Params:
 #   $1: The URL of the ztunnel binary to be downloaded.
 #   $2: The full path of the output binary.
@@ -57,28 +60,38 @@ function download_ztunnel_if_necessary () {
   if [[ -f "$2" ]]; then
     return
   fi
+  local URL="$1"
+  # If $1 is an s3:// URL, get a presigned URL
+  if [[ "$1" == s3://* ]]; then
+    setup_cf_credentials
+    echo "Getting presigned URL for $1"
+    # Use AWS CLI to get a presigned URL that is valid for 1 minute
+    if ! URL=$(aws s3 presign "$1" --expires-in 60 ${AWS_ENDPOINT_URL:+--endpoint-url "$AWS_ENDPOINT_URL"}); then
+      echo "Error: Failed to get presigned URL for $1"
+      return 1
+    fi
+  fi
+
   # Enter the output directory.
   mkdir -p "$(dirname "$2")"
   pushd "$(dirname "$2")"
 
   # Download and make the binary executable
   echo "Downloading ztunnel: $1 to $2"
-  BASE_NAME="$(basename "${ISTIO_ZTUNNEL_RELEASE_URL}")"
-  time ${DOWNLOAD_COMMAND} --header "${AUTH_HEADER:-}" "$1" > "${BASE_NAME}"
-  chmod +x "${BASE_NAME}"
 
-  # Copy the extracted binary to the output location
-  cp "${BASE_NAME}" "$2"
-
-  # Remove the extracted binary.
-  rm -rf usr
+  # Don't leak the presigned URL via xtrace.
+  case $- in *x*) local _xtrace=1;; *) local _xtrace=0;; esac
+  { set +x; } 2>/dev/null
+  time ${DOWNLOAD_COMMAND} "${URL}" > "$2"
+  [[ $_xtrace == 1 ]] && set -x
+  chmod +x "$2"
 
   # Make a copy named just "ztunnel" in the same directory (overwrite if necessary).
   echo "Copying $2 to $(dirname "$2")/${3}"
   cp -f "$2" "$(dirname "$2")/${3}"
   popd
 
-  # Also copy it to out/$os_arch/ztunnel as that's whats used in the build
+  # Also copy it to out/$os_arch/ztunnel as that's what's used in the build
   echo "Copying '${2}' to ${TARGET_OUT_LINUX}/ztunnel"
   cp -f "${2}" "${TARGET_OUT_LINUX}/ztunnel"
 }
@@ -106,7 +119,7 @@ function maybe_build_ztunnel() {
   fi
 
   pushd "${BUILD_ZTUNNEL_REPO}"
-  cargo build --profile="${BUILD_ZTUNNEL_PROFILE:-dev}"
+  cargo build --profile="${BUILD_ZTUNNEL_PROFILE:-dev}" ${BUILD_ZTUNNEL_TARGET:+--target=${BUILD_ZTUNNEL_TARGET}}
 
   local ZTUNNEL_BIN_PATH
   if [[ "${BUILD_ZTUNNEL_PROFILE:-dev}" == "dev" ]]; then
@@ -114,7 +127,7 @@ function maybe_build_ztunnel() {
   else
       ZTUNNEL_BIN_PATH="${BUILD_ZTUNNEL_PROFILE}"
   fi
-  ZTUNNEL_BIN_PATH="out/rust/${ZTUNNEL_BIN_PATH}/ztunnel"
+  ZTUNNEL_BIN_PATH="out/rust/${BUILD_ZTUNNEL_TARGET:+${BUILD_ZTUNNEL_TARGET}/}${ZTUNNEL_BIN_PATH}/ztunnel"
 
   echo "Copying $(pwd)/${ZTUNNEL_BIN_PATH} to ${TARGET_OUT_LINUX}/ztunnel"
   mkdir -p "${TARGET_OUT_LINUX}"
@@ -123,13 +136,7 @@ function maybe_build_ztunnel() {
 }
 
 # ztunnel binary vars (TODO handle debug builds, arm, darwin etc.)
-ISTIO_ZTUNNEL_BASE_URL="${ISTIO_ZTUNNEL_BASE_URL:-https://storage.googleapis.com/istio-build/ztunnel}"
-
-# If we are not using the default, assume its private and we need to authenticate
-if [[ "${ISTIO_ZTUNNEL_BASE_URL}" != "https://storage.googleapis.com/istio-build/ztunnel" ]]; then
-  AUTH_HEADER="Authorization: Bearer $(gcloud auth print-access-token)"
-  export AUTH_HEADER
-fi
+ISTIO_ZTUNNEL_BASE_URL="${ISTIO_ZTUNNEL_BASE_URL:-https://blob.istio.io/istio-build/ztunnel}"
 
 ZTUNNEL_REPO_SHA="${ZTUNNEL_REPO_SHA:-$(grep ZTUNNEL_REPO_SHA istio.deps  -A 4 | grep lastStableSHA | cut -f 4 -d '"')}"
 ISTIO_ZTUNNEL_VERSION="${ISTIO_ZTUNNEL_VERSION:-${ZTUNNEL_REPO_SHA}}"

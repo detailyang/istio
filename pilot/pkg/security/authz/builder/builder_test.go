@@ -19,11 +19,13 @@ import (
 	"testing"
 
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	authpb "istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
@@ -32,6 +34,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/protomarshal"
 )
 
@@ -85,13 +88,14 @@ var (
 				Name: "default",
 				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp{
 					EnvoyExtAuthzHttp: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationHttpProvider{
-						Service:                         "foo/my-custom-ext-authz.foo.svc.cluster.local",
-						Port:                            9000,
-						Timeout:                         &durationpb.Duration{Seconds: 10},
-						FailOpen:                        true,
-						StatusOnError:                   "403",
-						PathPrefix:                      "/check",
-						IncludeRequestHeadersInCheck:    []string{"x-custom-id", "x-prefix-*", "*-suffix"},
+						Service:                      "foo/my-custom-ext-authz.foo.svc.cluster.local",
+						Port:                         9000,
+						Timeout:                      &durationpb.Duration{Seconds: 10},
+						FailOpen:                     true,
+						StatusOnError:                "403",
+						PathPrefix:                   "/check",
+						IncludeRequestHeadersInCheck: []string{"x-custom-id", "x-prefix-*", "*-suffix"},
+						//nolint: staticcheck
 						IncludeHeadersInCheck:           []string{"should-not-include-when-IncludeRequestHeadersInCheck-is-set"},
 						IncludeAdditionalHeadersInCheck: map[string]string{"x-header-1": "value-1", "x-header-2": "value-2"},
 						IncludeRequestBodyInCheck: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationRequestBody{
@@ -180,7 +184,7 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 			name:       "custom-bad-multiple-providers",
 			meshConfig: meshConfigHTTP,
 			input:      "custom-bad-multiple-providers-in.yaml",
-			want:       []string{"custom-bad-out.yaml"},
+			want:       []string{"custom-bad-multiple-providers-out1.yaml", "custom-bad-multiple-providers-out2.yaml"},
 		},
 		{
 			name:       "custom-bad-invalid-config",
@@ -247,28 +251,38 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 			input:    "td-aliases-source-principal-in.yaml",
 			want:     []string{"td-aliases-source-principal-out.yaml"},
 		},
+		{
+			name:  "trust-domains-field",
+			input: "trust-domains-in.yaml",
+			want:  []string{"trust-domains-out.yaml"},
+		},
 	}
 
 	baseDir := "http/"
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			option := Option{
-				IsCustomBuilder: tc.meshConfig != nil,
-			}
-			push := push(t, baseDir+tc.input, tc.meshConfig)
-			proxy := node(tc.version)
-			selectionOpts := model.WorkloadSelectionOpts{
-				Namespace:      proxy.ConfigNamespace,
-				WorkloadLabels: proxy.Labels,
-			}
-			policies := push.AuthzPolicies.ListAuthorizationPolicies(selectionOpts)
-			g := New(tc.tdBundle, push, policies, option)
-			if g == nil {
-				t.Fatalf("failed to create generator")
-			}
-			got := g.BuildHTTP()
-			verify(t, convertHTTP(got), baseDir, tc.want, false /* forTCP */)
-		})
+	for _, extended := range []bool{false, true} {
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				option := Option{
+					IsCustomBuilder: tc.meshConfig != nil,
+				}
+				push := push(t, baseDir+tc.input, tc.meshConfig)
+				proxy := node(tc.version)
+				selectionOpts := model.PolicyMatcherForProxy(proxy)
+				policies := push.AuthzPolicies.ListAuthorizationPolicies(selectionOpts)
+				g := New(tc.tdBundle, push, policies, option)
+				if g == nil {
+					t.Fatal("failed to create generator")
+				}
+				got := g.BuildHTTP()
+				wants := tc.want
+				if extended {
+					for i := range wants {
+						wants[i] = "extended-" + wants[i]
+					}
+				}
+				verify(t, convertHTTP(got), baseDir, tc.want, false /* forTCP */)
+			})
+		}
 	}
 }
 
@@ -327,14 +341,11 @@ func TestGenerator_GenerateTCP(t *testing.T) {
 			}
 			push := push(t, baseDir+tc.input, tc.meshConfig)
 			proxy := node(nil)
-			selectionOpts := model.WorkloadSelectionOpts{
-				Namespace:      proxy.ConfigNamespace,
-				WorkloadLabels: proxy.Labels,
-			}
+			selectionOpts := model.PolicyMatcherForProxy(proxy)
 			policies := push.AuthzPolicies.ListAuthorizationPolicies(selectionOpts)
 			g := New(tc.tdBundle, push, policies, option)
 			if g == nil {
-				t.Fatalf("failed to create generator")
+				t.Fatal("failed to create generator")
 			}
 			got := g.BuildTCP()
 			verify(t, convertTCP(got), baseDir, tc.want, true /* forTCP */)
@@ -355,13 +366,13 @@ func verify(t *testing.T, gots []proto.Message, baseDir string, wants []string, 
 		}
 
 		wantFile := basePath + baseDir + wants[i]
+		util.RefreshGoldenFile(t, []byte(gotYaml), wantFile)
 		want := yamlConfig(t, wantFile, forTCP)
 		wantYaml, err := protomarshal.ToYAML(want)
 		if err != nil {
 			t.Fatalf("failed to convert to YAML: %v", err)
 		}
 
-		util.RefreshGoldenFile(t, []byte(gotYaml), wantFile)
 		if err := util.Compare([]byte(gotYaml), []byte(wantYaml)); err != nil {
 			t.Error(err)
 		}
@@ -423,7 +434,7 @@ func convertTCP(in []*listener.Filter) []proto.Message {
 }
 
 func newAuthzPolicies(t *testing.T, policies []*config.Config) *model.AuthorizationPolicies {
-	store := memory.Make(collections.Pilot)
+	store := memory.Make(collections.Pilot, false, test.NewStop(t))
 	for _, p := range policies {
 		if _, err := store.Create(*p); err != nil {
 			t.Fatalf("newAuthzPolicies: %v", err)
@@ -458,8 +469,116 @@ func node(version *model.IstioVersion) *model.Proxy {
 		ConfigNamespace: "foo",
 		Labels:          httpbin,
 		Metadata: &model.NodeMetadata{
-			Labels: httpbin,
+			Labels:    httpbin,
+			Namespace: "foo",
 		},
 		IstioVersion: version,
+	}
+}
+
+func authzPolicy(name string, action authpb.AuthorizationPolicy_Action) model.AuthorizationPolicy {
+	return model.AuthorizationPolicy{
+		Name:      name,
+		Namespace: "foo",
+		Spec: &authpb.AuthorizationPolicy{
+			Action: action,
+			Rules: []*authpb.Rule{
+				{
+					From: []*authpb.Rule_From{
+						{
+							Source: &authpb.Source{
+								Principals: []string{"cluster.local/ns/foo/sa/bar"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestBuildHTTPRBACForRoute(t *testing.T) {
+	cases := []struct {
+		name       string
+		policies   model.AuthorizationPoliciesResult
+		option     Option
+		wantAction []rbacpb.RBAC_Action
+	}{
+		{
+			name: "allow only",
+			policies: model.AuthorizationPoliciesResult{
+				Allow: []model.AuthorizationPolicy{authzPolicy("allow", authpb.AuthorizationPolicy_ALLOW)},
+			},
+			wantAction: []rbacpb.RBAC_Action{rbacpb.RBAC_ALLOW},
+		},
+		{
+			name: "deny only",
+			policies: model.AuthorizationPoliciesResult{
+				Deny: []model.AuthorizationPolicy{authzPolicy("deny", authpb.AuthorizationPolicy_DENY)},
+			},
+			wantAction: []rbacpb.RBAC_Action{rbacpb.RBAC_DENY},
+		},
+		{
+			name: "allow and deny produce independent configs",
+			policies: model.AuthorizationPoliciesResult{
+				Allow: []model.AuthorizationPolicy{authzPolicy("allow", authpb.AuthorizationPolicy_ALLOW)},
+				Deny:  []model.AuthorizationPolicy{authzPolicy("deny", authpb.AuthorizationPolicy_DENY)},
+			},
+			wantAction: []rbacpb.RBAC_Action{rbacpb.RBAC_ALLOW, rbacpb.RBAC_DENY},
+		},
+		{
+			// AUDIT is not valid for an HTTPRoute targetRef and must not produce a route override.
+			name: "audit is not built for routes",
+			policies: model.AuthorizationPoliciesResult{
+				Audit: []model.AuthorizationPolicy{authzPolicy("audit", authpb.AuthorizationPolicy_AUDIT)},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := New(trustdomain.NewBundle("cluster.local", nil), nil, tc.policies, tc.option)
+			if b == nil {
+				if len(tc.wantAction) != 0 {
+					t.Fatalf("New returned nil builder but expected actions %v", tc.wantAction)
+				}
+				return
+			}
+
+			got := b.BuildHTTPRBACForRoute()
+			if len(got) != len(tc.wantAction) {
+				t.Fatalf("got %d actions, want %d (%v)", len(got), len(tc.wantAction), tc.wantAction)
+			}
+			for _, action := range tc.wantAction {
+				rbac, ok := got[action]
+				if !ok {
+					t.Fatalf("missing config for action %v", action)
+				}
+				if rbac.GetRules() == nil {
+					t.Fatalf("action %v: expected enforced rules", action)
+				}
+				// The inner action must match the slot it is keyed by, otherwise a route override
+				// would flip the effect of the policy.
+				if rbac.GetRules().GetAction() != action {
+					t.Errorf("action %v: inner RBAC action is %v", action, rbac.GetRules().GetAction())
+				}
+				if len(rbac.GetRules().GetPolicies()) == 0 {
+					t.Errorf("action %v: expected generated policies", action)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildHTTPRBACForRouteCustomBuilder verifies CUSTOM policies never yield a route override:
+// only ALLOW and DENY are valid for an HTTPRoute targetRef. The Builder is constructed directly
+// because New requires a PushContext for CUSTOM providers.
+func TestBuildHTTPRBACForRouteCustomBuilder(t *testing.T) {
+	b := Builder{
+		option:         Option{IsCustomBuilder: true},
+		customPolicies: []model.AuthorizationPolicy{authzPolicy("custom", authpb.AuthorizationPolicy_CUSTOM)},
+	}
+	if got := b.BuildHTTPRBACForRoute(); got != nil {
+		t.Fatalf("expected nil for custom builder, got %v", got)
 	}
 }
